@@ -15,10 +15,10 @@ It serves its own web UI, so you never type these commands by hand.
 
 ## Demo
 
-**Planning a fit.** Qwen3.6-35B-A3B at its full 262,144-token context on a 12 GB card —
-the verdict and memory split, the KV-cache-vs-context table and full breakdown, then the
-speed estimate collapsing from a bracket to a single calibrated figure once it has a
-measurement to work from:
+**Planning a fit.** A full pass over Qwen3.6-35B-A3B at its 262,144-token context on a
+12 GB card — the verdict and memory split, the settings and `llama-server` command, the
+KV-cache-vs-context table, the full memory breakdown, and the speed estimate going from
+an uncalibrated bracket to a single measured figure:
 
 ![Planning a Qwen3.6-35B-A3B fit at 262k context](docs/demo-planner.gif)
 

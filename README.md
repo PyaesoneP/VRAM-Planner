@@ -15,8 +15,10 @@ It serves its own web UI, so you never type these commands by hand.
 
 ## Demo
 
-**Planning a fit.** Pick a model, set the context, and get the layer split, expert
-offload, the exact `llama-server` flags and a generation-speed estimate:
+**Planning a fit.** Qwen3.6-35B-A3B at its full 262,144-token context on a 12 GB card —
+the verdict and memory split, the KV-cache-vs-context table and full breakdown, then the
+speed estimate collapsing from a bracket to a single calibrated figure once it has a
+measurement to work from:
 
 ![Planning a Qwen3.6-35B-A3B fit at 262k context](docs/demo-planner.gif)
 

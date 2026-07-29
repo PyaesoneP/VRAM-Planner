@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+
+# Per-user state. These live in %LOCALAPPDATA%\vram-planner (or
+# ~/.local/share/vram-planner) as of v1.0.0; these entries catch pre-1.0 copies
+# left beside the script. They identify your GPU and your model filenames and
+# must never be committed.
+vram_calibration.json
+speed_history.json
+
+# scratch
+*.png
+*.pdf

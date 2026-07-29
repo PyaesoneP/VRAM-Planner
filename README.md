@@ -16,17 +16,14 @@ It serves its own web UI, so you never type these commands by hand.
 ## Demo
 
 **Planning a fit.** Pick a model, set the context, and get the layer split, expert
-offload and the exact `llama-server` flags:
+offload, the exact `llama-server` flags and a generation-speed estimate:
 
-<!-- REPLACE: drag "vram planner demo.mp4" into a GitHub issue or the release
-     description, then paste the resulting user-attachments URL here. -->
-https://github.com/user-attachments/assets/REPLACE-WITH-DEMO-ID
+![Planning a Qwen3.6-35B-A3B fit at 262k context](docs/demo-planner.gif)
 
-**Checking it against reality.** The same configuration loaded in LM Studio, so you can
-compare the prediction against what the engine actually allocates:
+**Checking it against reality.** The same configuration loaded in LM Studio, with Task
+Manager showing what the engine actually allocates:
 
-<!-- REPLACE: same process for "lm studio.mp4". -->
-https://github.com/user-attachments/assets/REPLACE-WITH-LMSTUDIO-ID
+![The same config running in LM Studio](docs/demo-lmstudio.gif)
 
 ## Supported platforms
 

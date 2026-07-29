@@ -13,6 +13,21 @@ exactly how a model fits at any context length and KV-cache quant:
 
 It serves its own web UI, so you never type these commands by hand.
 
+## Demo
+
+**Planning a fit.** Pick a model, set the context, and get the layer split, expert
+offload and the exact `llama-server` flags:
+
+<!-- REPLACE: drag "vram planner demo.mp4" into a GitHub issue or the release
+     description, then paste the resulting user-attachments URL here. -->
+https://github.com/user-attachments/assets/REPLACE-WITH-DEMO-ID
+
+**Checking it against reality.** The same configuration loaded in LM Studio, so you can
+compare the prediction against what the engine actually allocates:
+
+<!-- REPLACE: same process for "lm studio.mp4". -->
+https://github.com/user-attachments/assets/REPLACE-WITH-LMSTUDIO-ID
+
 ## Supported platforms
 
 | | status |

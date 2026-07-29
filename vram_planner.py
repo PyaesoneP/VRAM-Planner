@@ -2069,9 +2069,15 @@ def fit_calibration(rows, prior=None):
         if good:
             cand = dict(zip(free, x))
             for t, val in cand.items():
-                if val < 0:
-                    good = False
-                elif t != "const" and prior[t] > 0 and not (0.1 <= val / prior[t] <= 10.0):
+                if t == "const":
+                    # An additive offset, not a byte count on its own: the physical
+                    # pool is const + the structural per-hidden part, so a small
+                    # negative const is a legitimate fit that trims a slightly
+                    # over-predicting prior. Only reject nonsense magnitudes, and
+                    # check the total stays positive on the rows we actually have.
+                    if abs(val) > 20000 or any(val + _struct_offset(r) < 0 for r in rows):
+                        good = False
+                elif val < 0 or (prior[t] > 0 and not (0.1 <= val / prior[t] <= 10.0)):
                     good = False
         if good:
             coeffs = dict(prior)
@@ -2104,8 +2110,11 @@ def refresh_calibration(gpu=None):
         by_gpu.setdefault(r.get("gpu") or "", []).append(r)
     _CALIB_CACHE.clear()
     for g, rows in by_gpu.items():
-        same = [r for r in rows if cur and r.get("backend") == cur]
-        used, stale = (same, len(rows) - len(same)) if same else (rows, 0)
+        # Only drop a row when its build is KNOWN and different. Rows recorded
+        # before builds were tracked carry no backend; discarding those would
+        # throw away good measurements from this very machine.
+        used  = [r for r in rows if not cur or not r.get("backend") or r["backend"] == cur]
+        stale = len(rows) - len(used)
         f = fit_calibration(used)
         if f:
             f["stale_rows"] = stale
@@ -3048,9 +3057,13 @@ async function calibrate(){
     '</b> at ngl '+row.ngl+' / ctx '+row.ctx.toLocaleString()+
     ' <span class="muted">(read from LM Studio\\'s log)</span>.<br>'+
     'minus exact terms '+fmt(row.exact_mib)+' &rarr; overhead <b>'+fmt(row.overhead_mib)+'</b>.<br>'+
-    '<b style="color:var(--kv)">Calibrated</b> from '+st.n+' measurement'+(st.n==1?'':'s')+
-    ' on this GPU &mdash; fitted: '+st.free.join(", ")+
-    ' (in-sample '+st.residual_pct+'%).'+
+    (st.calibrated
+      ? '<b style="color:var(--kv)">Calibrated</b> from '+st.n+' measurement'+(st.n==1?'':'s')+
+        ' on this GPU &mdash; fitted: '+st.free.join(", ")+
+        ' (in-sample '+st.residual_pct+'%).'
+      : '<b style="color:var(--warn)">Recorded, but not fitted yet.</b> The measurement is '+
+        'saved; it did not produce a usable fit on its own, so the shipped defaults still '+
+        'apply. Measure once more at a different context length.')+
     (pending.length? '<br><span class="muted">Still on defaults: '+pending.join(", ")+
       '. '+calibHint(pending)+'</span>' : '')+
     '<br>Press Analyze fit again.';
@@ -3725,11 +3738,29 @@ def self_test():
     for r in absurd:
         r["overhead_mib"] = r["overhead_mib"] * 50.0 + 5000.0
     ab = fit_calibration(absurd)
-    ab_ok = all(ab["coeffs"][t] == CB_DEFAULTS[t] or 0.1 <= ab["coeffs"][t] / CB_DEFAULTS[t] <= 10.0
-                for t in ("ctx", "act", "nofa")) and all(ab["coeffs"][t] >= 0 for t in CALIB_TERMS)
-    print("  CALFIT absurd data: freed %-18s (slopes stayed plausible=%s)  %s"
-          % (",".join(ab["free"]), ab_ok, "OK" if ab_ok else "FAIL"))
+    # Rejecting outright is a valid answer; publishing an implausible slope is not.
+    ab_ok = ab is None or (
+        all(ab["coeffs"][t] == CB_DEFAULTS[t] or 0.1 <= ab["coeffs"][t] / CB_DEFAULTS[t] <= 10.0
+            for t in ("ctx", "act", "nofa"))
+        and all(ab["coeffs"][t] >= 0 for t in ("ctx", "act", "nofa")))
+    print("  CALFIT absurd data: %-28s  %s"
+          % ("rejected entirely" if ab is None else "freed " + ",".join(ab["free"]),
+             "OK" if ab_ok else "FAIL"))
     ok = ok and ab_ok
+
+    # A single measurement must still produce a usable fit. A small negative
+    # additive constant is legitimate - the physical pool is const + the
+    # structural per-hidden term - and rejecting it stranded real measurements
+    # as "calibrated from 0 measurements".
+    one_real = [{"ctx": 262144, "ub": 512, "fa": True, "hidden": 2048, "n_head": 16,
+                 "kv_tok_ctx": 5368709120.0, "exact_mib": 8965.0, "overhead_mib": 943.6}]
+    single = fit_calibration(one_real)
+    single_ok = (single is not None and single["free"] == ["const"]
+                 and single["coeffs"]["const"] + _struct_offset(one_real[0]) > 0)
+    print("  CALFIT single real measurement: fitted=%s const=%.1f  %s"
+          % (single is not None, (single or {}).get("coeffs", {}).get("const", 0.0),
+             "OK" if single_ok else "FAIL"))
+    ok = ok and single_ok
 
     # 10) --n-cpu-moe must move expert bytes to the RAM side of the speed model
     rm2 = analyze(p3, 4096, "f16", 512, False, vram_budget_mib=300, ram_budget_mib=8000,

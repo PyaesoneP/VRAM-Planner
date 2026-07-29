@@ -11,3 +11,10 @@ speed_history.json
 # scratch
 *.png
 *.pdf
+
+# Demo recordings. These are uploaded to GitHub (release or issue attachment)
+# and linked from the README, never committed - git keeps every binary blob in
+# history forever, and GitHub rejects any single file over 100 MB outright.
+*.mp4
+*.mov
+*.webm

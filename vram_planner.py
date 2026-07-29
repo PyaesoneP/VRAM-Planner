@@ -20,7 +20,7 @@ import os, re, sys, json, math, glob, time, struct, argparse, subprocess, webbro
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
-__version__ = "1.0.0"
+__version__ = "1.0.1"
 
 MiB = 1024 * 1024
 GiB = 1024 * 1024 * 1024

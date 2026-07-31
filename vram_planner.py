@@ -337,6 +337,14 @@ def extract_config(model):
         n_mtp = len(seen)
     n_mtp = max(0, min(n_mtp, (n_layers or 0)))
     mtp_layers = list(range((n_layers or 0) - n_mtp, n_layers or 0)) if n_mtp else []
+    # Kept from before the heads are zeroed: with MTP speculative decoding enabled
+    # (llama.cpp --spec-type draft-mtp, LM Studio's "Speculative Decoding: MTP")
+    # these blocks DO run and DO grow a cache. Measured f16 regardless of
+    # --cache-type-k/v, so the draft cache ignores the KV quant setting.
+    mtp_kv_per_token = 0.0
+    for i in mtp_layers:
+        if i < len(kv_heads_per_layer):
+            mtp_kv_per_token += kv_heads_per_layer[i] * ((head_dim_k or 0) + (head_dim_v or 0)) * 2.0
     if mtp_layers:
         mset = set(mtp_layers)
         attn_layers = [i for i in attn_layers if i not in mset]
@@ -409,6 +417,7 @@ def extract_config(model):
         "full_attention_interval": _as_int(g(".full_attention_interval"), 0) or 0,
         "n_swa": n_swa, "swa_layers": sorted(swa_layers), "swa_source": swa_source,
         "n_mtp_layers": n_mtp, "mtp_layers": mtp_layers,
+        "mtp_kv_per_token": mtp_kv_per_token,
         "kv_layer_dims": kv_layer_dims,
         "kv_ctx_per_layer": [],          # filled in by resolve_kv_lengths()
     }
@@ -614,6 +623,13 @@ CB_NOFA_HEAD_BYTES = 3.36     # f32 score matrix, per head per ctx token per uba
 # 5120) - a 3x range that no single constant can cover. The per-machine part is
 # the additive base, which is what calibration fits.
 CB_CONST_PER_KHID  = 149.18   # MiB per 1000 units of hidden size
+
+# MTP speculative decoding (llama.cpp --spec-type draft-mtp). Measured on
+# Qwen3.5-9B-MTP at ctx 8k/32k/131k and --parallel 1/2/4: the draft cache costs
+# one MTP block of f16 KV over the full context, plus a fixed pool and a
+# per-sequence slot. Linear in both to within ~9%.
+MTP_SPEC_CONST_MIB   = 104.0
+MTP_SPEC_PER_SEQ_MIB = 100.0
 # The constant covers CUDA context + driver + the fixed graph pool together: they
 # cannot be separated from outside the process, and fitting them jointly is what
 # the measurements support. So the GPU reserve field defaults to 0 - reserving on
@@ -889,7 +905,7 @@ def analyze(path, ctx, kv_type, n_ubatch, flash_attn,
             gpu_layers_override=None, ram_free_mib=None, n_seq=1,
             include_mmproj=True, n_cpu_moe_override=None,
             bw_vram_gbs=None, bw_ram_gbs=None, ram_eff=None, ctx_fill=None,
-            bw_note=""):
+            bw_note="", mtp_spec=False):
     model = load_gguf(path)
     cfg = extract_config(model)
     cl = classify_tensors(model, cfg)
@@ -960,13 +976,21 @@ def analyze(path, ctx, kv_type, n_ubatch, flash_attn,
         return compute_buffer_split(compute_terms, ngl > 0, any_on_cpu,
                                     output_on_gpu, compute_override_mib)
 
+    # MTP speculative decoding: the draft blocks run after all, so they get the KV
+    # cache back - at f16, whatever the configured KV quant - plus a fixed pool and
+    # one slot per sequence. Comes off the top of the budget like the projector.
+    spec_mib = 0.0
+    if mtp_spec and cfg.get("mtp_kv_per_token"):
+        spec_mib = (_mib(cfg["mtp_kv_per_token"] * ctx)
+                    + MTP_SPEC_CONST_MIB + MTP_SPEC_PER_SEQ_MIB * max(1, n_seq))
+
     # vision/audio projector: loaded to the GPU alongside the model, so it comes
     # off the top of the budget before any layer split is planned
     mmproj_mib = _mib(mmproj["tensor_bytes"]) if (mmproj and include_mmproj) else 0.0
 
     # usable VRAM after reserving driver/OS headroom and a safety margin
     eff_vram = max(0.0, (vram_budget_mib - gpu_reserve_mib) * (1.0 - safety_pct / 100.0))
-    eff_vram = max(0.0, eff_vram - mmproj_mib)
+    eff_vram = max(0.0, eff_vram - mmproj_mib - spec_mib)
 
     result = {
         "ok": True, "warnings": warnings, "config": cfg,
@@ -1015,6 +1039,7 @@ def analyze(path, ctx, kv_type, n_ubatch, flash_attn,
         },
         "inputs": {
             "context": ctx, "kv_type": kv_type, "n_ubatch": n_ubatch, "n_seq": n_seq,
+            "mtp_spec": bool(mtp_spec),
             "flash_attn": flash_attn, "vram_budget_mib": vram_budget_mib,
             "ram_budget_mib": ram_budget_mib, "gpu_reserve_mib": gpu_reserve_mib,
             "eff_vram_mib": eff_vram, "safety_pct": safety_pct,
@@ -1091,6 +1116,9 @@ def analyze(path, ctx, kv_type, n_ubatch, flash_attn,
     if mmproj_mib > 0:
         plan["mmproj_mib"] = mmproj_mib
         plan["vram_used_mib"] = plan.get("vram_used_mib", 0.0) + mmproj_mib
+    if spec_mib > 0:
+        plan["spec_mib"] = spec_mib
+        plan["vram_used_mib"] = plan.get("vram_used_mib", 0.0) + spec_mib
     result["plan"] = plan
 
     # ---- speed roofline ----------------------------------------------------
@@ -2481,6 +2509,13 @@ td:first-child,th:first-child{text-align:left}
       </div>
       <div class="field" id="mmprojfield" style="display:none">
         <label class="check"><input type="checkbox" id="mmproj" checked> Load vision projector (mmproj)</label>
+        <div id="mtprow" style="display:none">
+        <label class="check"><input type="checkbox" id="mtpspec" checked> MTP speculative decoding</label>
+        <div class="hint">This model ships multi-token-prediction blocks. LM Studio turns this on by
+          default for them (<span class="mono">Speculative Decoding: MTP</span>, llama.cpp
+          <span class="mono">--spec-type draft-mtp</span>). It gives the draft blocks a KV cache back
+          &mdash; at f16 regardless of your KV quant &mdash; plus a per-sequence slot. Untick only if
+          you set Speculative Decoding to Off.</div></div>
         <div class="hint" id="mmprojhint"></div>
       </div>
       <div class="field">
@@ -2714,6 +2749,7 @@ async function run(){
     n_ubatch: parseInt($("ubatch").value)||512,
     n_seq: parseInt($("nseq").value)||1,
     include_mmproj: $("mmproj").checked,
+    mtp_spec: $("mtpspec").checked,
     n_cpu_moe_override: $("ncpumoe").value===""? null : parseInt($("ncpumoe").value),
     bw_vram_gbs: parseFloat($("bwv").value)||0,
     bw_ram_gbs: parseFloat($("bwr").value)||0,
@@ -2765,6 +2801,7 @@ function render(r){
   const c=r.config, p=r.plan, s=r.sizes_mib, inp=r.inputs;
   $("mmprojfield").style.display = r.mmproj? "" : "none";
   $("ncpumoefield").style.display = r.is_moe? "" : "none";
+  { const row=$("mtprow"); if(row) row.style.display = c.n_mtp_layers ? "" : "none"; }
   if(r.mmproj) $("mmprojhint").innerHTML = r.mmproj.name+" &middot; "+fmt(r.mmproj.mib)+
     " of VRAM. LM Studio loads it with the model and includes it in the size it shows.";
   // verdict class
@@ -2794,7 +2831,7 @@ function render(r){
         : "")+
       (c.n_mtp_layers
         ? kvItem("multi-token pred.", c.n_mtp_layers + " block" + (c.n_mtp_layers==1?"":"s") +
-            ' <span class="muted">(weights counted, no KV)</span>')
+            ' <span class="muted">(' + (inp.mtp_spec ? "drafting: KV counted" : "idle: weights only") + ')</span>')
         : "")+
       kvItem("head dim", (c.head_dim_k||"-") +
         ((r.swa && r.swa.enabled && r.swa.head_dim!==r.swa.head_dim_global)
@@ -2809,6 +2846,7 @@ function render(r){
     {cls:"s-kv",  color:"var(--kv)",  label:"KV cache (GPU)", mib:p.gpu_kv_mib||0},
     {cls:"s-kv",  color:"#2aa88c",     label:"recurrent state", mib:p.gpu_recurrent_mib||0},
     {cls:"s-wt",  color:"#7d6cff",     label:"vision projector", mib:p.mmproj_mib||0},
+    {cls:"s-kv",  color:"#e0a03a",     label:"MTP draft cache", mib:p.spec_mib||0},
     {cls:"s-cmp", color:"var(--cmp)", label:"compute buffer", mib:p.compute_mib||0},
     {cls:"s-rsv", color:"#2c3742",    label:"driver reserve", mib:inp.gpu_reserve_mib||0},
   ];
@@ -3285,6 +3323,7 @@ class Handler(BaseHTTPRequestHandler):
                 n_ubatch=int(data.get("n_ubatch", 512)),
                 n_seq=int(data.get("n_seq", 1) or 1),
                 include_mmproj=bool(data.get("include_mmproj", True)),
+                mtp_spec=bool(data.get("mtp_spec", True)),
                 flash_attn=bool(data.get("flash_attn", False)),
                 vram_budget_mib=float(data.get("vram_budget_mib", 0)),
                 ram_budget_mib=float(data.get("ram_budget_mib", 0)),

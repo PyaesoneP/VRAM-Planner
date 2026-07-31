@@ -69,7 +69,7 @@ python vram_planner.py --self-test      # validates the parser + math
 python vram_planner.py --version
 ```
 
-Calibration and benchmark history live in `%LOCALAPPDATA%ram-planner\`
+Calibration and benchmark history live in `%LOCALAPPDATA%\vram-planner\`
 (`~/.local/share/vram-planner/` elsewhere), not next to the script.
 
 ## Sliding-window attention (Gemma, Mistral, gpt-oss, Cohere2 ...)

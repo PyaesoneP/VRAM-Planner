@@ -1043,9 +1043,11 @@ def analyze(path, ctx, kv_type, n_ubatch, flash_attn,
         result["plan"] = {"kind": "unknown"}
         return result
 
-    # full-GPU need (embed+output already inside weights_mib)
+    # Weights that actually reach VRAM: the transformer blocks only. The token
+    # embeddings and output head stay in system RAM even at full offload.
+    block_weights_mib = weights_mib - embed_mib - output_mib
     compute_full_mib = compute_fn(n_layers)["gpu"]
-    full_need = weights_mib + kv_total_mib + rec_total_mib + compute_full_mib
+    full_need = block_weights_mib + kv_total_mib + rec_total_mib + compute_full_mib
     fully_fits = full_need <= eff_vram
 
     # max context that fits fully on GPU (all weights on GPU). KV is piecewise
@@ -1054,7 +1056,7 @@ def analyze(path, ctx, kv_type, n_ubatch, flash_attn,
     def _gpu_room(c):
         t = compute_buffer_terms(cfg, c, n_ubatch, flash_attn, n_seq)
         cb = compute_override_mib if compute_override_mib else round(t["graph"] + t["logits"], 1)
-        return eff_vram - weights_mib - rec_total_mib - cb
+        return eff_vram - block_weights_mib - rec_total_mib - cb
     max_ctx_gpu = max_ctx_for_kv_budget(cfg, kv_type, _gpu_room(ctx), n_ubatch,
                                         n_seq, flash_attn)
     for _ in range(4):                       # settle the compute-buffer feedback
@@ -1108,7 +1110,7 @@ def analyze(path, ctx, kv_type, n_ubatch, flash_attn,
         fill = ctx_fill if ctx_fill is not None else min(ctx, 8192)
         sp = estimate_speed(cfg, cl, gpu_blocks, fill, kv_type,
                             bw_vram_gbs or 500.0, bw_ram_gbs or 50.0,
-                            cpu_head=(int(ngl) < n_layers),
+                            cpu_head=True,   # the head stays in RAM at every -ngl
                             ram_eff=ram_eff, n_cpu_moe=plan.get("n_cpu_moe", 0) or 0,
                             n_cpu_ffn=n_cpu_ffn)
         sp["n_gpu_layers"] = int(ngl)
@@ -1170,10 +1172,15 @@ def _plan_dense(cfg, cl, eff_vram, ram, kv_total, kv_layer, compute, weights,
         full = (ngl >= n_layers)
         cb = compute_fn(ngl) if compute_fn else {"gpu": compute, "cpu": 0.0}
         if full:
-            gpu_w, gpu_kv = weights, kv_total
+            # Even at full offload the token embeddings and the output head stay in
+            # system RAM - measured across an -ngl sweep, no step matching their
+            # size appears at any layer count, and charging them to VRAM would
+            # leave less room for the compute buffer than the CUDA context alone
+            # occupies. Only the transformer blocks go to the GPU.
+            gpu_w, gpu_kv = weights - embed - output, kv_total
             gpu_rec = _mib(recurrent_bytes(cfg, range(n_layers), n_seq))
-            vram_used = weights + kv_total + gpu_rec + cb["gpu"]
-            cpu_w = cpu_kv = cpu_rec = 0.0
+            vram_used = gpu_w + kv_total + gpu_rec + cb["gpu"]
+            cpu_w, cpu_kv, cpu_rec = embed + output, 0.0, 0.0
             cpu_layers = 0
         else:
             on_gpu = gpu_blocks(ngl)
@@ -1248,15 +1255,19 @@ def _plan_dense_kv_on_gpu(cfg, cl, eff_vram, ram, kv_total, compute, weights,
     for dense models than a normal layer split."""
     n_layers = cfg["n_layers"]
     n_ffn = cl["n_ffn_layers"]
-    # base = attention + norms + embed + output + full KV, all on GPU
-    base_gpu = (weights - ffn_total) + kv_total + rec_total + compute
+    # Weights that actually reach VRAM: blocks minus the dense FFN we are exiling.
+    # Embeddings and the output head stay in system RAM - see _plan_dense.build().
+    head_ram = _mib(cl["embed_bytes"] + cl["output_bytes"])
+    onchip_attn = weights - ffn_total - head_ram
+    # base = attention + norms + full KV, all on GPU
+    base_gpu = onchip_attn + kv_total + rec_total + compute
     if base_gpu <= eff_vram:
         spare = eff_vram - base_gpu
         ffn_on_gpu = int(spare / ffn_layer_mean) if ffn_layer_mean > 0 else 0
         ffn_on_gpu = max(0, min(ffn_on_gpu, n_ffn))
         ffn_on_cpu = n_ffn - ffn_on_gpu
         vram_used = base_gpu + ffn_on_gpu * ffn_layer_mean
-        cpu_weights = ffn_on_cpu * ffn_layer_mean
+        cpu_weights = ffn_on_cpu * ffn_layer_mean + head_ram
         ram_ok = cpu_weights <= ram
         if ffn_on_cpu == 0:
             head = "All KV on GPU and the whole model fits - no FFN offload needed."
@@ -1287,13 +1298,14 @@ def _plan_dense_kv_on_gpu(cfg, cl, eff_vram, ram, kv_total, compute, weights,
             "ffn_on_cpu": ffn_on_cpu, "ffn_on_gpu": ffn_on_gpu, "n_ffn_layers": n_ffn,
             "vram_used_mib": vram_used, "vram_budget_mib": eff_vram,
             "ram_used_mib": cpu_weights, "ram_ok": ram_ok, "max_ctx_gpu": max_ctx_gpu,
-            "gpu_weights_mib": (weights - ffn_total) + ffn_on_gpu * ffn_layer_mean,
+            "gpu_weights_mib": onchip_attn + ffn_on_gpu * ffn_layer_mean,
             "gpu_kv_mib": kv_total, "compute_mib": compute, "gpu_recurrent_mib": rec_total,
             "cpu_weights_mib": cpu_weights, "cpu_kv_mib": 0.0,
             "lmstudio": ls, "llama_cmd": cmd, "headline": head,
         }
     # even attention + full KV don't fit -> the attention weights pinned to the GPU are the wall
-    onchip = weights - ffn_total          # attention + embed + output (must be on GPU for KV to be)
+    # attention weights only - the KV cache cannot live apart from them
+    onchip = onchip_attn
     attn_base = onchip + rec_total + compute
     room = eff_vram - attn_base
     max_ctx_kv_gpu = max_ctx_for_kv_budget(cfg, kv_type, room, n_ubatch, n_seq, flash_attn)
@@ -1310,9 +1322,9 @@ def _plan_dense_kv_on_gpu(cfg, cl, eff_vram, ram, kv_total, compute, weights,
         "ffn_on_cpu": n_ffn, "ffn_on_gpu": 0, "n_ffn_layers": n_ffn,
         "n_gpu_layers": n_layers,
         "vram_used_mib": base_gpu, "vram_budget_mib": eff_vram, "ram_used_mib": ffn_total,
-        "gpu_weights_mib": weights - ffn_total, "gpu_kv_mib": kv_total, "compute_mib": compute,
+        "gpu_weights_mib": onchip_attn, "gpu_kv_mib": kv_total, "compute_mib": compute,
         "gpu_recurrent_mib": rec_total,
-        "cpu_weights_mib": ffn_total, "cpu_kv_mib": 0.0, "max_ctx_gpu": max_ctx_gpu,
+        "cpu_weights_mib": ffn_total + head_ram, "cpu_kv_mib": 0.0, "max_ctx_gpu": max_ctx_gpu,
         "max_ctx_kv_gpu": max_ctx_kv_gpu,
         "lmstudio": ["Attention weights that must stay on GPU: %.0f MiB (KV can't live apart from them)." % onchip,
                      "Those + %.0f MiB KV + %.0f MiB compute = %.0f MiB (budget %.0f MiB)."
@@ -1367,10 +1379,9 @@ def _plan_moe(cfg, cl, eff_vram, ram, kv_total, kv_layer, compute, weights,
             else:
                 cpu_w += b
         gpu_w, cpu_w = _mib(gpu_w), _mib(cpu_w)
-        if ngl >= n_layers:
-            gpu_w += embed + output          # output head rides along at full offload
-        else:
-            cpu_w += embed + output
+        # embeddings and the output head stay in system RAM at every layer count -
+        # see the note in _plan_dense.build()
+        cpu_w += embed + output
         gpu_kv = _mib(kv_bytes_total(cfg, kv_type, on_gpu))
         gpu_rec = _mib(recurrent_bytes(cfg, on_gpu, n_seq))
         rest = [i for i in range(n_layers) if i not in set(on_gpu)]
@@ -3579,6 +3590,8 @@ def self_test():
                              "Qwen3.6-27B-UD-Q4_K_XL.gguf"), "qwen35 hybrid-SSM"),
         "q35": (os.path.join(mroot, "unsloth", "Qwen3.6-35B-A3B-GGUF",
                              "Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf"), "qwen35moe hybrid"),
+        "q9":  (os.path.join(mroot, "unsloth", "Qwen3.5-9B-MTP-GGUF",
+                             "Qwen3.5-9B-Q6_K.gguf"), "qwen35 hybrid + MTP"),
     }
     # model, ctx, ngl, seq, ubatch, flash, kv, measured MiB, projector
     obs = [("g31", 32768,  4, 1, 512, True,  "q8_0",  2797.7, False),
@@ -3612,7 +3625,17 @@ def self_test():
            ("q35", 2048,   1, 1, 64,  True,  "f16",    895.5, False),
            # multi-sequence: exercises the recurrent state and the SWA window
            ("q27", 32768,  6, 8, 512, True,  "f16",   3035.7, False),
-           ("q27", 32768,  6, 2, 512, True,  "f16",   2967.6, False)]
+           ("q27", 32768,  6, 2, 512, True,  "f16",   2967.6, False),
+           # FULL offload, where embeddings and the output head decide the answer.
+           # This model is 22% embed+head, so charging them to VRAM was a ~1.6 GB
+           # error that stayed hidden on the bigger models above.
+           ("q9",  8192,  33, 1, 512, True,  "q8_0",  6827.6, False),
+           ("q9",  8192,  99, 1, 512, True,  "q8_0",  6983.6, False),
+           ("q9",  65536, 99, 1, 512, True,  "q8_0",  8215.7, False),
+           ("q9",  131072,99, 1, 512, True,  "q8_0",  9623.9, False),
+           ("q9",  8192,   1, 1, 512, True,  "q8_0",  1087.6, False),
+           ("q9",  8192,   2, 1, 512, True,  "q8_0",  1285.6, False),
+           ("q9",  8192,  31, 1, 512, True,  "q8_0",  6477.6, False)]
     this_gpu = _active_gpu()
     hw_match = (this_gpu == REF_GPU)
     seen, worst, worst_lbl, n = set(), 0.0, "", 0

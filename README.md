@@ -271,6 +271,10 @@ fit that no longer applies.
 - **Non-CUDA backends are unvalidated.** See Supported platforms above.
 - **Multi-GPU is not modelled.** `--tensor-split` is ignored; the plan targets GPU 0
   and the tool warns when it sees more than one card.
+- **Crossing `-ngl > n_layer` costs a fixed ~156 MiB** that is not the output
+  weight and does not scale with ubatch (measured 172 / 156 / 140 MiB at ubatch
+  128 / 512 / 2048). The planner does not model it, so a full-offload plan can be
+  off by that much in either direction depending on how you invoke llama.cpp.
 - **Two measured anomalies I could not explain from outside the process.** On
   Qwen3.6-35B-A3B the recurrent state does not scale with `-np`, while Qwen3.6-27B's
   scales exactly as modelled (+88.0 MiB measured vs +87.3 predicted). And on

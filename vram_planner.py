@@ -309,12 +309,43 @@ def extract_config(model):
         kv_heads_per_layer = [kvh] * (n_layers or 0) if kvh else []
     aset = set(attn_layers)
     kv_heads_per_layer = [(h if i in aset else 0)
-                          for i, h in enumerate(kv_heads_per_layer)]
+                          for i, h in enumerate(kv_heads_per_layer)]  # 0 for SSM and MTP
 
     n_vocab = 0
     for t in model["tensors"]:
         if "token_embd" in t["name"] and len(t["dims"]) >= 2:
             n_vocab = max(t["dims"])
+
+    # ---- multi-token-prediction (MTP / "nextn") blocks -----------------------
+    # DeepSeek-V3, GLM-4.5/4.6 and Qwen3.5 ship extra blocks that predict further
+    # tokens ahead. They sit at the END of the block list, are counted in
+    # block_count, and look exactly like ordinary transformer blocks in the tensor
+    # table - same attn_q/k/v, same FFN - plus a few nextn.* tensors.
+    #
+    # Measured on Qwen3.5-9B-MTP (5 configurations, ctx 8k-131k): their weights
+    # ARE loaded and resident, but they do NOT grow a KV cache, because they do
+    # not run during ordinary decoding. Counting their KV inflated the cache by
+    # 1/9 here. So: keep the weight, drop the cache.
+    n_mtp = _as_int(g(".nextn_predict_layers"), 0) or 0
+    if n_mtp <= 0 and any(".nextn." in t["name"] for t in model["tensors"]):
+        seen = set()
+        for t in model["tensors"]:
+            if ".nextn." in t["name"]:
+                mm = RE_BLK.match(t["name"])
+                if mm:
+                    seen.add(int(mm.group(1)))
+        n_mtp = len(seen)
+    n_mtp = max(0, min(n_mtp, (n_layers or 0)))
+    mtp_layers = list(range((n_layers or 0) - n_mtp, n_layers or 0)) if n_mtp else []
+    if mtp_layers:
+        mset = set(mtp_layers)
+        attn_layers = [i for i in attn_layers if i not in mset]
+        ssm_layers  = [i for i in ssm_layers if i not in mset]
+        # kv_heads_per_layer was built above from the pre-MTP attention set, so it
+        # has to be zeroed here too or the cache is still sized for these blocks
+        for i in mtp_layers:
+            if i < len(kv_heads_per_layer):
+                kv_heads_per_layer[i] = 0
 
     # ---- sliding-window attention (SWA) --------------------------------------
     # Gemma 2/3/4, Mistral, Phi-3, Cohere2, gpt-oss, Llama-4 and friends cap most
@@ -377,6 +408,7 @@ def extract_config(model):
         "recurrent_bytes_per_layer": recurrent_bytes,
         "full_attention_interval": _as_int(g(".full_attention_interval"), 0) or 0,
         "n_swa": n_swa, "swa_layers": sorted(swa_layers), "swa_source": swa_source,
+        "n_mtp_layers": n_mtp, "mtp_layers": mtp_layers,
         "kv_layer_dims": kv_layer_dims,
         "kv_ctx_per_layer": [],          # filled in by resolve_kv_lengths()
     }
@@ -742,8 +774,13 @@ def per_token_bytes(cfg, cl, gpu_blocks, ctx_fill, kv_type, cpu_head=True,
     frac = (n_used / n_exp) if (n_exp and n_used) else 1.0
     ffns = cl.get("per_layer_ffn_bytes") or {}
     on = set(gpu_blocks)
+    # MTP blocks are resident but do not run during ordinary decoding, so their
+    # weights are never streamed per token. Counting them would understate tok/s.
+    mtp = set(cfg.get("mtp_layers") or [])
     gpu = cpu = 0.0
     for i in range(cfg["n_layers"] or 0):
+        if i in mtp:
+            continue
         dense = per.get(i, 0) - exps.get(i, 0)
         act_exp = exps.get(i, 0) * frac          # only n_used experts fire
         if i in on:
@@ -2744,6 +2781,10 @@ function render(r){
         ? kvItem("sliding window", r.swa.n_swa.toLocaleString() + " tok &middot; " +
             r.swa.n_swa_layers + " windowed / " + r.swa.n_global_layers + " global")
         : "")+
+      (c.n_mtp_layers
+        ? kvItem("multi-token pred.", c.n_mtp_layers + " block" + (c.n_mtp_layers==1?"":"s") +
+            ' <span class="muted">(weights counted, no KV)</span>')
+        : "")+
       kvItem("head dim", (c.head_dim_k||"-") +
         ((r.swa && r.swa.enabled && r.swa.head_dim!==r.swa.head_dim_global)
           ? '  <span class="muted">/ '+r.swa.head_dim+' swa</span>' : ""))+
@@ -3678,6 +3719,40 @@ def self_test():
              (rt or {}).get("context"), (rt or {}).get("n_cpu_moe"),
              "OK" if rt_ok else "FAIL"))
     ok = ok and rt_ok
+
+    # 8e) multi-token-prediction blocks. They sit at the end of the block list and
+    #     look like ordinary transformer blocks, so they get counted twice over:
+    #     once in the weights (correct - measurement shows they ARE resident) and
+    #     once in the KV cache (wrong - they never grow one). Measured on
+    #     Qwen3.5-9B-MTP: the ctx-slope over 8k->131k is 2640.3 MiB, which matches
+    #     8 attention layers (-1.5%), not the 9 the block list implies (+10.9%).
+    mtpp = os.path.join(mroot, "unsloth", "Qwen3.5-9B-MTP-GGUF", "Qwen3.5-9B-Q6_K.gguf")
+    if os.path.isfile(mtpp):
+        mc = extract_config(load_gguf(mtpp))
+        struct_ok = (mc["n_mtp_layers"] == 1 and mc["mtp_layers"] == [32]
+                     and 32 not in mc["attn_layers"]
+                     and mc["kv_heads_per_layer"][32] == 0
+                     and len(mc["attn_layers"]) == 8)
+        def _v(ctx):
+            rr = analyze(mtpp, ctx, "q8_0", 512, True, vram_budget_mib=1 << 20,
+                         ram_budget_mib=1 << 20, gpu_reserve_mib=0,
+                         compute_override_mib=None, safety_pct=0, n_seq=1,
+                         gpu_layers_override=mc["n_layers"], include_mmproj=False)
+            return rr["plan"]["vram_used_mib"]
+        # The structural facts are the actual assertion - they are exact. The slope
+        # is the evidence that justified them, kept here only as a sanity net; a
+        # tight bound on it would really be testing the compute-buffer coefficients,
+        # which are fitted and which calibration legitimately moves.
+        slope = _v(131072) - _v(8192)
+        slope_err = abs(slope - 2640.3) / 2640.3 * 100.0
+        mtp_ok = struct_ok and slope_err <= 10.0
+        print("  MTP    %d nextn block(s), %d attention layers (not %d), ctx-slope "
+              "%.0f MiB vs measured 2640 (%.1f%% on shipped defaults)  %s"
+              % (mc["n_mtp_layers"], len(mc["attn_layers"]), len(mc["attn_layers"]) + 1,
+                 slope, slope_err, "OK" if mtp_ok else "FAIL"))
+        ok = ok and mtp_ok
+    else:
+        print("  MTP    skipped (reference MTP model not present)")
 
     # 9) the calibration fitter must recover known coefficients from synthetic rows,
     #    and must REFUSE to free terms the data cannot identify (fitting four

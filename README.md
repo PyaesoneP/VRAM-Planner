@@ -216,24 +216,47 @@ Validated against real llama.cpp across four architectures; per-layer offload de
 match to ~0.1 MiB.
 
 **Estimated**: the compute buffer, and only that. The obvious formula for it is wrong,
-so it is modelled from measurement instead. Across 17 controlled `llama-server` loads
-the GPU-side overhead:
+and so was this tool's first attempt at it. The numbers now come from llama.cpp's own
+allocator — running with `-v` prints `CUDA0 compute buffer size = N MiB`, which is
+exact, where the earlier fit inferred this term by subtracting everything else from
+total process VRAM. Measured that way over 36 loads across four architectures, the
+GPU-side overhead:
 
-- does **not** depend on `n_batch` at all (identical at 512 and 2048),
-- does **not** depend on how many layers are offloaded (one scratch pool),
-- grows linearly in `n_ctx` **independently of `n_ubatch`** — so it is not the
-  `[n_kv x n_ubatch]` attention mask the graph structure suggests,
-- grows linearly in `n_ubatch` independently of `n_ctx`,
-- and has a large fixed pool that scales with **hidden size**, not with layer count
-  (measured 342 MiB at hidden 2048 up to 991 MiB at hidden 5120).
+- **is allocated even at `-ngl 0`**, where not one layer is offloaded — 999 MiB at
+  ctx 131072. The tool used to charge the GPU nothing here, which is exactly what let
+  partial-offload plans overcommit and spill into shared memory;
+- does **not** depend on how many layers are offloaded — but **does** depend on whether
+  the graph is *split*. Identical at `-ngl` 0, 8 and 23 (999.38 MiB), and *smaller* at
+  full offload (719.66). A split graph costs more, not less;
+- grows linearly in `n_ctx`, **flat — not as a share of the KV cache**. Qwen3.6-27B has
+  exactly 2x Qwen3.5-9B's KV bytes per token and the identical 7296 B/token here; Gemma
+  4 26B's cache does not grow with context at all (sliding window) yet its buffer still
+  grows at 7379 B/token. Sliding-window layers get no discount in this term;
+- grows separately in `n_ctx x n_ubatch` — the f16 attention mask, which fitted freely
+  to **1.990 B** and is the one term whose textbook value the data actually confirms;
+- costs **more** with a quantised KV cache than with f16 (5120 vs 1024 B/token), the
+  opposite of what the cache sizes do;
+- does **not** depend on `n_batch`, or on `--parallel` (719.66 MiB at `-np` 1 and 4);
+- and sits on a fixed floor that scales with **hidden size** (~147 MiB at hidden 2048,
+  ~759 MiB at hidden 5120) — but only once at least one layer is actually on the GPU.
+  At `-ngl 0` the process holds a bare CUDA context of ~156 MiB and nothing more,
+  because CUDA loads kernel modules lazily.
 
-So the model is additive: `const(hidden) + act(hidden x ubatch) + ctx(KV/token x ctx)`,
-plus the f32 score matrix when flash attention is **off** — that term alone is ~3.5 GiB
+That floor is invisible to the allocator log, so it is fitted from total-VRAM
+measurements instead, with the scaling terms held at their allocator-derived values.
+The log fixes the slopes exactly; the perf counters fix the floor.
+
+Plus the f32 score matrix when flash attention is **off** — that term alone is ~3.5 GiB
 at 64k context on a 32-head model, which is why FA is not optional at long context.
 
-Accuracy of the shipped coefficients: **3.2% mean, 12.3% worst over 35 measured loads**
-across four architectures — on one CUDA card. They are a starting point, not arithmetic.
-Press **Measure** to pin them for your machine (see below).
+Accuracy: **2.7% mean, 8.1% worst over 37 measured loads** across four architectures,
+spanning `-ngl` 0 to full offload, context 2048 to 262144, ubatch 64 to 2048, both cache
+types, with and without the projector and MTP draft cache — on one CUDA card. Measured
+in isolation the buffer itself is only good to ~21%; it looks better than that in a
+plan because it sits alongside weights and KV, which are exact. Residuals run positive
+at short context and negative at long, so the truth is probably a `max()` over several
+buffers rather than a sum, and no additive form will close it. Press **Measure** to pin
+it for your machine (see below).
 
 - **Parallel seqs** should match LM Studio's "Parallel" / llama.cpp `-np`. It sizes the
   recurrent state on hybrid models and the sliding-window cache on SWA models.
@@ -271,10 +294,6 @@ fit that no longer applies.
 - **Non-CUDA backends are unvalidated.** See Supported platforms above.
 - **Multi-GPU is not modelled.** `--tensor-split` is ignored; the plan targets GPU 0
   and the tool warns when it sees more than one card.
-- **Crossing `-ngl > n_layer` costs a fixed ~156 MiB** that is not the output
-  weight and does not scale with ubatch (measured 172 / 156 / 140 MiB at ubatch
-  128 / 512 / 2048). The planner does not model it, so a full-offload plan can be
-  off by that much in either direction depending on how you invoke llama.cpp.
 - **Two measured anomalies I could not explain from outside the process.** On
   Qwen3.6-35B-A3B the recurrent state does not scale with `-np`, while Qwen3.6-27B's
   scales exactly as modelled (+88.0 MiB measured vs +87.3 predicted). And on

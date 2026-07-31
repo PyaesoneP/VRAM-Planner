@@ -20,7 +20,7 @@ import os, re, sys, json, math, glob, time, struct, argparse, subprocess, webbro
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
-__version__ = "1.0.2"
+__version__ = "1.0.3"
 
 MiB = 1024 * 1024
 GiB = 1024 * 1024 * 1024
@@ -610,19 +610,39 @@ def recurrent_bytes(cfg, layers, n_seq):
 # Empirical coefficients for the GPU-side runtime overhead (compute buffer +
 # backend workspace). These are MEASURED, not derived: see the note in
 # compute_buffer_terms for why the textbook formula does not describe reality.
-# Fitted jointly over 24 measured llama.cpp loads spanning four architectures
-# (gemma4 dense + gemma4 MoE + qwen35 hybrid-SSM + qwen35moe), CUDA / llama.cpp
-# 2.27.1. Mean error 4.8%, worst 12.1%. Fitting on a single model instead gave
-# 14% mean / 32% worst on the other three - the shape held, the constants did not.
-CB_ACT_PER_HIDDEN  = 56.12    # bytes per ubatch token per unit of hidden size
-CB_CTX_FRAC        = 0.1164   # per ctx token, as a share of one token of f16 KV
+# Fitted over 36 loads spanning four architectures (gemma4 MoE + qwen35
+# hybrid-SSM + qwen35moe + qwen35 27B), CUDA / llama.cpp 2.27.1, against the
+# `CUDA0 compute buffer size` the allocator itself reports under -v. Earlier
+# versions fitted against total process VRAM, where this term is a small share of
+# a total dominated by exact weights and KV - that flattered the error badly. On
+# the buffer alone the old form scores 54% mean / 311% worst; this one scores
+# 20.7% mean / 76.6% worst. It is still the one estimated term in the tool.
+CB_ACT_PER_HIDDEN  = 44.25    # bytes per ubatch token per unit of hidden size
+# The ctx term is NOT a share of the KV cache, which is what this used to assume.
+# Disproved directly: Qwen3.6-27B has exactly 2x Qwen3.5-9B's KV bytes per token
+# and an identical 7296 B/token of compute buffer, and Gemma 4 26B's KV does not
+# grow with context at all (sliding window, flat at 159.38 MiB) yet its buffer
+# still grows at 7379 B/token. So it is charged per context token, flat, and
+# sliding-window layers get no discount here even though they do for the cache.
+CB_CTX_PER_TOKEN   = 1059.9   # bytes per ctx token
+# ... plus the attention mask [n_kv x n_ubatch]. Fitted freely at 1.990 B, which
+# is f16 to within a rounding error - a good sign the decomposition is real and
+# not just a curve with enough knobs.
+CB_MASK_PER_UB_TOK = 2.0      # bytes per (ubatch token x ctx token)
+# A quantised KV cache costs MORE compute buffer than f16, not less: measured
+# 5120 B/token at q8_0 against 1024 B/token at f16, same model and config. The
+# cache is smaller but the kernels need scratch the f16 path does not.
+CB_CTX_QUANT_BYTES = 3070.0   # extra bytes per ctx token when the cache is quantised
+# When the graph spans both CPU and GPU, the CUDA pool is BIGGER than at full
+# offload, not smaller. Measured on Qwen3.5-9B: 999.38 MiB at -ngl 0, 8 and 23
+# alike against 719.66 at -ngl 33 (ctx 131072), and 315.38 against 239.66 (ctx
+# 32768). So the surcharge is independent of how many layers landed on the GPU -
+# it is binary in whether the graph is split at all - but it does grow with
+# context, at 2176 B/token, which is one attention layer's worth of cache: the
+# staging buffer for moving activations across the backend boundary.
+CB_SPLIT_GRAPH_MIB = 7.7      # flat part of the split surcharge, MiB
+CB_SPLIT_PER_TOKEN = 2176.0   # ... plus this per context token
 CB_NOFA_HEAD_BYTES = 3.36     # f32 score matrix, per head per ctx token per ubatch token
-# The fixed pool is not actually fixed: it scales with the residual-stream width.
-# Measured directly with minimal probes (ctx 2048, ubatch 64, -ngl 1), where the
-# scaling terms nearly vanish, it ran 342 MiB (hidden 2048) to 991 MiB (hidden
-# 5120) - a 3x range that no single constant can cover. The per-machine part is
-# the additive base, which is what calibration fits.
-CB_CONST_PER_KHID  = 149.18   # MiB per 1000 units of hidden size
 
 # MTP speculative decoding (llama.cpp --spec-type draft-mtp). Measured on
 # Qwen3.5-9B-MTP at ctx 8k/32k/131k and --parallel 1/2/4: the draft cache costs
@@ -630,20 +650,35 @@ CB_CONST_PER_KHID  = 149.18   # MiB per 1000 units of hidden size
 # per-sequence slot. Linear in both to within ~9%.
 MTP_SPEC_CONST_MIB   = 104.0
 MTP_SPEC_PER_SEQ_MIB = 100.0
-# The constant covers CUDA context + driver + the fixed graph pool together: they
-# cannot be separated from outside the process, and fitting them jointly is what
-# the measurements support. So the GPU reserve field defaults to 0 - reserving on
-# top of this would double-count. (One caveat: at -ngl 0, where no graph runs on
-# the GPU at all, a bare CUDA context still measured ~714 MiB. That degenerate
-# case is not modelled; it is also not a case anyone plans for.)
-CB_GRAPH_CONST_MIB = 84.5     # additive base: CUDA context + driver, per machine
+# Everything the process holds on top of the pool the allocator reports: the CUDA
+# context, the driver, and the lazily-loaded kernel modules. The allocator log
+# cannot see any of it, so these two come from total-process-VRAM measurements
+# instead - 25 loads across four architectures - with the scaling terms above
+# held fixed at their allocator-derived values. That division of labour is the
+# point: the log fixes the slopes exactly, the perf counters fix the floor.
+#
+# It is genuinely large and it scales with the residual-stream width: ~147 MiB at
+# hidden 2048 against ~759 MiB at hidden 5120. A bare CUDA context measured 156
+# MiB on its own, so most of this is kernel modules, and wider models pull in
+# more of them. The intercept is negative because it is an intercept and not a
+# byte count; the pair is clamped at zero below.
+CB_GRAPH_CONST_MIB = -102.1   # additive base, per machine (this is what Measure fits)
+CB_CONST_PER_KHID  = 200.17   # MiB per 1000 units of hidden size
+# ... but only once at least one layer actually runs on the GPU. At -ngl 0 the
+# process holds a bare CUDA context and nothing else: dedicated VRAM minus the
+# reported compute buffer came to 156.2 / 156.4 / 155.97 MiB across three
+# configs, against the ~555 MiB the formula above gives for that model. CUDA
+# loads kernel modules lazily, so with no layer offloaded almost none arrive.
+# (This is also the "-ngl > n_layer costs a fixed ~156 MiB" anomaly that shipped
+# as a known issue - the same allocation, seen from the other side.)
+CB_CUDA_CTX_MIB    = 156.0    # bare CUDA context, when no layer is on the GPU
 
 # These four are the ONLY numbers in the tool that are fitted rather than read
 # from the model file, and they are the only ones that depend on the machine
 # rather than the model. They ship as a prior and are refined per GPU from the
 # user's own Measure runs - see fit_calibration().
 CB_DEFAULTS = {"const": CB_GRAPH_CONST_MIB, "act": CB_ACT_PER_HIDDEN,
-               "ctx": CB_CTX_FRAC, "nofa": CB_NOFA_HEAD_BYTES}
+               "ctx": CB_CTX_PER_TOKEN, "nofa": CB_NOFA_HEAD_BYTES}
 _CALIB_CACHE = {}                     # (gpu, backend) key -> fitted coefficient dict
 _CALIB_LOADED = False                 # the store is read once, lazily
 
@@ -672,30 +707,43 @@ def _active_gpu():
     g = gpu_list()
     return (g[0].get("name") or "") if g else ""
 
-def compute_buffer_terms(cfg, context, n_ubatch, flash_attn, n_seq=1):
+def compute_buffer_terms(cfg, context, n_ubatch, flash_attn, n_seq=1, kv_type="f16"):
     """The GPU-side runtime overhead beyond weights and KV, in MiB.
 
     This is the ONLY fuzzy term; weights and KV are exact. It is worth being
-    explicit about how this is derived, because the obvious formula is wrong.
+    explicit about how it is derived, because the obvious formula is wrong and so
+    was the previous version of this one.
 
-    Measuring llama.cpp (CUDA, 17 configurations, one model) shows the overhead:
-      * does NOT depend on n_batch at all (identical to the byte at 512 vs 2048);
-      * does NOT depend on how many layers are offloaded (one scratch pool, and
-        it is the same size at -ngl 4 and -ngl 8);
-      * grows LINEARLY in n_ctx, independent of n_ubatch - so it is NOT the
-        [n_kv x n_ubatch] attention mask that the graph structure suggests. A
-        regression with a ub*ctx term drives that term negative;
-      * grows linearly in n_ubatch, independent of n_ctx;
-      * has a large fixed floor (the CUDA context, ~700 MiB on a 12 GB card),
-        which is what the GPU reserve field is for.
+    The numbers behind it come from llama.cpp's own allocator: running with -v
+    prints `CUDA0 compute buffer size = N MiB`, which is exact, where the earlier
+    fit used total process VRAM and had to infer this term by subtraction. 36
+    loads across four architectures show it:
 
-    So the model is additive and empirical:  const + f(ctx) + g(n_ubatch).
-    The coefficients were fitted on one model on one GPU, so treat this as a good
-    starting point and not as arithmetic - press Measure to pin it exactly for
-    your machine. Weights and KV need no such caveat.
+      * IS allocated on the GPU even at -ngl 0, where no layer is offloaded at
+        all. Measured 999.38 MiB at ctx 131072. The previous version charged the
+        GPU nothing here, which is what made partial-offload plans overcommit.
+      * does NOT depend on how many layers are offloaded - but DOES depend on
+        whether the graph is split. Identical at -ngl 0, 8 and 23 (999.38 MiB),
+        and smaller at full offload (719.66). See CB_SPLIT_GRAPH_MIB.
+      * grows linearly in n_ctx, and separately in n_ctx x n_ubatch - the second
+        being the f16 attention mask, which fitted freely to 1.990 B.
+      * grows with n_ctx *flat*, not as a share of the KV cache: two models with
+        2x different KV per token show the identical 7296 B/token, and a
+        sliding-window model whose cache does not grow with context at all still
+        grows here. Sliding-window layers therefore get no discount in this term.
+      * costs MORE with a quantised KV cache than with f16 (5120 vs 1024
+        B/token), the opposite of what the cache sizes do.
+      * does NOT depend on n_batch, or on --parallel (719.66 at -np 1 and -np 4).
+
+    Residuals are systematically positive at short context and negative at long,
+    so the truth is almost certainly a max() over several buffers rather than a
+    sum, and no linear form will close it. This one lands at 20.7% mean / 76.6%
+    worst on the buffer in isolation. Press Measure to pin it for your machine;
+    weights and KV need no such caveat.
 
     Returned separately:
       * graph  - the pool above, which lives wherever the layers run.
+      * split_extra - the surcharge for a graph that spans CPU and GPU.
       * logits - the output tensor [n_outputs x n_vocab], produced by the output
         matmul, so it belongs to whichever backend holds the head - NOT
         automatically to the GPU.
@@ -705,26 +753,26 @@ def compute_buffer_terms(cfg, context, n_ubatch, flash_attn, n_seq=1):
     n_vocab = cfg.get("n_vocab") or 32000
     ub      = max(1, n_ubatch)
     ctx     = max(1, context)
+    K       = calib_coeffs()
+
+    # the floor: CUDA context + driver + kernel modules. Clamped at zero because
+    # the intercept is negative and a narrow enough model would drive it under.
+    floor = max(0.0, K["const"] + CB_CONST_PER_KHID * hidden / 1000.0)
 
     attn = cfg.get("attn_layers") or []
     if not attn:
-        return {"graph": round(calib_coeffs()["const"]
-                                + CB_CONST_PER_KHID * (cfg["hidden"] or 4096) / 1000.0, 1),
-                "logits": 0.0}
+        return {"graph": round(floor, 1), "floor": round(floor, 1), "logits": 0.0,
+                "split_extra": round(CB_SPLIT_GRAPH_MIB + _mib(CB_SPLIT_PER_TOKEN * ctx), 1)}
 
-    # ubatch-sized activation scratch, in units of the FFN width
-    K = calib_coeffs()
+    # ubatch-sized activation scratch, in units of the residual-stream width
     act = K["act"] * ub * hidden
 
-    # the ctx-linear term, expressed against one token of full-attention KV so it
-    # carries across architectures (head count, GQA ratio and cache quant all move
-    # it). Sliding-window layers contribute only their window, as they do for KV.
-    kv_tok_global = sum(kv_bytes_per_token_layer(cfg, "f16", i)
-                        for i in attn if not is_swa_layer(cfg, i))
-    kv_tok_swa    = sum(kv_bytes_per_token_layer(cfg, "f16", i)
-                        for i in attn if is_swa_layer(cfg, i))
-    swa_len = swa_cache_len(cfg, ctx, ub, n_seq, flash_attn)
-    ctx_term = K["ctx"] * (kv_tok_global * ctx + kv_tok_swa * swa_len)
+    # context terms: a flat per-token pool plus the [n_kv x n_ubatch] f16 mask,
+    # with a surcharge when the cache is quantised. No SWA discount here - see
+    # the note above; that is measured, not an oversight.
+    ctx_term = K["ctx"] * ctx + CB_MASK_PER_UB_TOK * ub * ctx
+    if kv_type != "f16":
+        ctx_term += CB_CTX_QUANT_BYTES * ctx
 
     # without flash attention the full f32 score matrix is materialised, and it is
     # the one term that really is [n_kv x n_ubatch x n_head]
@@ -734,9 +782,10 @@ def compute_buffer_terms(cfg, context, n_ubatch, flash_attn, n_seq=1):
         # ^ this term is why flash attention is not optional at long context:
         #   at 64k ctx it alone is ~3.5 GiB on a 32-head model.
 
-    graph = (K["const"] + CB_CONST_PER_KHID * hidden / 1000.0
-             + _mib(act + ctx_term + scores))
-    return {"graph": round(graph, 1), "logits": round(_mib(4.0 * ub * n_vocab), 1)}
+    graph = floor + _mib(act + ctx_term + scores)
+    return {"graph": round(graph, 1), "floor": round(floor, 1),
+            "logits": round(_mib(4.0 * ub * n_vocab), 1),
+            "split_extra": round(CB_SPLIT_GRAPH_MIB + _mib(CB_SPLIT_PER_TOKEN * ctx), 1)}
 
 def compute_buffer_split(terms, any_on_gpu, any_on_cpu, output_on_gpu, override_mib=None):
     """Split the compute buffer across backends. llama.cpp allocates a scratch
@@ -745,16 +794,26 @@ def compute_buffer_split(terms, any_on_gpu, any_on_cpu, output_on_gpu, override_
     one holding the output head. At -ngl 4 of 60 the head stays on the CPU, so
     charging its (often huge) logits buffer to VRAM overstates the GPU footprint.
 
+    The scaling part of the graph pool is charged to the GPU whether or not a
+    layer landed there - it is allocated at -ngl 0 too, measured at 999.38 MiB.
+    Charging nothing there is what let partial-offload plans overcommit. Only the
+    fixed floor is conditional, because that floor is lazily-loaded CUDA kernel
+    modules and they do not arrive until a layer needs them.
+
     An override is a measured VRAM number, so it replaces the GPU side outright."""
-    gpu = (terms["graph"] if any_on_gpu else 0.0) + (terms["logits"] if output_on_gpu else 0.0)
+    split_extra = terms.get("split_extra", 0.0) if any_on_cpu else 0.0
+    graph = terms["graph"]
+    if not any_on_gpu:
+        graph -= max(0.0, terms.get("floor", 0.0) - CB_CUDA_CTX_MIB)
+    gpu = graph + split_extra + (terms["logits"] if output_on_gpu else 0.0)
     cpu = (terms["graph"] if any_on_cpu else 0.0) + (0.0 if output_on_gpu else terms["logits"])
     if override_mib:
         gpu = float(override_mib)
     return {"gpu": round(gpu, 1), "cpu": round(cpu, 1)}
 
-def compute_buffer_mib(cfg, context, n_ubatch, flash_attn, n_seq=1):
+def compute_buffer_mib(cfg, context, n_ubatch, flash_attn, n_seq=1, kv_type="f16"):
     """Total compute buffer across all backends (back-compat / whole-model view)."""
-    t = compute_buffer_terms(cfg, context, n_ubatch, flash_attn, n_seq)
+    t = compute_buffer_terms(cfg, context, n_ubatch, flash_attn, n_seq, kv_type)
     return round(t["graph"] + t["logits"], 1)
 
 def _mib(x):
@@ -960,7 +1019,7 @@ def analyze(path, ctx, kv_type, n_ubatch, flash_attn,
     rec_total_mib = _mib(recurrent_bytes(cfg, range(n_layers), n_seq))
     rec_per_layer_mib = (rec_total_mib / len(cfg["ssm_layers"])) if cfg["ssm_layers"] else 0.0
 
-    compute_terms = compute_buffer_terms(cfg, ctx, n_ubatch, flash_attn, n_seq)
+    compute_terms = compute_buffer_terms(cfg, ctx, n_ubatch, flash_attn, n_seq, kv_type)
     # planning value: assume the whole graph runs on the GPU. The plan builders
     # re-split it once they know where the layers and the output head landed.
     compute_mib = compute_override_mib if compute_override_mib else \
@@ -1079,7 +1138,7 @@ def analyze(path, ctx, kv_type, n_ubatch, flash_attn,
     # linear in ctx once sliding-window layers are in play, and the compute buffer
     # itself grows with ctx, so re-solve rather than divide by a per-token cost.
     def _gpu_room(c):
-        t = compute_buffer_terms(cfg, c, n_ubatch, flash_attn, n_seq)
+        t = compute_buffer_terms(cfg, c, n_ubatch, flash_attn, n_seq, kv_type)
         cb = compute_override_mib if compute_override_mib else round(t["graph"] + t["logits"], 1)
         return eff_vram - block_weights_mib - rec_total_mib - cb
     max_ctx_gpu = max_ctx_for_kv_budget(cfg, kv_type, _gpu_room(ctx), n_ubatch,
@@ -2071,17 +2130,32 @@ def save_calibration(data):
         pass
 
 def _design(row):
-    """Regressors for one observation, in MiB, matching compute_buffer_terms."""
+    """Regressors for one observation, in MiB, matching compute_buffer_terms.
+
+    The ctx regressor is the raw context length, not the KV bytes it implies: the
+    compute buffer was measured to scale with context flat, independently of how
+    big the cache is. Rows written before this change carry a `kv_tok_ctx` field
+    that is simply ignored now."""
     return {"const": 1.0,
-            "ctx":   _mib(row["kv_tok_ctx"]),
+            "ctx":   _mib(row["ctx"]),
             "act":   _mib(row["hidden"] * row["ub"]),
             "nofa":  0.0 if row["fa"] else _mib(row["n_head"] * row["ub"] * row["ctx"])}
 
 def _struct_offset(row):
-    """Part of the graph pool that is structural (scales with hidden size) rather
-    than per-machine. It is not fitted, so it comes off the observation before the
-    additive base is solved for."""
-    return CB_CONST_PER_KHID * row["hidden"] / 1000.0
+    """Parts of the graph pool that are structural rather than per-machine: the
+    attention mask, the quantised-cache surcharge, and the split-graph penalty.
+    They are not fitted, so they come off the observation before the additive base
+    and the remaining slopes are solved for."""
+    off = (CB_CONST_PER_KHID * row["hidden"] / 1000.0
+           + _mib(CB_MASK_PER_UB_TOK * row["ub"] * row["ctx"]))
+    if row.get("kv_type", "f16") != "f16":
+        off += _mib(CB_CTX_QUANT_BYTES * row["ctx"])
+    # Rows written before n_layers was recorded cannot say whether the graph was
+    # split, so they are treated as unsplit. That biases those rows only.
+    n_layers, ngl = row.get("n_layers"), row.get("ngl")
+    if n_layers and ngl is not None and ngl < n_layers:
+        off += CB_SPLIT_GRAPH_MIB + _mib(CB_SPLIT_PER_TOKEN * row["ctx"])
+    return off
 
 def _solve(A, y):
     """Least squares by normal equations. Returns None if ill-conditioned."""
@@ -2236,6 +2310,7 @@ def record_calibration(path, ctx, kv_type, n_ubatch, n_seq, flash_attn, ngl,
            "ctx": ctx, "ub": n_ubatch, "n_seq": n_seq, "fa": bool(flash_attn),
            "ngl": ngl, "n_cpu_moe": n_cpu_moe, "kv_type": kv_type,
            "hidden": cfg["hidden"] or 4096, "n_head": cfg["n_head"] or 32,
+           "n_layers": cfg["n_layers"] or 0,
            "kv_tok_ctx": kvg * ctx + kvs * swa_cache_len(cfg, ctx, n_ubatch, n_seq, flash_attn),
            "exact_mib": round(exact, 1), "measured_mib": round(measured_mib, 1),
            "overhead_mib": round(overhead, 1)}
@@ -3603,17 +3678,19 @@ def self_test():
     rf = analyze(p2, 4096, "f16", 512, False, vram_budget_mib=99999, ram_budget_mib=8000,
                  gpu_reserve_mib=0, compute_override_mib=None, safety_pct=0)
     lg, gr = rc["sizes_mib"]["compute_logits"], rc["sizes_mib"]["compute_graph"]
-    # partial offload: graph scratch on both sides, logits with the CPU-side head.
-    # full offload: everything on the GPU, nothing left in RAM.
-    cb_ok = (abs(rc["plan"]["compute_mib"] - gr) < 0.05
+    # partial offload: graph scratch on both sides plus the split surcharge on the
+    # GPU, logits with the CPU-side head. Full offload: everything on the GPU, no
+    # surcharge, nothing left in RAM.
+    split_x = CB_SPLIT_GRAPH_MIB + _mib(CB_SPLIT_PER_TOKEN * 4096)
+    cb_ok = (abs(rc["plan"]["compute_mib"] - (gr + split_x)) < 0.05
              and abs(rc["plan"]["cpu_compute_mib"] - (gr + lg)) < 0.05
              and rf["plan"]["cpu_compute_mib"] == 0
              and abs(rf["plan"]["compute_mib"] - (gr + lg)) < 0.05 and lg > 0)
     print("  CMPBUF split ngl=2: gpu=%.1f cpu=%.1f | full offload: gpu=%.1f cpu=%.1f "
-          "(graph=%.1f logits=%.1f)  %s"
+          "(graph=%.1f logits=%.1f split=%.1f)  %s"
           % (rc["plan"]["compute_mib"], rc["plan"]["cpu_compute_mib"],
              rf["plan"]["compute_mib"], rf["plan"]["cpu_compute_mib"], gr, lg,
-             "OK" if cb_ok else "FAIL"))
+             split_x, "OK" if cb_ok else "FAIL"))
     ok = ok and cb_ok
 
     # 8) regression-lock the measured VRAM model. These are real llama-server runs
@@ -3674,7 +3751,24 @@ def self_test():
            ("q9",  131072,99, 1, 512, True,  "q8_0",  9623.9, False),
            ("q9",  8192,   1, 1, 512, True,  "q8_0",  1087.6, False),
            ("q9",  8192,   2, 1, 512, True,  "q8_0",  1285.6, False),
-           ("q9",  8192,  31, 1, 512, True,  "q8_0",  6477.6, False)]
+           ("q9",  8192,  31, 1, 512, True,  "q8_0",  6477.6, False),
+           # PARTIAL offload at long context, and -ngl 0. These are the rows that
+           # exposed the compute buffer being charged nothing to the GPU unless a
+           # layer landed there - which is what let plans overcommit and spill.
+           # -ngl 0 is not a case anyone plans for, but it isolates the pool
+           # perfectly: no weights, no KV on the GPU, so what is left is the term
+           # that used to be invisible.
+           ("q9",  32768,  0, 1, 512, True,  "q8_0",   471.6, False),
+           ("q9",  65536,  0, 1, 512, True,  "q8_0",   699.7, False),
+           ("q9",  131072, 0, 1, 512, True,  "q8_0",  1155.8, False),
+           ("q9",  262144, 0, 1, 512, True,  "q8_0",  2068.1, False),
+           ("q9",  32768,  8, 1, 512, True,  "q8_0",  2661.7, False),
+           ("q9",  32768, 16, 1, 512, True,  "q8_0",  4191.7, False),
+           ("q9",  32768, 23, 1, 512, True,  "q8_0",  5543.7, False),
+           ("q9",  131072,23, 1, 512, True,  "q8_0",  7451.9, False),
+           ("q9",  262144,23, 1, 512, True,  "q8_0",  9996.1, False),
+           ("q9",  32768, 33, 1, 512, True,  "q8_0",  7355.7, False),
+           ("q9",  32768, 33, 1, 512, True,  "q8_0",  9301.7, True)]
     this_gpu = _active_gpu()
     hw_match = (this_gpu == REF_GPU)
     seen, worst, worst_lbl, n = set(), 0.0, "", 0
@@ -3696,7 +3790,7 @@ def self_test():
         print("  VRAMFIT skipped (reference data measured on %s; this is %s)"
               % (REF_GPU, this_gpu or "no NVIDIA GPU"))
     elif n:
-        vram_ok = worst <= 13.0
+        vram_ok = worst <= 10.0
         print("  VRAMFIT worst %.1f%% (%s) over %d runs / %d architectures  %s"
               % (worst, worst_lbl, n, len(seen), "OK" if vram_ok else "FAIL"))
         ok = ok and vram_ok
@@ -3819,10 +3913,13 @@ def self_test():
     # 9) the calibration fitter must recover known coefficients from synthetic rows,
     #    and must REFUSE to free terms the data cannot identify (fitting four
     #    coefficients to two points would be worse than shipping the defaults).
-    truth = {"const": 900.0, "ctx": 0.20, "act": 40.0, "nofa": 5.0}
+    # "ctx" is bytes per context token now, not a fraction of a KV token, so the
+    # synthetic truth has to live on that scale or the plausibility guard will
+    # (correctly) refuse to free it.
+    truth = {"const": 900.0, "ctx": 1100.0, "act": 40.0, "nofa": 5.0}
     def synth(ctx, ub, fa, hid=4096, nh=32, kvtok=8192):
         r = {"ctx": ctx, "ub": ub, "fa": fa, "hidden": hid, "n_head": nh,
-             "kv_tok_ctx": kvtok * ctx, "exact_mib": 1000.0}
+             "kv_type": "f16", "kv_tok_ctx": kvtok * ctx, "exact_mib": 1000.0}
         d = _design(r)
         r["overhead_mib"] = _struct_offset(r) + sum(truth[k] * d[k] for k in truth)
         return r

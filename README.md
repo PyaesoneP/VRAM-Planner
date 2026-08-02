@@ -90,7 +90,8 @@ every number has one home:
 | `speed` | bandwidth roofline |
 | `calib` | fitting `compute` to this machine's measurements |
 | `plan` | `analyze()` and the layer-split planners |
-| `web` | UI and JSON endpoints |
+| `web` | JSON endpoints and static file serving |
+| `ui/` | `index.html`, `app.css`, `app.js` — the front end, as real files |
 | `selftest` | synthetic GGUFs and the test suite |
 | `cli` | entry point |
 

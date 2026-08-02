@@ -1,0 +1,279 @@
+/* VRAM Planner UI.
+   Two themes from one set of tokens: the palette flips, the roles do not. Every
+   colour is referenced by what it MEANS (weights, kv, compute) rather than by
+   hue, so the memory bar, its legend and the breakdown table cannot drift apart. */
+
+:root{
+  color-scheme: dark light;
+
+  --wt:#5aa9ff;        /* weights        */
+  --kv:#37d5b0;        /* KV cache       */
+  --cmp:#b98bff;       /* compute buffer */
+  --rec:#2aa88c;       /* recurrent state */
+  --proj:#7d6cff;      /* vision projector */
+  --spec:#e0a03a;      /* MTP draft cache */
+  --ok:#37d5b0; --warn:#f2b64c; --bad:#ff6a6a;
+
+  --bg:#0b0f14; --panel:#121a23; --panel2:#0e141b; --sunk:#080c11;
+  --line:#25313d; --line2:#39485a;
+  --ink:#e7eef5; --muted:#8ba0b3; --dim:#5b6b7b;
+  --rsv:#2c3742; --rsv2:#232d38;
+  --glow: radial-gradient(1200px 600px at 80% -10%, #14202c 0%, transparent 60%);
+  --shadow: 0 1px 2px rgba(0,0,0,.4);
+
+  --mono:ui-monospace,"Cascadia Code","JetBrains Mono",Consolas,"DejaVu Sans Mono",monospace;
+  --sans:system-ui,-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+
+  /* type scale */
+  --t-micro:11px; --t-small:12px; --t-body:14px; --t-lead:15px;
+  --t-head:20px; --t-hero:26px;
+  /* spacing rhythm */
+  --s1:4px; --s2:8px; --s3:12px; --s4:16px; --s5:22px; --s6:32px;
+  --radius:11px; --radius-sm:7px;
+}
+
+@media (prefers-color-scheme: light){
+  :root{
+    --wt:#1d6fd0; --kv:#0f8f74; --cmp:#7b46d8; --rec:#0f7a63;
+    --proj:#5541c9; --spec:#a96f10;
+    --ok:#0f8f74; --warn:#a3670a; --bad:#c4342f;
+    --bg:#f4f6f9; --panel:#ffffff; --panel2:#f7f9fc; --sunk:#eef2f7;
+    --line:#d8e0ea; --line2:#b7c4d4;
+    --ink:#101922; --muted:#5a6b7d; --dim:#8395a7;
+    --rsv:#cbd6e2; --rsv2:#dde5ee;
+    --glow: radial-gradient(1200px 600px at 80% -10%, #e6eefa 0%, transparent 60%);
+    --shadow: 0 1px 2px rgba(16,25,34,.07), 0 1px 3px rgba(16,25,34,.05);
+  }
+}
+/* The toggle wins over the OS in both directions, so these repeat the blocks
+   above rather than relying on cascade order. */
+:root[data-theme="dark"]{
+  color-scheme: dark;
+  --wt:#5aa9ff; --kv:#37d5b0; --cmp:#b98bff; --rec:#2aa88c;
+  --proj:#7d6cff; --spec:#e0a03a;
+  --ok:#37d5b0; --warn:#f2b64c; --bad:#ff6a6a;
+  --bg:#0b0f14; --panel:#121a23; --panel2:#0e141b; --sunk:#080c11;
+  --line:#25313d; --line2:#39485a;
+  --ink:#e7eef5; --muted:#8ba0b3; --dim:#5b6b7b;
+  --rsv:#2c3742; --rsv2:#232d38;
+  --glow: radial-gradient(1200px 600px at 80% -10%, #14202c 0%, transparent 60%);
+  --shadow: 0 1px 2px rgba(0,0,0,.4);
+}
+:root[data-theme="light"]{
+  color-scheme: light;
+  --wt:#1d6fd0; --kv:#0f8f74; --cmp:#7b46d8; --rec:#0f7a63;
+  --proj:#5541c9; --spec:#a96f10;
+  --ok:#0f8f74; --warn:#a3670a; --bad:#c4342f;
+  --bg:#f4f6f9; --panel:#ffffff; --panel2:#f7f9fc; --sunk:#eef2f7;
+  --line:#d8e0ea; --line2:#b7c4d4;
+  --ink:#101922; --muted:#5a6b7d; --dim:#8395a7;
+  --rsv:#cbd6e2; --rsv2:#dde5ee;
+  --glow: radial-gradient(1200px 600px at 80% -10%, #e6eefa 0%, transparent 60%);
+  --shadow: 0 1px 2px rgba(16,25,34,.07), 0 1px 3px rgba(16,25,34,.05);
+}
+
+*{box-sizing:border-box}
+html{-webkit-text-size-adjust:100%}
+body{
+  margin:0; background:var(--glow), var(--bg); background-attachment:fixed;
+  color:var(--ink); font-family:var(--sans); font-size:var(--t-body); line-height:1.45;
+}
+a{color:var(--wt)}
+h1,h2,h3{margin:0}
+
+/* Anything that can be long and unbreakable - a Windows path, a llama.cpp command
+   line - must scroll inside its own box, never widen the page. */
+.wrap{max-width:1180px;margin:0 auto;padding:var(--s5) 20px 60px}
+
+:where(button,input,select,summary,[tabindex]):focus-visible{
+  outline:2px solid var(--wt); outline-offset:2px; border-radius:var(--radius-sm);
+}
+
+/* ---------- header ---------- */
+header{
+  display:flex;flex-wrap:wrap;align-items:flex-end;gap:var(--s3) var(--s5);
+  justify-content:space-between;padding-bottom:var(--s4);
+  border-bottom:1px solid var(--line);margin-bottom:var(--s5);
+}
+.brand h1{font-family:var(--mono);font-weight:600;font-size:var(--t-head);letter-spacing:.14em}
+.brand .tag{color:var(--muted);font-size:var(--t-small);letter-spacing:.05em;margin-top:3px}
+.brand .accent{color:var(--ok)}
+.sys{display:flex;gap:18px;flex-wrap:wrap;align-items:center}
+.sys .g{min-width:190px}
+.sys .lbl{
+  font-family:var(--mono);font-size:var(--t-micro);color:var(--muted);letter-spacing:.08em;
+  display:flex;justify-content:space-between;gap:10px;
+}
+.sys .lbl b{color:var(--ink);font-weight:600}
+.meter{
+  height:7px;border-radius:4px;background:var(--sunk);border:1px solid var(--line);
+  margin-top:5px;overflow:hidden;
+}
+.meter > i{display:block;height:100%;background:linear-gradient(90deg,var(--wt),var(--kv))}
+.hdr-actions{display:flex;gap:var(--s2);align-items:center}
+
+/* ---------- controls ---------- */
+button{
+  font-family:var(--sans);font-size:13px;cursor:pointer;color:var(--ink);
+  border:1px solid var(--line);background:var(--panel2);
+  border-radius:var(--radius-sm);padding:7px 12px;
+}
+button:hover:not(:disabled){border-color:var(--line2)}
+button:disabled{opacity:.55;cursor:progress}
+button.ghost{background:transparent;color:var(--muted);padding:5px 9px;font-size:var(--t-small)}
+button.ghost:hover:not(:disabled){color:var(--ink)}
+.go{
+  width:100%;background:linear-gradient(90deg,#1c3a4f,#1a4a44);border-color:#2b5a52;
+  color:#eafff9;font-weight:600;padding:11px;font-size:var(--t-body);
+  letter-spacing:.03em;margin-top:var(--s2);
+}
+.go:hover:not(:disabled){filter:brightness(1.12)}
+
+.field{margin-bottom:13px}
+.field > label{display:block;font-size:var(--t-small);color:var(--muted);margin-bottom:5px}
+.hint{color:var(--dim);font-size:var(--t-micro);margin-top:var(--s1);line-height:1.5}
+input[type=text],input[type=number],select{
+  width:100%;background:var(--panel2);border:1px solid var(--line);color:var(--ink);
+  border-radius:var(--radius-sm);padding:8px 10px;font-family:var(--mono);font-size:13px;
+}
+input:focus,select:focus{outline:none;border-color:var(--wt)}
+.row{display:flex;gap:var(--s2);flex-wrap:wrap}
+.row > *{flex:1 1 120px;min-width:0}
+.check{display:flex;align-items:center;gap:var(--s2);font-size:13px;color:var(--ink);cursor:pointer}
+.check input{width:16px;height:16px;accent-color:var(--kv);flex:0 0 auto}
+
+.chips{display:flex;gap:6px;flex-wrap:wrap;margin-top:7px}
+.chip{
+  font-family:var(--mono);font-size:var(--t-small);padding:4px 9px;
+  border:1px solid var(--line);border-radius:20px;background:var(--panel2);
+  color:var(--muted);cursor:pointer;
+}
+.chip:hover{color:var(--ink)}
+.chip[aria-pressed="true"]{border-color:var(--kv);color:var(--kv)}
+
+details.adv{margin-top:6px;border-top:1px dashed var(--line);padding-top:var(--s3)}
+details.adv > summary{
+  cursor:pointer;color:var(--muted);font-size:var(--t-small);font-family:var(--mono);
+  letter-spacing:.06em;list-style:none;margin-bottom:10px;
+}
+details.adv > summary::-webkit-details-marker{display:none}
+details.adv > summary::before{content:"\25B8 ";display:inline-block;transition:transform .15s}
+details.adv[open] > summary::before{transform:rotate(90deg)}
+
+/* ---------- layout ---------- */
+.grid{display:grid;grid-template-columns:340px minmax(0,1fr);gap:18px;align-items:start}
+@media(max-width:900px){.grid{grid-template-columns:1fr}}
+.card{
+  background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);
+  padding:var(--s4);box-shadow:var(--shadow);
+}
+.card + .card{margin-top:0}
+.card > h2{
+  font-family:var(--mono);font-size:var(--t-small);letter-spacing:.1em;color:var(--muted);
+  text-transform:uppercase;margin:0 0 var(--s3);font-weight:600;
+}
+.results{display:flex;flex-direction:column;gap:var(--s4);min-width:0}
+.placeholder{
+  color:var(--dim);font-size:13px;text-align:center;padding:40px 10px;
+  font-family:var(--mono);letter-spacing:.05em;
+}
+
+/* The plan card carries the answer, so it gets the accent rail and the only
+   hero-sized type on the page. */
+.card.lead{border-color:var(--line2)}
+.verdict{border-left:3px solid var(--rsv);padding-left:var(--s3)}
+.verdict.ok{border-color:var(--ok)}
+.verdict.warn{border-color:var(--warn)}
+.verdict.bad{border-color:var(--bad)}
+.verdict .h{font-size:var(--t-lead);font-weight:600}
+.verdict.ok .h{color:var(--ok)}
+.verdict.warn .h{color:var(--warn)}
+.verdict.bad .h{color:var(--bad)}
+
+.badge{
+  display:inline-block;font-family:var(--mono);font-size:var(--t-micro);
+  letter-spacing:.06em;padding:2px 8px;border-radius:5px;border:1px solid var(--line);
+}
+.badge.moe{color:var(--cmp);border-color:var(--cmp)}
+.badge.dense{color:var(--wt);border-color:var(--wt)}
+
+.summary-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(140px,1fr));gap:10px var(--s4)}
+.kvi{font-family:var(--mono)}
+.kvi .k{color:var(--muted);font-size:var(--t-micro);letter-spacing:.04em}
+.kvi .v{color:var(--ink);font-size:var(--t-lead);margin-top:2px}
+
+/* ---------- memory bar ---------- */
+.barwrap{margin-top:var(--s4)}
+.bar-top{
+  display:flex;justify-content:space-between;gap:var(--s2);flex-wrap:wrap;
+  font-family:var(--mono);font-size:var(--t-micro);color:var(--muted);margin-bottom:5px;
+}
+.bar-top b{color:var(--ink)}
+.bar-top .over{color:var(--bad)}
+.bar{
+  position:relative;height:26px;border-radius:6px;background:var(--sunk);
+  border:1px solid var(--line);overflow:hidden;display:flex;
+}
+.bar > span{height:100%;transition:width .5s cubic-bezier(.2,.7,.2,1)}
+@media (prefers-reduced-motion: reduce){.bar > span{transition:none}}
+.bar .s-rsv{background:repeating-linear-gradient(45deg,var(--rsv),var(--rsv) 5px,var(--rsv2) 5px,var(--rsv2) 10px)}
+.cap{position:absolute;top:-4px;bottom:-4px;width:2px;background:var(--ink);opacity:.85}
+.cap::after{
+  content:attr(data-l);position:absolute;top:-15px;left:50%;transform:translateX(-50%);
+  font-family:var(--mono);font-size:9px;color:var(--muted);white-space:nowrap;
+}
+.legend{
+  display:flex;flex-wrap:wrap;gap:var(--s3);margin-top:9px;
+  font-family:var(--mono);font-size:var(--t-micro);color:var(--muted);
+}
+.legend i{display:inline-block;width:10px;height:10px;border-radius:2px;margin-right:5px;vertical-align:-1px}
+.legend .n{color:var(--ink)}
+
+/* ---------- output blocks ---------- */
+.setrow{
+  font-family:var(--mono);font-size:13px;padding:5px 0;
+  border-bottom:1px dashed var(--line);color:var(--ink);
+}
+.setrow:last-child{border-bottom:none}
+.sublabel{
+  font-family:var(--mono);font-size:var(--t-small);letter-spacing:.06em;
+  color:var(--muted);margin-bottom:6px;
+}
+pre.cmd{
+  background:var(--sunk);border:1px solid var(--line);border-radius:8px;padding:var(--s3);
+  font-family:var(--mono);font-size:12.5px;color:var(--ink);
+  overflow-x:auto;white-space:pre-wrap;word-break:break-word;margin:0;
+}
+.cmdhead{display:flex;justify-content:space-between;align-items:center;gap:var(--s2);margin-bottom:var(--s2)}
+
+.tablewrap{overflow-x:auto}
+table{width:100%;border-collapse:collapse;font-family:var(--mono);font-size:12.5px}
+th,td{text-align:right;padding:6px 8px;border-bottom:1px solid var(--line)}
+th{color:var(--muted);font-weight:600;font-size:var(--t-micro);letter-spacing:.04em}
+td:first-child,th:first-child{text-align:left}
+tr.cur td{color:var(--kv)}
+
+.warns{color:var(--warn);font-size:12.5px}
+.warns > h2{color:var(--warn)}
+.warns div{padding:var(--s1) 0}
+.muted{color:var(--muted)}
+.small{font-size:var(--t-small)}
+.mono{font-family:var(--mono)}
+.note{color:var(--dim);font-size:var(--t-micro);margin-top:var(--s2);line-height:1.5}
+.note b{color:var(--ink)}
+.hero{font-size:var(--t-hero);font-weight:600}
+.hero.ok{color:var(--kv)}
+
+.spin{
+  display:inline-block;width:13px;height:13px;border:2px solid var(--dim);
+  border-top-color:var(--ok);border-radius:50%;animation:sp .7s linear infinite;
+  vertical-align:-2px;margin-right:7px;
+}
+@keyframes sp{to{transform:rotate(360deg)}}
+@media (prefers-reduced-motion: reduce){.spin{animation-duration:2s}}
+
+.actions{margin-top:var(--s4);display:flex;gap:var(--s2);align-items:center;flex-wrap:wrap}
+.sr-only{
+  position:absolute;width:1px;height:1px;padding:0;margin:-1px;
+  overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap;border:0;
+}

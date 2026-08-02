@@ -1,0 +1,192 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>VRAM Planner</title>
+<link rel="stylesheet" href="/app.css">
+<script>
+  /* Applied before first paint so a light-theme user never sees a dark flash. */
+  try{
+    var t = localStorage.getItem("vramplanner-theme");
+    if(t === "light" || t === "dark") document.documentElement.dataset.theme = t;
+  }catch(e){}
+</script>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <div class="brand">
+      <h1>VRAM<span class="accent">//</span>PLANNER</h1>
+      <p class="tag">exact GGUF weights + KV cache &middot; live VRAM/RAM &middot; layer &amp; expert offload
+        <span class="muted" id="ver"></span></p>
+    </div>
+    <div class="hdr-actions">
+      <div class="sys" id="sys"><span class="muted small">reading hardware&hellip;</span></div>
+      <button class="ghost" id="themeBtn" type="button" data-action="theme"
+              aria-label="Switch colour theme" title="Switch colour theme">&#9681;</button>
+    </div>
+  </header>
+  <div id="platwarn"></div>
+
+  <div class="grid">
+<form class="card" id="controls" autocomplete="off">
+      <h2>Model &amp; run settings</h2>
+
+      <div class="field">
+        <label for="dir">Models folder</label>
+        <div class="row">
+          <input type="text" id="dir" placeholder="path to .gguf folder">
+          <button class="ghost" type="button" style="flex:0 0 auto" data-action="scan">Scan</button>
+        </div>
+        <p class="hint" id="scanhint" role="status"></p>
+      </div>
+
+      <div class="field">
+        <label for="model">Model</label>
+        <select id="model"><option value="">&mdash; scan or paste a path &mdash;</option></select>
+      </div>
+
+      <div class="field">
+        <label for="path">&hellip;or full path to a .gguf</label>
+        <input type="text" id="path" placeholder="C:\…\model.gguf">
+      </div>
+
+      <div class="field">
+        <label for="ctx">Context length (tokens)</label>
+        <input type="number" id="ctx" value="8192" min="256" step="256">
+        <div class="chips" id="ctxchips" role="group" aria-label="Context length presets"></div>
+      </div>
+
+      <div class="row">
+        <div class="field">
+          <label for="kv">KV cache quant</label>
+          <select id="kv">
+            <option value="f16">f16 (2.00 B)</option>
+            <option value="q8_0">q8_0 (1.06 B)</option>
+            <option value="q5_1">q5_1 (0.75 B)</option>
+            <option value="q4_0">q4_0 (0.56 B)</option>
+          </select>
+        </div>
+        <div class="field">
+          <label for="ubatch">ubatch = LM Studio &ldquo;Physical Batch Size&rdquo;</label>
+          <input type="number" id="ubatch" value="512" min="16" step="16">
+        </div>
+        <div class="field">
+          <label for="nseq">seqs = &ldquo;Max Concurrent Predictions&rdquo;</label>
+          <input type="number" id="nseq" value="1" min="1" step="1">
+        </div>
+      </div>
+      <p class="hint">Match seqs to LM Studio&rsquo;s &ldquo;Max Concurrent Predictions&rdquo; (default 4). It
+        sizes the recurrent state on hybrid models and the sliding-window cache on SWA models
+        (Gemma, Mistral, gpt-oss) &mdash; llama.cpp allocates one window per sequence slot.</p>
+
+      <div class="field">
+        <label class="check"><input type="checkbox" id="fa"> Flash attention (needed for quant KV)</label>
+      </div>
+
+      <div class="field" id="mmprojfield" hidden>
+        <label class="check"><input type="checkbox" id="mmproj" checked> Load vision projector (mmproj)</label>
+        <div id="mtprow" hidden>
+          <label class="check"><input type="checkbox" id="mtpspec" checked> MTP speculative decoding</label>
+          <p class="hint">This model ships multi-token-prediction blocks. LM Studio turns this on by
+            default for them (<span class="mono">Speculative Decoding: MTP</span>, llama.cpp
+            <span class="mono">--spec-type draft-mtp</span>). It gives the draft blocks a KV cache back
+            &mdash; at f16 regardless of your KV quant &mdash; plus a per-sequence slot. Untick only if
+            you set Speculative Decoding to Off.</p>
+        </div>
+        <p class="hint" id="mmprojhint"></p>
+      </div>
+
+      <div class="field">
+        <label class="check"><input type="checkbox" id="kvgpu"> Force ALL layers&rsquo; KV onto GPU (offload FFN)</label>
+        <p class="hint">Advanced, llama.cpp <b>-ot</b> only. Different from LM Studio&rsquo;s &ldquo;Offload KV
+          Cache to GPU&rdquo; (which only keeps <i>GPU-layer</i> KV in VRAM). This pushes FFN weights to CPU so
+          every layer&rsquo;s KV sits in VRAM; dense generation gets slower. Leave OFF to model a normal
+          LM Studio GPU-offload split.</p>
+      </div>
+
+      <details class="adv">
+        <summary>Advanced budgets &amp; overrides</summary>
+
+        <div class="field">
+          <label for="ngl">GPU layers (blank = auto; set to match/verify an LM Studio run)</label>
+          <input type="number" id="ngl" step="1" min="0" placeholder="auto">
+          <p class="hint">Enter LM Studio&rsquo;s &ldquo;GPU Offload&rdquo; number to see the exact VRAM/RAM that
+            config uses, then compare against Task Manager. <b>Check the real value in the log</b>
+            (<span class="mono">%APPDATA%\LM Studio\logs\main.log</span>, &ldquo;Resolved GPU config
+            options&rdquo;) &mdash; LM Studio silently adjusts the slider to respect its VRAM cap.</p>
+        </div>
+
+        <div class="field" id="ncpumoefield" hidden>
+          <label for="ncpumoe">CPU expert layers (MoE; blank = auto)</label>
+          <input type="number" id="ncpumoe" step="1" min="0" placeholder="auto">
+          <p class="hint">LM Studio&rsquo;s &ldquo;Number of layers to keep experts on CPU&rdquo; /
+            llama.cpp <b>--n-cpu-moe</b>. Different knob from GPU Offload: it moves only the
+            routed experts of the first N blocks, leaving their attention and KV on the GPU.</p>
+        </div>
+
+        <div class="row">
+          <div class="field"><label for="vram">VRAM budget (MiB)</label>
+            <input type="number" id="vram" step="64"></div>
+          <div class="field"><label for="ram">RAM budget (MiB)</label>
+            <input type="number" id="ram" step="256"></div>
+        </div>
+        <p class="hint" style="margin:-6px 0 12px">RAM budget defaults to total installed, since a
+          model can load into standby/paged memory (LM Studio pushes RAM to ~100%). The header shows
+          what&rsquo;s free right now; the plan warns if it exceeds that.</p>
+
+        <div class="row">
+          <div class="field"><label for="reserve">GPU reserve (MiB)</label>
+            <input type="number" id="reserve" value="0" step="64">
+            <p class="hint">Extra headroom on top of the plan. Defaults to 0 because the CUDA
+              context and driver overhead are already inside the compute-buffer estimate (they were
+              fitted together against measured loads). Add to this only if you want the plan to
+              leave room for something else on the GPU, e.g. your desktop.</p>
+          </div>
+          <div class="field"><label for="safety">Safety %</label>
+            <input type="number" id="safety" value="5" step="1" min="0" max="40"></div>
+        </div>
+
+        <div class="row">
+          <div class="field"><label for="bwv">VRAM bandwidth (GB/s)</label>
+            <input type="number" id="bwv" step="1" placeholder="auto"></div>
+          <div class="field"><label for="bwr">RAM bandwidth (GB/s)</label>
+            <input type="number" id="bwr" step="0.1" placeholder="auto"></div>
+        </div>
+        <p class="hint" id="bwhint" style="margin:-6px 0 12px"></p>
+
+        <div class="row">
+          <div class="field"><label for="ctxfill">Context filled (tokens)</label>
+            <input type="number" id="ctxfill" step="256" placeholder="8192">
+            <p class="hint">KV is re-read every token, so speed depends on how full the
+              context actually is &mdash; not on the size you allocated.</p>
+          </div>
+          <div class="field"><label for="rameff">RAM efficiency (0 = bracket)</label>
+            <input type="number" id="rameff" step="0.01" min="0" max="1" placeholder="0">
+            <p class="hint">Set by Calibrate. Fraction of peak RAM bandwidth actually reached.</p>
+          </div>
+        </div>
+
+        <div class="field">
+          <label for="compute">Compute buffer override (MiB, 0 = estimate)</label>
+          <input type="number" id="compute" value="0" step="16">
+          <p class="hint">Weights &amp; KV are exact. The compute buffer is estimated. You do not
+            need the load log &mdash; if the model is loaded right now, press Measure and the tool reads
+            the engine process&rsquo;s real VRAM and back-solves the true overhead.</p>
+          <button class="ghost" type="button" style="margin-top:8px" data-action="measure">&#9673; Measure running model</button>
+          <p class="hint" id="calhint" role="status"></p>
+        </div>
+      </details>
+
+      <button class="go" id="goBtn" type="submit">Analyze fit</button>
+    </form>
+
+    <div class="results" id="out">
+      <div class="card"><p class="placeholder">Pick a model and press Analyze fit.</p></div>
+    </div>
+  </div>
+</div>
+<script src="/app.js"></script>
+</body>
+</html>

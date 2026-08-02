@@ -72,6 +72,6 @@ from .calib import (CALIB_TERMS, CALIB_SCHEMA, CALIB_MIN_SPREAD, CALIB_MIN_FREE_
                     calibration_status, record_calibration, _calib_store, _row_flags,
                     _design, _struct_offset, _active_gpu)
 from .plan import analyze, find_mmproj
-from .web import serve, Handler
+from .web import serve, Handler, read_ui
 from .selftest import self_test
 from .cli import main

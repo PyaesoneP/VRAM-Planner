@@ -54,23 +54,52 @@ its Windows log path.
 
 ## Run
 ```powershell
-python vram_planner.py
+python -m vram_planner
 # or, if that isn't found:
-py vram_planner.py
+py -m vram_planner
 ```
+Run it from the folder containing the `vram_planner/` package.
 A browser opens at http://localhost:8121. Point the **Models folder** at your
 LM Studio models dir (defaults to `%USERPROFILE%\.lmstudio\models`), pick a model,
 set context + KV quant, and press **Analyze fit**.
 
 Other flags:
 ```
-python vram_planner.py --port 8100 --no-browser
-python vram_planner.py --self-test      # validates the parser + math
-python vram_planner.py --version
+python -m vram_planner --port 8100 --no-browser
+python -m vram_planner --self-test      # validates the parser + math
+python -m vram_planner --version
 ```
 
 Calibration and benchmark history live in `%LOCALAPPDATA%\vram-planner\`
 (`~/.local/share/vram-planner/` elsewhere), not next to the script.
+
+## Layout
+Each module imports only from those above it, so the import graph is a DAG and
+every number has one home:
+
+| module | what lives there |
+|---|---|
+| `const` | version, byte units |
+| `gguf` | the GGUF binary reader |
+| `model` | config extraction, tensor classification |
+| `kv` | cache geometry — exact, read from metadata |
+| `compute` | the compute buffer — the one fitted term |
+| `paths` | user data locations |
+| `gpu` | live hardware probes |
+| `lmstudio` | models, runtime config, server logs, backends |
+| `speed` | bandwidth roofline |
+| `calib` | fitting `compute` to this machine's measurements |
+| `plan` | `analyze()` and the layer-split planners |
+| `web` | UI and JSON endpoints |
+| `selftest` | synthetic GGUFs and the test suite |
+| `cli` | entry point |
+
+Two edges run backwards and are imported inside the function that needs them:
+`compute.compute_buffer_terms` reads `calib.calib_coeffs`, and
+`calib.record_calibration` calls `plan.analyze`. Both are marked at the call site.
+
+`import vram_planner as v` still re-exports the whole public surface, so
+`v.analyze()`, `v.load_gguf()` and friends work unchanged.
 
 ## Sliding-window attention (Gemma, Mistral, gpt-oss, Cohere2 ...)
 

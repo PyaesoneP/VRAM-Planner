@@ -811,6 +811,25 @@ def compute_buffer_split(terms, any_on_gpu, any_on_cpu, output_on_gpu, override_
         gpu = float(override_mib)
     return {"gpu": round(gpu, 1), "cpu": round(cpu, 1)}
 
+def graph_is_split(n_layers, ngl, n_cpu_moe=0):
+    """Does the graph span both backends? THE definition of `any_on_cpu`.
+
+    Both knobs move work to the CPU and they are independent: --n-cpu-moe pins
+    the routed experts of the first M blocks there even at ngl == n_layers, so
+    testing ngl alone reports every expert offload as unsplit. The planner and
+    the calibration fit must read this from one place - when they did not, the
+    fit saw those rows as unsplit and quietly absorbed the split surcharge into
+    `const`, after which prediction charged it a second time. On a 26B MoE at
+    262k that was ~850 MiB of phantom VRAM, about two expert layers."""
+    return bool((n_layers and ngl is not None and ngl < n_layers)
+                or (n_cpu_moe or 0) > 0)
+
+def output_head_on_gpu(n_layers, ngl):
+    """Does the output head - and so the logits tensor - land on the GPU? The
+    head follows the last block, so it does exactly when every block is offloaded.
+    --n-cpu-moe does not move it: routed experts are not the head."""
+    return bool(n_layers and ngl is not None and ngl >= n_layers)
+
 def compute_buffer_mib(cfg, context, n_ubatch, flash_attn, n_seq=1, kv_type="f16"):
     """Total compute buffer across all backends (back-compat / whole-model view)."""
     t = compute_buffer_terms(cfg, context, n_ubatch, flash_attn, n_seq, kv_type)
@@ -1029,9 +1048,9 @@ def analyze(path, ctx, kv_type, n_ubatch, flash_attn,
         """GPU/CPU compute-buffer split for a candidate layer count."""
         ngl = max(0, min(int(ngl), n_layers))
         if output_on_gpu is None:
-            output_on_gpu = (ngl >= n_layers)
+            output_on_gpu = output_head_on_gpu(n_layers, ngl)
         if any_on_cpu is None:
-            any_on_cpu = (ngl < n_layers)
+            any_on_cpu = graph_is_split(n_layers, ngl)
         return compute_buffer_split(compute_terms, ngl > 0, any_on_cpu,
                                     output_on_gpu, compute_override_mib)
 
@@ -1473,7 +1492,7 @@ def _plan_moe(cfg, cl, eff_vram, ram, kv_total, kv_layer, compute, weights,
         gpu_rec = _mib(recurrent_bytes(cfg, on_gpu, n_seq))
         rest = [i for i in range(n_layers) if i not in set(on_gpu)]
         # experts pinned to the CPU also make the CPU run graph ops, even at full -ngl
-        cb = (compute_fn(ngl, any_on_cpu=(ngl < n_layers or n_cpu_moe > 0))
+        cb = (compute_fn(ngl, any_on_cpu=graph_is_split(n_layers, ngl, n_cpu_moe))
               if compute_fn else {"gpu": compute, "cpu": 0.0})
         return {
             "n_gpu_layers": ngl, "n_cpu_moe": n_cpu_moe,
@@ -2129,6 +2148,125 @@ def save_calibration(data):
     except Exception:
         pass
 
+CALIB_SCHEMA = 2                      # 2 adds n_layers + n_vocab to every row
+
+# A measurement taken with the card full is a ceiling, not a reading: llama.cpp
+# spills the remainder to shared system memory and the counter reports the cap.
+# Detecting that needs the free VRAM at measure time, which only rows recorded by
+# this version carry - a high process figure alone proves nothing, since a 12 GiB
+# card really does hand out 11.2 GiB to one process.
+CALIB_MIN_FREE_MIB = 192.0
+# The same condition seen from inside the data, and the only test available to
+# rows recorded before free VRAM was stored: a group whose measured VRAM barely
+# moves while its exact terms move a lot.
+CALIB_FLAT_RATIO   = 0.25             # measured span vs exact span
+CALIB_FLAT_MIN_MIB = 200.0            # ...only when the exact span is real
+
+def mark_unreliable(rows, gpu_totals=None):
+    """Flag rows whose measured_mib cannot be read as "what this config needed".
+
+    `overhead_mib` is measured minus exact, so a measurement that did not respond
+    to the config does not produce a weak observation - it produces a fictitious
+    overhead that moves the opposite way from the truth. Five rows of one model
+    here spanned 2458 MiB of exact terms against 17 MiB of measured VRAM, which
+    fitted as the compute buffer *shrinking* by 2.4 GiB as layers were added.
+
+    Sets or clears row["unreliable"]. Nothing is deleted: re-measuring on a card
+    with room rescues the row, and the reason is worth showing to whoever ran it."""
+    groups = {}
+    for r in rows:
+        r.pop("unreliable", None)
+        free = r.get("gpu_free_mib")
+        if free is not None and free < CALIB_MIN_FREE_MIB:
+            r["unreliable"] = ("only %.0f MiB of VRAM was free at measure time - the card "
+                               "was at the wall, so the reading is the cap, not the need"
+                               % free)
+        groups.setdefault((r.get("gpu"), r.get("model"), r.get("ctx"), r.get("ub"),
+                           r.get("fa"), r.get("kv_type")), []).append(r)
+    for rs in groups.values():
+        if len(rs) < 2:
+            continue
+        span = lambda f: max(x.get(f, 0.0) for x in rs) - min(x.get(f, 0.0) for x in rs)
+        exact_span = span("exact_mib")
+        if exact_span > CALIB_FLAT_MIN_MIB and \
+                span("measured_mib") < CALIB_FLAT_RATIO * exact_span:
+            for r in rs:
+                r.setdefault("unreliable",
+                             "measured VRAM moved %.0f MiB while the exact terms moved "
+                             "%.0f - these rows are not independent measurements"
+                             % (span("measured_mib"), exact_span))
+    return rows
+
+def _model_facts(name, roots=None, _cache={}):
+    """(n_layers, n_vocab) read from the named model file, or None if it is gone.
+
+    Matched on basename: the store records that and nothing else, and a model is
+    not going to be two different architectures under one file name."""
+    if name in _cache:
+        return _cache[name]
+    found = None
+    for root in (roots if roots is not None else [default_models_dir()]):
+        if not root or not os.path.isdir(root):
+            continue
+        for dirpath, _dirs, files in os.walk(root):
+            if name in files:
+                found = os.path.join(dirpath, name)
+                break
+        if found:
+            break
+    facts = None
+    if found:
+        try:
+            cfg = extract_config(load_gguf(found))
+            facts = (cfg.get("n_layers") or 0, cfg.get("n_vocab") or 0)
+        except Exception:
+            facts = None
+    _cache[name] = facts
+    return facts
+
+def migrate_calibration(data):
+    """Backfill n_layers / n_vocab onto rows written before they were stored, in
+    place. Returns True if anything changed.
+
+    Sources in descending authority: the model file if it is still on disk, then
+    another row for the same file name, then another row with the same
+    architecture AND the same residual width - the same base model at a different
+    quant, which cannot differ in either field. Rows that resolve to none of
+    these keep their data and are skipped by the fit rather than deleted: a
+    re-measure, or the file reappearing, rescues them later."""
+    rows = data.get("rows") or []
+    if not rows:
+        return False
+    snap = lambda: [(r.get("n_layers"), r.get("n_vocab"), r.get("unreliable"))
+                    for r in rows]
+    before = snap()
+
+    for r in rows:
+        if r.get("n_layers") and r.get("n_vocab"):
+            continue
+        facts = _model_facts(r.get("model") or "")
+        if facts:
+            r["n_layers"] = r.get("n_layers") or facts[0]
+            r["n_vocab"] = r.get("n_vocab") or facts[1]
+
+    # ...then propagate across rows, by file name first and architecture second.
+    for key in (lambda r: (r.get("model"),),
+                lambda r: (r.get("arch"), r.get("hidden"))):
+        known = {}
+        for r in rows:
+            k = key(r)
+            for f in ("n_layers", "n_vocab"):
+                if r.get(f):
+                    known.setdefault(k, {}).setdefault(f, r[f])
+        for r in rows:
+            for f, val in (known.get(key(r)) or {}).items():
+                if not r.get(f):
+                    r[f] = val
+
+    mark_unreliable(rows)
+    data["schema"] = CALIB_SCHEMA
+    return snap() != before
+
 def _design(row):
     """Regressors for one observation, in MiB, matching compute_buffer_terms.
 
@@ -2141,20 +2279,51 @@ def _design(row):
             "act":   _mib(row["hidden"] * row["ub"]),
             "nofa":  0.0 if row["fa"] else _mib(row["n_head"] * row["ub"] * row["ctx"])}
 
+def _row_flags(row):
+    """Where the graph ran for one stored observation, and whether the row can be
+    fitted at all.
+
+    A row is usable only if its placement is knowable. `n_layers` decides both
+    predicates, so a row without it cannot be fitted - guessing "unsplit" is what
+    let the split surcharge hide in `const`. `n_vocab` only matters when the head
+    was on the GPU, which is why partial-offload rows recorded before it was
+    stored stay usable: their logits tensor was never charged to VRAM."""
+    n_layers, ngl = row.get("n_layers"), row.get("ngl")
+    split = graph_is_split(n_layers, ngl, row.get("n_cpu_moe"))
+    if row.get("unreliable"):
+        return {"ok": False, "why": row["unreliable"], "split": split,
+                "output_on_gpu": output_head_on_gpu(n_layers, ngl),
+                "n_vocab": row.get("n_vocab") or 0}
+    if not n_layers or ngl is None:
+        return {"ok": False, "why": "no n_layers recorded",
+                "split": split, "output_on_gpu": False, "n_vocab": 0}
+    on_gpu = output_head_on_gpu(n_layers, ngl)
+    n_vocab = row.get("n_vocab") or 0
+    if on_gpu and not n_vocab:
+        return {"ok": False, "why": "head was on the GPU but no n_vocab recorded",
+                "split": split, "output_on_gpu": True, "n_vocab": 0}
+    return {"ok": True, "why": "", "split": split,
+            "output_on_gpu": on_gpu, "n_vocab": n_vocab}
+
 def _struct_offset(row):
-    """Parts of the graph pool that are structural rather than per-machine: the
-    attention mask, the quantised-cache surcharge, and the split-graph penalty.
-    They are not fitted, so they come off the observation before the additive base
-    and the remaining slopes are solved for."""
+    """Parts of the observation that are structural rather than per-machine: the
+    attention mask, the quantised-cache surcharge, the split-graph penalty, and
+    the logits tensor. They are not fitted, so they come off the observation
+    before the additive base and the remaining slopes are solved for.
+
+    Every term the planner charges to VRAM must appear either here or in
+    _design(). `overhead_mib` is measured VRAM minus the exact terms, so it
+    already contains split_extra and logits; anything charged at prediction time
+    and not subtracted here gets absorbed into `const` and then billed twice."""
+    flags = _row_flags(row)
     off = (CB_CONST_PER_KHID * row["hidden"] / 1000.0
            + _mib(CB_MASK_PER_UB_TOK * row["ub"] * row["ctx"]))
     if row.get("kv_type", "f16") != "f16":
         off += _mib(CB_CTX_QUANT_BYTES * row["ctx"])
-    # Rows written before n_layers was recorded cannot say whether the graph was
-    # split, so they are treated as unsplit. That biases those rows only.
-    n_layers, ngl = row.get("n_layers"), row.get("ngl")
-    if n_layers and ngl is not None and ngl < n_layers:
+    if flags["split"]:
         off += CB_SPLIT_GRAPH_MIB + _mib(CB_SPLIT_PER_TOKEN * row["ctx"])
+    if flags["output_on_gpu"]:
+        off += _mib(4.0 * row["ub"] * flags["n_vocab"])
     return off
 
 def _solve(A, y):
@@ -2179,6 +2348,12 @@ def fit_calibration(rows, prior=None):
     """Fit what the data supports. Returns {coeffs, free, n, residual_pct} or None."""
     prior = dict(prior or CB_DEFAULTS)
     rows = [r for r in rows if r.get("overhead_mib") is not None and r.get("hidden")]
+    # A row whose backend placement cannot be reconstructed is not a weak
+    # observation, it is an unreadable one - fitting it means fitting a term that
+    # may or may not be in the measurement. Skip, do not guess.
+    usable = [r for r in rows if _row_flags(r)["ok"]]
+    skipped = len(rows) - len(usable)
+    rows = usable
     if len(rows) < 1:
         return None
     des = [_design(r) for r in rows]
@@ -2244,6 +2419,7 @@ def fit_calibration(rows, prior=None):
         base = max(1.0, r["overhead_mib"] + r.get("exact_mib", 0.0))
         errs.append(abs(pred - r["overhead_mib"]) / base * 100.0)
     return {"coeffs": coeffs, "free": free, "n": len(rows),
+            "skipped_rows": skipped,
             "residual_pct": round(sum(errs) / len(errs), 1)}
 
 def refresh_calibration(gpu=None):
@@ -2254,6 +2430,8 @@ def refresh_calibration(gpu=None):
     the current build is known and any row matches it, only those rows are used;
     otherwise everything for that GPU is used and the mismatch is reported."""
     data = load_calibration()
+    if migrate_calibration(data):
+        save_calibration(data)
     cur = current_backend()
     by_gpu = {}
     for r in data.get("rows", []):
@@ -2279,10 +2457,11 @@ def calibration_status(gpu=None):
     if not f:
         return {"calibrated": False, "gpu": g, "n": 0, "coeffs": dict(CB_DEFAULTS),
                 "free": [], "residual_pct": None, "stale_rows": 0,
-                "backend": current_backend()}
+                "skipped_rows": 0, "backend": current_backend()}
     return {"calibrated": True, "gpu": g, "n": f["n"], "coeffs": f["coeffs"],
             "free": f["free"], "residual_pct": f["residual_pct"],
-            "stale_rows": f.get("stale_rows", 0), "backend": f.get("backend", "")}
+            "stale_rows": f.get("stale_rows", 0),
+            "skipped_rows": f.get("skipped_rows", 0), "backend": f.get("backend", "")}
 
 def record_calibration(path, ctx, kv_type, n_ubatch, n_seq, flash_attn, ngl,
                        include_mmproj, measured_mib, gpu="", n_cpu_moe=0):
@@ -2304,29 +2483,42 @@ def record_calibration(path, ctx, kv_type, n_ubatch, n_seq, flash_attn, ngl,
     attn = cfg["attn_layers"]
     kvg = sum(kv_bytes_per_token_layer(cfg, "f16", i) for i in attn if not is_swa_layer(cfg, i))
     kvs = sum(kv_bytes_per_token_layer(cfg, "f16", i) for i in attn if is_swa_layer(cfg, i))
-    row = {"when": int(time.time()), "gpu": gpu or _active_gpu(),
+    # Record what the card had, so a reading taken at the wall can be recognised
+    # as one later - by mark_unreliable() here, and by any future rule.
+    gpu_name = gpu or _active_gpu()
+    card = next((g for g in gpu_list(fresh=True) if g.get("name") == gpu_name), {})
+    row = {"when": int(time.time()), "gpu": gpu_name,
+           "gpu_total_mib": card.get("total_mib") or 0.0,
+           "gpu_free_mib": card.get("free_mib"),
            "backend": current_backend(fresh=True),
            "model": os.path.basename(path), "arch": cfg["arch"],
            "ctx": ctx, "ub": n_ubatch, "n_seq": n_seq, "fa": bool(flash_attn),
            "ngl": ngl, "n_cpu_moe": n_cpu_moe, "kv_type": kv_type,
            "hidden": cfg["hidden"] or 4096, "n_head": cfg["n_head"] or 32,
-           "n_layers": cfg["n_layers"] or 0,
+           "n_layers": cfg["n_layers"] or 0, "n_vocab": cfg.get("n_vocab") or 0,
            "kv_tok_ctx": kvg * ctx + kvs * swa_cache_len(cfg, ctx, n_ubatch, n_seq, flash_attn),
            "exact_mib": round(exact, 1), "measured_mib": round(measured_mib, 1),
            "overhead_mib": round(overhead, 1)}
     data = load_calibration()
     rows = data.setdefault("rows", [])
-    # one row per distinct config; a re-measure replaces the older reading
-    key = (row["gpu"], row["model"], ctx, n_ubatch, n_seq, row["fa"], ngl, kv_type)
-    rows[:] = [x for x in rows if (x.get("gpu"), x.get("model"), x.get("ctx"), x.get("ub"),
-                                   x.get("n_seq"), x.get("fa"), x.get("ngl"),
-                                   x.get("kv_type")) != key]
+    # One row per distinct config. n_cpu_moe belongs in the key: with expert
+    # offload ngl is pinned at n_layers, so without it every --n-cpu-moe sweep of
+    # one model collapsed onto a single row and each measurement threw away the
+    # last - exactly the sweep that identifies the expert-layer slope.
+    def _key(x):
+        return (x.get("gpu"), x.get("model"), x.get("ctx"), x.get("ub"),
+                x.get("n_seq"), x.get("fa"), x.get("ngl"), x.get("kv_type"),
+                x.get("n_cpu_moe") or 0)
+    key = _key(row)
+    rows[:] = [x for x in rows if _key(x) != key]
     rows.insert(0, row)
     del rows[400:]
-    data["schema"] = 1
+    data["schema"] = CALIB_SCHEMA
+    mark_unreliable(rows)
     save_calibration(data)
     refresh_calibration()
-    return {"ok": True, "row": row, "status": calibration_status(row["gpu"])}
+    return {"ok": True, "row": row, "status": calibration_status(row["gpu"]),
+            "unreliable": row.get("unreliable", "")}
 
 def get_ram():
     try:
@@ -3225,7 +3417,11 @@ async function calibrate(){
     (st.calibrated
       ? '<b style="color:var(--kv)">Calibrated</b> from '+st.n+' measurement'+(st.n==1?'':'s')+
         ' on this GPU &mdash; fitted: '+st.free.join(", ")+
-        ' (in-sample '+st.residual_pct+'%).'
+        ' (in-sample '+st.residual_pct+'%).'+
+        (st.skipped_rows? '<br><span class="muted">'+st.skipped_rows+' stored measurement'+
+          (st.skipped_rows==1?' was':'s were')+' left out: the reading did not respond to '+
+          'the config, or the layer count was never recorded. Re-measure with VRAM to '+
+          'spare to bring them back.</span>' : '')
       : '<b style="color:var(--warn)">Recorded, but not fitted yet.</b> The measurement is '+
         'saved; it did not produce a usable fit on its own, so the shipped defaults still '+
         'apply. Measure once more at a different context length.')+
@@ -3439,6 +3635,9 @@ def serve(host, port, open_browser):
              % (st["n"], st["gpu"] or "this GPU", ", ".join(st["free"]), st["residual_pct"])
              if st["calibrated"] else
              "shipped defaults - press Measure on a loaded model to calibrate"))
+    if st.get("skipped_rows"):
+        print("  measurements skipped  :  %d (reading did not respond to the config, or "
+              "no layer count recorded)" % st["skipped_rows"])
     if not plat["supported"]:
         print("\n  !! UNVALIDATED PLATFORM\n     %s" % plat["reason"])
     print("  press Ctrl+C to stop\n")
@@ -3917,9 +4116,12 @@ def self_test():
     # synthetic truth has to live on that scale or the plausibility guard will
     # (correctly) refuse to free it.
     truth = {"const": 900.0, "ctx": 1100.0, "act": 40.0, "nofa": 5.0}
-    def synth(ctx, ub, fa, hid=4096, nh=32, kvtok=8192):
+    def synth(ctx, ub, fa, hid=4096, nh=32, kvtok=8192, ngl=16, n_layers=32,
+              n_cpu_moe=0, n_vocab=32000):
         r = {"ctx": ctx, "ub": ub, "fa": fa, "hidden": hid, "n_head": nh,
-             "kv_type": "f16", "kv_tok_ctx": kvtok * ctx, "exact_mib": 1000.0}
+             "kv_type": "f16", "kv_tok_ctx": kvtok * ctx, "exact_mib": 1000.0,
+             "measured_mib": 1000.0, "ngl": ngl, "n_layers": n_layers,
+             "n_cpu_moe": n_cpu_moe, "n_vocab": n_vocab}
         d = _design(r)
         r["overhead_mib"] = _struct_offset(r) + sum(truth[k] * d[k] for k in truth)
         return r
@@ -3987,7 +4189,9 @@ def self_test():
     # structural per-hidden term - and rejecting it stranded real measurements
     # as "calibrated from 0 measurements".
     one_real = [{"ctx": 262144, "ub": 512, "fa": True, "hidden": 2048, "n_head": 16,
-                 "kv_tok_ctx": 5368709120.0, "exact_mib": 8965.0, "overhead_mib": 943.6}]
+                 "kv_tok_ctx": 5368709120.0, "exact_mib": 8965.0, "overhead_mib": 943.6,
+                 "measured_mib": 9908.6, "ngl": 40, "n_layers": 40, "n_cpu_moe": 37,
+                 "n_vocab": 248320}]
     single = fit_calibration(one_real)
     single_ok = (single is not None and single["free"] == ["const"]
                  and single["coeffs"]["const"] + _struct_offset(one_real[0]) > 0)
@@ -3995,6 +4199,48 @@ def self_test():
           % (single is not None, (single or {}).get("coeffs", {}).get("const", 0.0),
              "OK" if single_ok else "FAIL"))
     ok = ok and single_ok
+
+    # 9b) THE symmetry that broke. Every term the planner charges to VRAM must be
+    #     removed from the observation by _struct_offset or _design, or the fit
+    #     absorbs it into `const` and prediction then bills it a second time.
+    #     --n-cpu-moe is the case that regressed: ngl == n_layers there, so a
+    #     `ngl < n_layers` test called the graph unsplit while the planner - right,
+    #     the experts really do run on the CPU - called it split. Worth ~850 MiB of
+    #     phantom VRAM on a 26B MoE at 262k, two expert layers' worth.
+    sym_ok = True
+    for label, sngl, sncm in (("dense partial", 16, 0), ("dense full", 32, 0),
+                              ("experts on cpu", 32, 20), ("moe partial", 24, 20)):
+        srow = synth(65536, 512, True, ngl=sngl, n_cpu_moe=sncm)
+        scfg = {"hidden": srow["hidden"], "n_head": srow["n_head"],
+                "n_vocab": srow["n_vocab"], "attn_layers": [0], "n_layers": 32}
+        st = compute_buffer_terms(scfg, srow["ctx"], srow["ub"], srow["fa"], 1, "f16")
+        charged = compute_buffer_split(st, True, graph_is_split(32, sngl, sncm),
+                                       output_head_on_gpu(32, sngl))["gpu"]
+        sd = _design(srow)
+        removed = _struct_offset(srow) + sum(calib_coeffs()[k] * sd[k] for k in CALIB_TERMS)
+        hit = abs(charged - removed) <= 0.5
+        sym_ok = sym_ok and hit
+        print("  CALSYM %-15s ngl=%2d n_cpu_moe=%2d  planner charges %8.1f, fit removes "
+              "%8.1f  %s" % (label, sngl, sncm, charged, removed, "OK" if hit else "FAIL"))
+    ok = ok and sym_ok
+
+    # ...and a measurement whose reading did not respond to the config must be
+    # flagged, not fitted: overhead = measured - exact turns a clamped reading into
+    # a compute buffer that shrinks as layers are added.
+    flat = [dict(synth(262144, 512, True, ngl=n), model="flat.gguf", gpu="g",
+                 exact_mib=8000.0 + 500.0 * i, measured_mib=11500.0)
+            for i, n in enumerate((18, 22, 26))]
+    mark_unreliable(flat)
+    flat_ok = all(r.get("unreliable") for r in flat)
+    moving = [dict(synth(262144, 512, True, ngl=n), model="ok.gguf", gpu="g",
+                   exact_mib=8000.0 + 500.0 * i, measured_mib=9000.0 + 500.0 * i)
+              for i, n in enumerate((18, 22, 26))]
+    mark_unreliable(moving)
+    flat_ok = flat_ok and not any(r.get("unreliable") for r in moving)
+    print("  CALFLAT clamped rows flagged=%s, responsive rows kept=%s  %s"
+          % (all(r.get("unreliable") for r in flat),
+             not any(r.get("unreliable") for r in moving), "OK" if flat_ok else "FAIL"))
+    ok = ok and flat_ok
 
     # 10) --n-cpu-moe must move expert bytes to the RAM side of the speed model
     rm2 = analyze(p3, 4096, "f16", 512, False, vram_budget_mib=300, ram_budget_mib=8000,

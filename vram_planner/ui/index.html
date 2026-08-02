@@ -30,7 +30,14 @@
   <div id="platwarn"></div>
 
   <div class="grid">
-<form class="card" id="controls" autocomplete="off">
+    <!-- novalidate: the step/min/max attributes below are spinner increments and
+         nudges, not constraints. Several fields are legitimately off-step - the
+         VRAM budget is prefilled from live free VRAM (11508 MiB is not a multiple
+         of 64), RAM likewise - and most of them live inside the collapsed
+         "Advanced" block, which the browser cannot focus to report a violation.
+         That combination is exactly the "invalid form control is not focusable"
+         error. run() coerces every field itself. -->
+    <form class="card" id="controls" autocomplete="off" novalidate>
       <h2>Model &amp; run settings</h2>
 
       <div class="field">

@@ -49,9 +49,10 @@ def analyze(path, ctx, kv_type, n_ubatch, flash_attn,
     n_layers = cfg["n_layers"] or 0
     warnings = []
     if cl["unknown_types"]:
-        warnings.append("Unrecognized quant type(s) %s - sizes for those tensors may be off. "
-                        "Check the total against file size below."
-                        % ", ".join(cl["unknown_types"]))
+        warnings.append("Unrecognized quant type(s) %s. Their sizes were recovered from the "
+                        "gaps between tensor offsets rather than from the type table, which "
+                        "is exact but includes any padding, so the total may run a few bytes "
+                        "high. Everything else is unaffected." % ", ".join(cl["unknown_types"]))
     if n_layers == 0:
         warnings.append("Could not read block_count from metadata; layer math unavailable.")
     _plat = platform_support()
@@ -96,20 +97,24 @@ def analyze(path, ctx, kv_type, n_ubatch, flash_attn,
     rec_per_layer_mib = (rec_total_mib / len(cfg["ssm_layers"])) if cfg["ssm_layers"] else 0.0
 
     compute_terms = compute_buffer_terms(cfg, ctx, n_ubatch, flash_attn, n_seq, kv_type)
-    # planning value: assume the whole graph runs on the GPU. The plan builders
-    # re-split it once they know where the layers and the output head landed.
+    # planning value: assume the whole graph runs on the GPU at full offload. The
+    # plan builders re-split it once they know where the layers landed - including
+    # the floor, which now depends on how many blocks are resident.
     compute_mib = compute_override_mib if compute_override_mib else \
-        round(compute_terms["graph"] + compute_terms["logits"], 1)
+        round(compute_terms["graph"] + compute_terms["floor_base"]
+              + compute_terms["floor_per_layer"] * n_layers, 1)
 
     def compute_fn(ngl, output_on_gpu=None, any_on_cpu=None):
-        """GPU/CPU compute-buffer split for a candidate layer count."""
+        """GPU/CPU compute-buffer split for a candidate layer count.
+
+        output_on_gpu is accepted and ignored: the logits buffer is host memory at
+        every offload level, measured. The parameter stays so callers that pass it
+        keep working, and because where the HEAD runs is still meaningful."""
         ngl = max(0, min(int(ngl), n_layers))
-        if output_on_gpu is None:
-            output_on_gpu = output_head_on_gpu(n_layers, ngl)
         if any_on_cpu is None:
             any_on_cpu = graph_is_split(n_layers, ngl)
         return compute_buffer_split(compute_terms, ngl > 0, any_on_cpu,
-                                    output_on_gpu, compute_override_mib)
+                                    ngl, compute_override_mib)
 
     # MTP speculative decoding: the draft blocks run after all, so they get the KV
     # cache back - at f16, whatever the configured KV quant - plus a fixed pool and
@@ -148,7 +153,9 @@ def analyze(path, ctx, kv_type, n_ubatch, flash_attn,
             "kv_grow_per_token_kib": kv_grow_per_tok_mib * 1024.0,
             "recurrent_total": rec_total_mib, "recurrent_per_layer": rec_per_layer_mib,
             "compute": compute_mib, "mmproj": mmproj_mib,
-            "compute_graph": compute_terms["graph"], "compute_logits": compute_terms["logits"],
+            "compute_graph": compute_terms["graph"], "compute_output": compute_terms["output"],
+            "compute_floor": round(compute_terms["floor_base"]
+                                   + compute_terms["floor_per_layer"] * n_layers, 1),
             "bundle_on_disk": file_on_disk_mib + (_mib(mmproj["bytes"]) if mmproj else 0.0),
         },
         "mmproj": ({"name": mmproj["name"], "mib": _mib(mmproj["tensor_bytes"]),
@@ -203,19 +210,45 @@ def analyze(path, ctx, kv_type, n_ubatch, flash_attn,
         result["plan"] = {"kind": "unknown"}
         return result
 
-    # Weights that actually reach VRAM: the transformer blocks only. The token
-    # embeddings and output head stay in system RAM even at full offload.
+    # Weights that reach VRAM beyond the transformer blocks. THE single largest
+    # error in the end-to-end total before this was measured: on the three dense
+    # models swept, CUDA0.model carries 626-843 MiB more than the blocks account
+    # for, appearing as soon as -ngl is 1 and not growing after. On the two MoE
+    # models it carries 15-143 MiB, i.e. nothing.
+    #
+    # Scored against the process counter over 144 loads, charging the token
+    # embeddings on dense models only takes the total from 22.7% mean / 54.4% worst
+    # to 7.1% / 39.6% - and does it uniformly, every model between 4% and 10%,
+    # rather than by trading one architecture off against another. Charging them on
+    # every model gets 14.6%; charging the output head instead gets 20.4%; charging
+    # both gets 35.6%.
+    #
+    # The MECHANISM is not established - five models over three architectures is
+    # enough to measure the split but not to explain it - so this is the first thing
+    # to re-check when more architectures are swept, especially a dense MoE-free
+    # model with untied embeddings. It errs in the safe direction for the case it is
+    # least sure of: over-charging VRAM makes a plan conservative, under-charging it
+    # makes the plan overcommit and the load spill.
+    embed_on_gpu_mib = 0.0 if cl["is_moe"] else embed_mib
+
+    def gpu_extra_weights(ngl):
+        """Non-block weights resident in VRAM at this offload level."""
+        return embed_on_gpu_mib if ngl > 0 else 0.0
+
     block_weights_mib = weights_mib - embed_mib - output_mib
     compute_full_mib = compute_fn(n_layers)["gpu"]
-    full_need = block_weights_mib + kv_total_mib + rec_total_mib + compute_full_mib
+    full_need = (block_weights_mib + gpu_extra_weights(n_layers)
+                 + kv_total_mib + rec_total_mib + compute_full_mib)
     fully_fits = full_need <= eff_vram
 
     # max context that fits fully on GPU (all weights on GPU). KV is piecewise
     # linear in ctx once sliding-window layers are in play, and the compute buffer
     # itself grows with ctx, so re-solve rather than divide by a per-token cost.
     def _gpu_room(c):
+        # full offload, so every block is resident and the floor is at its largest
         t = compute_buffer_terms(cfg, c, n_ubatch, flash_attn, n_seq, kv_type)
-        cb = compute_override_mib if compute_override_mib else round(t["graph"] + t["logits"], 1)
+        cb = compute_override_mib if compute_override_mib else \
+            round(t["graph"] + t["floor_base"] + t["floor_per_layer"] * n_layers, 1)
         return eff_vram - block_weights_mib - rec_total_mib - cb
     max_ctx_gpu = max_ctx_for_kv_budget(cfg, kv_type, _gpu_room(ctx), n_ubatch,
                                         n_seq, flash_attn)
@@ -238,22 +271,33 @@ def analyze(path, ctx, kv_type, n_ubatch, flash_attn,
         plan = _plan_dense_kv_on_gpu(cfg, cl, eff_vram, ram_budget_mib, kv_total_mib,
                                      compute_mib, weights_mib, ffn_dense_total_mib,
                                      ffn_layer_mean_mib, max_ctx_gpu, ctx, kv_type, flash_attn,
-                                     rec_total=rec_total_mib, n_ubatch=n_ubatch, n_seq=n_seq)
+                                     rec_total=rec_total_mib, n_ubatch=n_ubatch, n_seq=n_seq,
+                                     compute_fn=compute_fn, gpu_extra=gpu_extra_weights)
     else:
         plan = _plan_dense(cfg, cl, eff_vram, ram_budget_mib, kv_total_mib, kv_per_layer_mib,
                            compute_mib, weights_mib, embed_mib, output_mib,
                            per_layer_max_mib, per_layer_mean_mib, fully_fits, full_need,
                            max_ctx_gpu, ctx, kv_type, flash_attn,
                            ngl_override=gpu_layers_override, n_seq=n_seq,
-                           compute_fn=compute_fn)
-    # the projector was held out of eff_vram while planning; fold it back into the
-    # reported totals so the bars and warnings show the real GPU footprint
+                           compute_fn=compute_fn, gpu_extra=gpu_extra_weights)
+    # The projector and the MTP draft cache were held out of eff_vram while planning,
+    # so the split search never had to think about them. Fold them back into the
+    # reported totals - but into the BUDGET as well as the usage, or the two numbers
+    # end up on different bases and a plan that fits reads as though it does not.
+    # On gemma-4-31B with its 1145 MiB projector that showed as "11045 / 10070" next
+    # to a green verdict, which is exactly the sort of thing that makes a user stop
+    # trusting the tool.
+    held_out = 0.0
     if mmproj_mib > 0:
         plan["mmproj_mib"] = mmproj_mib
-        plan["vram_used_mib"] = plan.get("vram_used_mib", 0.0) + mmproj_mib
+        held_out += mmproj_mib
     if spec_mib > 0:
         plan["spec_mib"] = spec_mib
-        plan["vram_used_mib"] = plan.get("vram_used_mib", 0.0) + spec_mib
+        held_out += spec_mib
+    if held_out > 0:
+        plan["vram_used_mib"] = plan.get("vram_used_mib", 0.0) + held_out
+        if plan.get("vram_budget_mib") is not None:
+            plan["vram_budget_mib"] = plan["vram_budget_mib"] + held_out
     result["plan"] = plan
 
     # ---- speed roofline ----------------------------------------------------
@@ -323,9 +367,10 @@ def _llama_flags(ctx, kv_type, flash_attn, ngl=None, n_cpu_moe=None, ot_all_expe
 def _plan_dense(cfg, cl, eff_vram, ram, kv_total, kv_layer, compute, weights,
                 embed, output, layer_max, layer_mean, fully_fits, full_need,
                 max_ctx_gpu, ctx, kv_type, flash_attn, ngl_override=None, n_seq=1,
-                compute_fn=None):
+                compute_fn=None, gpu_extra=None):
     n_layers = cfg["n_layers"]
     per_layer = cl.get("per_layer_bytes") or {}
+    gpu_extra = gpu_extra or (lambda ngl: 0.0)
     # llama.cpp offloads the LAST n_gpu_layers blocks (i_gpu_start = n_layer - ngl),
     # so which blocks land on the GPU matters: on a hybrid model the attention
     # blocks are the expensive ones and they are not evenly spread.
@@ -336,28 +381,27 @@ def _plan_dense(cfg, cl, eff_vram, ram, kv_total, kv_layer, compute, weights,
         ngl = max(0, min(int(ngl), n_layers))
         full = (ngl >= n_layers)
         cb = compute_fn(ngl) if compute_fn else {"gpu": compute, "cpu": 0.0}
+        # The output head always stays in system RAM; the token embeddings follow
+        # gpu_extra() - see the note where embed_on_gpu_mib is derived.
+        extra = gpu_extra(ngl)
         if full:
-            # Even at full offload the token embeddings and the output head stay in
-            # system RAM - measured across an -ngl sweep, no step matching their
-            # size appears at any layer count, and charging them to VRAM would
-            # leave less room for the compute buffer than the CUDA context alone
-            # occupies. Only the transformer blocks go to the GPU.
-            gpu_w, gpu_kv = weights - embed - output, kv_total
+            gpu_w, gpu_kv = weights - embed - output + extra, kv_total
             gpu_rec = _mib(recurrent_bytes(cfg, range(n_layers), n_seq))
             vram_used = gpu_w + kv_total + gpu_rec + cb["gpu"]
-            cpu_w, cpu_kv, cpu_rec = embed + output, 0.0, 0.0
+            cpu_w, cpu_kv, cpu_rec = embed + output - extra, 0.0, 0.0
             cpu_layers = 0
         else:
             on_gpu = gpu_blocks(ngl)
             off = set(on_gpu)
-            gpu_w  = _mib(sum(per_layer.get(i, 0) for i in on_gpu)) or (ngl * layer_max)
+            gpu_w  = (_mib(sum(per_layer.get(i, 0) for i in on_gpu))
+                      or (ngl * layer_max)) + extra
             gpu_kv = _mib(kv_bytes_total(cfg, kv_type, on_gpu))
             gpu_rec = _mib(recurrent_bytes(cfg, on_gpu, n_seq))
             vram_used = gpu_w + gpu_kv + gpu_rec + cb["gpu"]
             cpu_layers = n_layers - ngl
             rest = [i for i in range(n_layers) if i not in off]
             cpu_w = (_mib(sum(per_layer.get(i, 0) for i in rest)) or (cpu_layers * layer_mean)) \
-                    + embed + output
+                    + embed + output - extra
             cpu_kv = kv_total - gpu_kv
             cpu_rec = _mib(recurrent_bytes(cfg, rest, n_seq))
         ram_used = cpu_w + cpu_kv + cpu_rec + cb["cpu"]
@@ -416,25 +460,53 @@ def _ffn_cpu_flag():
 
 def _plan_dense_kv_on_gpu(cfg, cl, eff_vram, ram, kv_total, compute, weights,
                           ffn_total, ffn_layer_mean, max_ctx_gpu, ctx, kv_type, flash_attn,
-                          rec_total=0.0, n_ubatch=512, n_seq=1):
+                          rec_total=0.0, n_ubatch=512, n_seq=1, compute_fn=None,
+                          gpu_extra=None):
     """Keep ALL KV cache (and attention) on GPU by offloading dense FFN weights to CPU.
     Dense analog of MoE expert offload. Note: FFN runs every token, so this is slower
     for dense models than a normal layer split."""
     n_layers = cfg["n_layers"]
     n_ffn = cl["n_ffn_layers"]
+    # Exiling every dense FFN to the CPU makes the graph span both backends, which
+    # is what graph_is_split() means - the same thing --n-cpu-moe does for experts.
+    # This planner used to take a flat scalar and so was the one path that never
+    # paid the split surcharge, understating VRAM by the surcharge plus its
+    # per-context part. Every block is still offloaded, so the output head, and
+    # with it the logits tensor, does land on the GPU.
+    if compute_fn:
+        compute = compute_fn(n_layers, output_on_gpu=True, any_on_cpu=True)["gpu"]
     # Weights that actually reach VRAM: blocks minus the dense FFN we are exiling.
     # Embeddings and the output head stay in system RAM - see _plan_dense.build().
-    head_ram = _mib(cl["embed_bytes"] + cl["output_bytes"])
+    # This mode always offloads every block, so the embeddings follow the same rule
+    # they would at full offload - see embed_on_gpu_mib in analyze().
+    extra = (gpu_extra or (lambda ngl: 0.0))(n_layers)
+    head_ram = _mib(cl["embed_bytes"] + cl["output_bytes"]) - extra
     onchip_attn = weights - ffn_total - head_ram
     # base = attention + norms + full KV, all on GPU
     base_gpu = onchip_attn + kv_total + rec_total + compute
     if base_gpu <= eff_vram:
         spare = eff_vram - base_gpu
-        ffn_on_gpu = int(spare / ffn_layer_mean) if ffn_layer_mean > 0 else 0
-        ffn_on_gpu = max(0, min(ffn_on_gpu, n_ffn))
+        # Buy back FFN layers at their real byte sizes, not at the mean. The other
+        # two planners sum per-block bytes because blocks are not interchangeable -
+        # a quant mixes types across layers, and the first and last blocks are
+        # routinely bigger. Keeping the last blocks matches llama.cpp's own
+        # last-N-first offload order.
+        per_ffn = cl.get("per_layer_ffn_bytes") or {}
+        ffn_on_gpu, ffn_gpu_mib, spent = 0, 0.0, 0.0
+        for li in sorted(per_ffn, reverse=True):
+            cost = _mib(per_ffn[li])
+            if spent + cost > spare:
+                break
+            spent += cost
+            ffn_on_gpu += 1
+        if not per_ffn and ffn_layer_mean > 0:      # metadata-only parse: nothing to sum
+            ffn_on_gpu = max(0, min(int(spare / ffn_layer_mean), n_ffn))
+            spent = ffn_on_gpu * ffn_layer_mean
+        ffn_on_gpu = min(ffn_on_gpu, n_ffn)
+        ffn_gpu_mib = spent
         ffn_on_cpu = n_ffn - ffn_on_gpu
-        vram_used = base_gpu + ffn_on_gpu * ffn_layer_mean
-        cpu_weights = ffn_on_cpu * ffn_layer_mean + head_ram
+        vram_used = base_gpu + ffn_gpu_mib
+        cpu_weights = max(0.0, ffn_total - ffn_gpu_mib) + head_ram
         ram_ok = cpu_weights <= ram
         if ffn_on_cpu == 0:
             head = "All KV on GPU and the whole model fits - no FFN offload needed."
@@ -465,7 +537,7 @@ def _plan_dense_kv_on_gpu(cfg, cl, eff_vram, ram, kv_total, compute, weights,
             "ffn_on_cpu": ffn_on_cpu, "ffn_on_gpu": ffn_on_gpu, "n_ffn_layers": n_ffn,
             "vram_used_mib": vram_used, "vram_budget_mib": eff_vram,
             "ram_used_mib": cpu_weights, "ram_ok": ram_ok, "max_ctx_gpu": max_ctx_gpu,
-            "gpu_weights_mib": onchip_attn + ffn_on_gpu * ffn_layer_mean,
+            "gpu_weights_mib": onchip_attn + ffn_gpu_mib,
             "gpu_kv_mib": kv_total, "compute_mib": compute, "gpu_recurrent_mib": rec_total,
             "cpu_weights_mib": cpu_weights, "cpu_kv_mib": 0.0,
             "lmstudio": ls, "llama_cmd": cmd, "headline": head,

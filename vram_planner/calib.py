@@ -4,7 +4,7 @@ from .const import _mib
 from .gguf import load_gguf
 from .model import extract_config
 from .kv import is_swa_layer, kv_bytes_per_token_layer, swa_cache_len
-from .compute import CB_CONST_PER_KHID, CB_CTX_QUANT_BYTES, CB_DEFAULTS, CB_MASK_PER_UB_TOK, CB_SPLIT_GRAPH_MIB, CB_SPLIT_PER_TOKEN, graph_is_split, output_head_on_gpu
+from .compute import CB_CTX_QUANT_BYTES, CB_CUDA_CTX_MIB, CB_DEFAULTS, CB_MASK_PER_UB_TOK, CB_MOE_ACT_PER_WIDTH, CB_SPLIT_GRAPH_MIB, CB_SPLIT_PER_TOKEN, graph_is_split, output_head_on_gpu
 from .paths import _user_file
 from .gpu import gpu_list
 from .lmstudio import current_backend, default_models_dir
@@ -57,7 +57,7 @@ def _active_gpu():
 # lengths also move the ctx slope; varied ubatch or model width moves the
 # activation slope; a flash-attention-off run moves the score term. Fitting four
 # coefficients to two points would be worse than not fitting at all.
-CALIB_TERMS = ["const", "ctx", "act", "nofa"]   # freed in this order
+CALIB_TERMS = ["floor", "ctx", "act", "nofa"]   # freed in this order
 
 CALIB_MIN_SPREAD = 0.25                          # min relative range to free a term
 
@@ -80,7 +80,9 @@ def save_calibration(data):
         pass
 
 
-CALIB_SCHEMA = 2                      # 2 adds n_layers + n_vocab to every row
+# 2 adds n_layers + n_vocab; 3 adds moe_width; 4 re-derives exact/overhead after the
+# embeddings moved to VRAM on dense models - see _recompute_overheads().
+CALIB_SCHEMA = 4
 
 
 # A measurement taken with the card full is a ceiling, not a reading: llama.cpp
@@ -135,27 +137,19 @@ def mark_unreliable(rows, gpu_totals=None):
 
 
 def _model_facts(name, roots=None, _cache={}):
-    """(n_layers, n_vocab) read from the named model file, or None if it is gone.
+    """(n_layers, n_vocab, moe_width) read from the named model file, or None.
 
     Matched on basename: the store records that and nothing else, and a model is
     not going to be two different architectures under one file name."""
     if name in _cache:
         return _cache[name]
-    found = None
-    for root in (roots if roots is not None else [default_models_dir()]):
-        if not root or not os.path.isdir(root):
-            continue
-        for dirpath, _dirs, files in os.walk(root):
-            if name in files:
-                found = os.path.join(dirpath, name)
-                break
-        if found:
-            break
+    found = _model_file(name, roots)
     facts = None
     if found:
         try:
             cfg = extract_config(load_gguf(found))
-            facts = (cfg.get("n_layers") or 0, cfg.get("n_vocab") or 0)
+            facts = (cfg.get("n_layers") or 0, cfg.get("n_vocab") or 0,
+                     (cfg.get("n_expert_used") or 0) * (cfg.get("expert_ffn_len") or 0))
         except Exception:
             facts = None
     _cache[name] = facts
@@ -175,17 +169,20 @@ def migrate_calibration(data):
     rows = data.get("rows") or []
     if not rows:
         return False
-    snap = lambda: [(r.get("n_layers"), r.get("n_vocab"), r.get("unreliable"))
-                    for r in rows]
+    _recompute_overheads(data, rows)
+    snap = lambda: [(r.get("n_layers"), r.get("n_vocab"), r.get("moe_width"),
+                     r.get("unreliable")) for r in rows]
     before = snap()
 
     for r in rows:
-        if r.get("n_layers") and r.get("n_vocab"):
+        if r.get("n_layers") and r.get("n_vocab") and r.get("moe_width") is not None:
             continue
         facts = _model_facts(r.get("model") or "")
         if facts:
             r["n_layers"] = r.get("n_layers") or facts[0]
             r["n_vocab"] = r.get("n_vocab") or facts[1]
+            if r.get("moe_width") is None:
+                r["moe_width"] = facts[2]
 
     # ...then propagate across rows, by file name first and architecture second.
     for key in (lambda r: (r.get("model"),),
@@ -193,17 +190,90 @@ def migrate_calibration(data):
         known = {}
         for r in rows:
             k = key(r)
-            for f in ("n_layers", "n_vocab"):
-                if r.get(f):
+            for f in ("n_layers", "n_vocab", "moe_width"):
+                if r.get(f) is not None:
                     known.setdefault(k, {}).setdefault(f, r[f])
         for r in rows:
             for f, val in (known.get(key(r)) or {}).items():
-                if not r.get(f):
+                if r.get(f) is None:
                     r[f] = val
 
+    # After mark_unreliable(), which clears the flag before recomputing it.
+    # A row whose routed-expert width cannot be resolved would have the MoE
+    # activation scratch left inside its observation, which the fit would then
+    # absorb into the per-block floor - the same double-billing shape as the
+    # split-surcharge bug. Better to say so and skip it.
     mark_unreliable(rows)
+    for r in rows:
+        if r.get("moe_width") is None:
+            r.setdefault("unreliable",
+                         "routed-expert width unknown for %s - re-measure with the "
+                         "model present, or delete this row" % (r.get("model") or "?"))
+        if r.get("stale"):
+            r.setdefault("unreliable", r["stale"])
     data["schema"] = CALIB_SCHEMA
     return snap() != before
+
+
+def _recompute_overheads(data, rows):
+    """Re-derive `exact_mib` / `overhead_mib` for rows stored under an older schema.
+
+    `overhead_mib` is measured VRAM minus what the planner calls exact, so it is not
+    a measurement on its own - it is a measurement interpreted through a particular
+    model. When that model changes, every stored row silently means something else.
+    Schema 3 charges the token embeddings to VRAM on dense models, which moves
+    several hundred MiB from `overhead` into `exact`; left alone, the old rows fit a
+    per-block floor six times too large and the planner then bills it.
+
+    `measured_mib` is the actual reading and never changes, so the fix is to
+    re-derive the split from it. A row whose model file is gone cannot be
+    re-derived, and is flagged rather than guessed at."""
+    if (data.get("schema") or 0) >= CALIB_SCHEMA:
+        return
+    from .plan import analyze                # deferred: plan reads calibration_status()
+    for r in rows:
+        if not r.get("measured_mib"):
+            continue
+        path = _model_file(r.get("model") or "")
+        if not path:
+            r["stale"] = ("recorded under an older model of what counts as exact, and "
+                          "%s is no longer on disk to re-derive it from"
+                          % (r.get("model") or "the model"))
+            continue
+        try:
+            rr = analyze(path, r["ctx"], r.get("kv_type", "f16"), r["ub"],
+                         bool(r.get("fa", True)), vram_budget_mib=1 << 20,
+                         ram_budget_mib=1 << 20, gpu_reserve_mib=0,
+                         compute_override_mib=0.001, safety_pct=0,
+                         n_seq=r.get("n_seq", 1), gpu_layers_override=r.get("ngl"),
+                         include_mmproj=False,
+                         n_cpu_moe_override=(r.get("n_cpu_moe") or None))
+        except Exception:
+            continue
+        p = rr["plan"]
+        exact = (p.get("gpu_weights_mib", 0.0) + p.get("gpu_kv_mib", 0.0)
+                 + p.get("gpu_recurrent_mib", 0.0) + p.get("mmproj_mib", 0.0))
+        r.pop("stale", None)
+        r["exact_mib"] = round(exact, 1)
+        r["overhead_mib"] = round(r["measured_mib"] - exact, 1)
+
+
+def _model_file(name, roots=None):
+    for root in (roots if roots is not None else [default_models_dir()]):
+        if not root or not os.path.isdir(root):
+            continue
+        for dirpath, _dirs, files in os.walk(root):
+            if name in files:
+                return os.path.join(dirpath, name)
+    return None
+
+
+def _gpu_layers(row):
+    """Blocks actually resident on the GPU for this row."""
+    n_layers, ngl = row.get("n_layers") or 0, row.get("ngl")
+    if ngl is None:
+        return 0
+    return max(0, min(int(ngl), n_layers or int(ngl)))
 
 
 def _design(row):
@@ -212,8 +282,13 @@ def _design(row):
     The ctx regressor is the raw context length, not the KV bytes it implies: the
     compute buffer was measured to scale with context flat, independently of how
     big the cache is. Rows written before this change carry a `kv_tok_ctx` field
-    that is simply ignored now."""
-    return {"const": 1.0,
+    that is simply ignored now.
+
+    `floor` is per resident block rather than a bare intercept. The bare CUDA
+    context is structural (156 MiB, measured to 0.7 MiB across five models) and
+    comes off in _struct_offset(); what varies by machine is the per-block ramp of
+    lazily-loaded kernel modules."""
+    return {"floor": float(_gpu_layers(row)),
             "ctx":   _mib(row["ctx"]),
             "act":   _mib(row["hidden"] * row["ub"]),
             "nofa":  0.0 if row["fa"] else _mib(row["n_head"] * row["ub"] * row["ctx"])}
@@ -225,23 +300,22 @@ def _row_flags(row):
 
     A row is usable only if its placement is knowable. `n_layers` decides both
     predicates, so a row without it cannot be fitted - guessing "unsplit" is what
-    let the split surcharge hide in `const`. `n_vocab` only matters when the head
-    was on the GPU, which is why partial-offload rows recorded before it was
-    stored stay usable: their logits tensor was never charged to VRAM."""
+    let the split surcharge hide in the additive base.
+
+    `n_vocab` used to be required whenever the head was on the GPU, because the
+    logits tensor was charged to VRAM there. It is not charged to either side any
+    more - it is host memory in every measured load - so those rows are usable now
+    whether or not they carry it."""
     n_layers, ngl = row.get("n_layers"), row.get("ngl")
     split = graph_is_split(n_layers, ngl, row.get("n_cpu_moe"))
+    on_gpu = output_head_on_gpu(n_layers, ngl)
+    n_vocab = row.get("n_vocab") or 0
     if row.get("unreliable"):
         return {"ok": False, "why": row["unreliable"], "split": split,
-                "output_on_gpu": output_head_on_gpu(n_layers, ngl),
-                "n_vocab": row.get("n_vocab") or 0}
+                "output_on_gpu": on_gpu, "n_vocab": n_vocab}
     if not n_layers or ngl is None:
         return {"ok": False, "why": "no n_layers recorded",
                 "split": split, "output_on_gpu": False, "n_vocab": 0}
-    on_gpu = output_head_on_gpu(n_layers, ngl)
-    n_vocab = row.get("n_vocab") or 0
-    if on_gpu and not n_vocab:
-        return {"ok": False, "why": "head was on the GPU but no n_vocab recorded",
-                "split": split, "output_on_gpu": True, "n_vocab": 0}
     return {"ok": True, "why": "", "split": split,
             "output_on_gpu": on_gpu, "n_vocab": n_vocab}
 
@@ -254,17 +328,21 @@ def _struct_offset(row):
 
     Every term the planner charges to VRAM must appear either here or in
     _design(). `overhead_mib` is measured VRAM minus the exact terms, so it
-    already contains split_extra and logits; anything charged at prediction time
-    and not subtracted here gets absorbed into `const` and then billed twice."""
+    already contains split_extra; anything charged at prediction time and not
+    subtracted here gets absorbed into the free coefficients and then billed twice.
+
+    The logits tensor is deliberately NOT here any more. It used to be subtracted
+    whenever the head was on the GPU, matching a planner that charged it to VRAM;
+    both were wrong. Measured across 144 loads it is host memory at every offload
+    level, so neither side should see it."""
     flags = _row_flags(row)
-    off = (CB_CONST_PER_KHID * row["hidden"] / 1000.0
-           + _mib(CB_MASK_PER_UB_TOK * row["ub"] * row["ctx"]))
+    off = (CB_CUDA_CTX_MIB
+           + _mib(CB_MASK_PER_UB_TOK * row["ub"] * row["ctx"])
+           + _mib(CB_MOE_ACT_PER_WIDTH * row["ub"] * (row.get("moe_width") or 0)))
     if row.get("kv_type", "f16") != "f16":
         off += _mib(CB_CTX_QUANT_BYTES * row["ctx"])
     if flags["split"]:
         off += CB_SPLIT_GRAPH_MIB + _mib(CB_SPLIT_PER_TOKEN * row["ctx"])
-    if flags["output_on_gpu"]:
-        off += _mib(4.0 * row["ub"] * flags["n_vocab"])
     return off
 
 
@@ -311,7 +389,7 @@ def fit_calibration(rows, prior=None):
     knob = {"ctx": lambda r: float(r["ctx"]),
             "act": lambda r: float(r["ub"]),
             "nofa": lambda r: 0.0 if r["fa"] else 1.0}
-    free = ["const"]
+    free = ["floor"]
     for t in CALIB_TERMS[1:]:
         vals = [knob[t](r) for r in rows]
         lo, hi = min(vals), max(vals)
@@ -337,13 +415,22 @@ def fit_calibration(rows, prior=None):
         if good:
             cand = dict(zip(free, x))
             for t, val in cand.items():
-                if t == "const":
-                    # An additive offset, not a byte count on its own: the physical
-                    # pool is const + the structural per-hidden part, so a small
-                    # negative const is a legitimate fit that trims a slightly
-                    # over-predicting prior. Only reject nonsense magnitudes, and
-                    # check the total stays positive on the rows we actually have.
-                    if abs(val) > 20000 or any(val + _struct_offset(r) < 0 for r in rows):
+                if t == "floor":
+                    # MiB of lazily-loaded kernel modules per resident block, and the
+                    # term most able to do damage: unlike the intercept it replaced,
+                    # its regressor grows with -ngl, so any systematic under-
+                    # prediction gets absorbed here and then billed per layer. A
+                    # store of eight LM Studio measurements fitted it at 38 MiB/layer
+                    # - 300 MiB of phantom VRAM on a 8-layer offload, and ten times
+                    # anything the allocator has ever been seen to hold.
+                    #
+                    # So it gets the same order-of-magnitude bound as the slopes.
+                    # That is wide enough for real variation - gemma-4 measures ~10
+                    # MiB/layer against Qwen3.6-35B-A3B's ~2.5 - and narrow enough
+                    # that a fit this far out falls back to the shipped prior.
+                    if val < 0 or (prior[t] > 0 and not (0.1 <= val / prior[t] <= 10.0)) \
+                            or any(val * d["floor"] + _struct_offset(r) < 0
+                                   for r, d in zip(rows, des)):
                         good = False
                 elif val < 0 or (prior[t] > 0 and not (0.1 <= val / prior[t] <= 10.0)):
                     good = False
@@ -443,6 +530,9 @@ def record_calibration(path, ctx, kv_type, n_ubatch, n_seq, flash_attn, ngl,
            "ngl": ngl, "n_cpu_moe": n_cpu_moe, "kv_type": kv_type,
            "hidden": cfg["hidden"] or 4096, "n_head": cfg["n_head"] or 32,
            "n_layers": cfg["n_layers"] or 0, "n_vocab": cfg.get("n_vocab") or 0,
+           # routed-expert width, so _struct_offset can remove the MoE activation
+           # scratch. Zero on a dense model, which is exactly right.
+           "moe_width": (cfg.get("n_expert_used") or 0) * (cfg.get("expert_ffn_len") or 0),
            "kv_tok_ctx": kvg * ctx + kvs * swa_cache_len(cfg, ctx, n_ubatch, n_seq, flash_attn),
            "exact_mib": round(exact, 1), "measured_mib": round(measured_mib, 1),
            "overhead_mib": round(overhead, 1)}

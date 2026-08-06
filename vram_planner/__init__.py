@@ -50,7 +50,8 @@ from .kv import (KV_TYPE_BYTES, KV_PAD_FA, KV_PAD_NOFA, kv_bytes_per_token_layer
                  kv_bytes_layer, kv_bytes_total, kv_bytes_total_at,
                  max_ctx_for_kv_budget, kv_bytes_per_token,
                  kv_bytes_per_token_growing, recurrent_bytes)
-from .compute import (CB_DEFAULTS, CB_GRAPH_CONST_MIB, CB_CONST_PER_KHID,
+from .compute import (CB_DEFAULTS, CB_FLOOR_PER_LAYER, CB_MOE_ACT_PER_WIDTH,
+                      CB_OUTPUT_BYTES,
                       CB_CUDA_CTX_MIB, CB_ACT_PER_HIDDEN, CB_CTX_PER_TOKEN,
                       CB_MASK_PER_UB_TOK, CB_CTX_QUANT_BYTES, CB_SPLIT_GRAPH_MIB,
                       CB_SPLIT_PER_TOKEN, CB_NOFA_HEAD_BYTES, MTP_SPEC_CONST_MIB,

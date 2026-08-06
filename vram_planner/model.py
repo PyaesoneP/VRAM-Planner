@@ -78,6 +78,7 @@ def extract_config(model):
     # layers keep a fixed-size recurrent state. Read it off the tensor table --
     # that is ground truth and needs no per-arch table.
     attn_layers, ssm_layers, conv_dim, d_conv = set(), set(), 0, 0
+    mla_layers, mla_k_tensor, mla_lora_tensor = set(), 0, 0
     for t in model["tensors"]:
         m = RE_BLK.match(t["name"])
         if not m:
@@ -85,6 +86,22 @@ def extract_config(model):
         li = int(m.group(1)); rest = t["name"][m.end():]
         if rest.startswith(("attn_k.", "attn_v.", "attn_k_b.", "attn_kv_")):
             attn_layers.add(li)
+            # ---- multi-head latent attention (DeepSeek-V2/V3, Kimi) ------------
+            # These blocks do NOT cache K and V per head. They cache one compressed
+            # latent per token: the output of attn_kv_a_mqa, which is
+            # kv_lora_rank + qk_rope_head_dim wide (576 on V3) and shared across
+            # every head. Sizing them as n_kv_heads * (head_dim_k + head_dim_v)
+            # overstates the cache several-fold.
+            #
+            # Both widths are in the tensor table, which is ground truth:
+            #   attn_kv_a_mqa  ne = [n_embd, kv_lora_rank + qk_rope]
+            #   attn_kv_b      ne = [kv_lora_rank, n_head * (qk_nope + v_head_dim)]
+            if rest.startswith("attn_kv_a_mqa.") and len(t["dims"]) >= 2:
+                mla_layers.add(li)
+                mla_k_tensor = max(mla_k_tensor, t["dims"][1])
+            elif rest.startswith("attn_kv_b.") and len(t["dims"]) >= 1:
+                mla_layers.add(li)
+                mla_lora_tensor = max(mla_lora_tensor, t["dims"][0])
         elif rest.startswith("ssm_"):
             ssm_layers.add(li)
             if rest.startswith("ssm_conv1d.") and len(t["dims"]) >= 2:
@@ -102,6 +119,25 @@ def extract_config(model):
     attn_layers = sorted(attn_layers)
     ssm_layers  = sorted(ssm_layers)
 
+    # ---- MLA cache geometry --------------------------------------------------
+    # Mirrors llama.cpp: it reads key_length_mla / value_length_mla when the file
+    # carries them and otherwise derives them from kv_lora_rank and the rope
+    # dimension. The tensor table is the last resort, and the most reliable of the
+    # three - it is what the weights actually are rather than what a converter
+    # claimed. The cached latent is shared across heads, so the head count for
+    # these blocks is 1, not n_head_kv.
+    kv_lora_rank = _as_int(g(".attention.kv_lora_rank"), 0) or 0
+    qk_rope_dim  = _as_int(g(".rope.dimension_count"), 0) or 0
+    head_dim_k_mla = (_as_int(g(".attention.key_length_mla"), 0) or 0
+                      or (kv_lora_rank + qk_rope_dim if kv_lora_rank else 0)
+                      or mla_k_tensor)
+    head_dim_v_mla = (_as_int(g(".attention.value_length_mla"), 0) or 0
+                      or kv_lora_rank or mla_lora_tensor)
+    mla_layers &= set(attn_layers)
+    is_mla = bool(mla_layers and head_dim_k_mla and head_dim_v_mla)
+    if not is_mla:
+        mla_layers = set()
+
     # recurrent state per SSM layer per sequence (llama.cpp keeps both in f32):
     #   conv state = (d_conv - 1) * conv_dim      s state = d_state * d_inner
     ssm_d_state = _as_int(g(".ssm.state_size"), 0) or 0
@@ -117,6 +153,10 @@ def extract_config(model):
     aset = set(attn_layers)
     kv_heads_per_layer = [(h if i in aset else 0)
                           for i, h in enumerate(kv_heads_per_layer)]  # 0 for SSM and MTP
+    # one shared latent per token, not one K/V pair per head
+    for i in mla_layers:
+        if i < len(kv_heads_per_layer):
+            kv_heads_per_layer[i] = 1
 
     n_vocab = 0
     for t in model["tensors"]:
@@ -206,7 +246,11 @@ def extract_config(model):
 
     # per-layer (head_dim_k, head_dim_v, is_swa) - precomputed so the KV math and
     # the layer-split search stay O(1) per layer instead of re-deriving this.
-    kv_layer_dims = [([head_dim_k_swa, head_dim_v_swa, 1] if i in swa_layers
+    # MLA takes precedence over the SWA dims: no MLA architecture ships a sliding
+    # window today, but if one does, the latent width is what gets cached either way.
+    kv_layer_dims = [([head_dim_k_mla, head_dim_v_mla, 1 if i in swa_layers else 0]
+                      if i in mla_layers else
+                      [head_dim_k_swa, head_dim_v_swa, 1] if i in swa_layers
                       else [head_dim_k, head_dim_v, 0]) for i in range(n_layers or 0)]
 
     return {
@@ -223,6 +267,9 @@ def extract_config(model):
         "recurrent_bytes_per_layer": recurrent_bytes,
         "full_attention_interval": _as_int(g(".full_attention_interval"), 0) or 0,
         "n_swa": n_swa, "swa_layers": sorted(swa_layers), "swa_source": swa_source,
+        "is_mla": is_mla, "mla_layers": sorted(mla_layers),
+        "kv_lora_rank": kv_lora_rank,
+        "head_dim_k_mla": head_dim_k_mla, "head_dim_v_mla": head_dim_v_mla,
         "n_mtp_layers": n_mtp, "mtp_layers": mtp_layers,
         "mtp_kv_per_token": mtp_kv_per_token,
         "kv_layer_dims": kv_layer_dims,

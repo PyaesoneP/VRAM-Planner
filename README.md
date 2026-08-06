@@ -1,15 +1,18 @@
 # VRAM Planner
 
-One self-contained Python file. It parses any GGUF **directly** (reads the real
-byte size of every tensor — the same info as `npx @huggingface/gguf --show-tensor`,
-but with no npx/Node dependency), reads your live free VRAM + RAM, and tells you
-exactly how a model fits at any context length and KV-cache quant:
+A self-contained Python package (standard library only). It parses any GGUF
+**directly** (reads the real byte size of every tensor — the same info as
+`npx @huggingface/gguf --show-tensor`, but with no npx/Node dependency), reads
+your live free VRAM + RAM, and tells you exactly how a model fits at any context
+length and KV-cache quant:
 
 - **Dense models** → how many layers go on the GPU (`-ngl` / LM Studio "GPU Layers").
 - **MoE models** → how many layers' experts to keep on CPU (`--n-cpu-moe` / `-ot`),
   keeping attention + router + shared experts on the GPU.
 - Max context that still fits fully on the GPU, a KV-cache-vs-context table, and a
   full memory breakdown.
+- The one estimated term (the compute buffer) can be re-fitted to **your** machine
+  with a `--sweep`/`--fit` harness — see **Measuring it yourself**.
 
 It serves its own web UI, so you never type these commands by hand.
 
@@ -66,8 +69,11 @@ set context + KV quant, and press **Analyze fit**.
 Other flags:
 ```
 python -m vram_planner --port 8100 --no-browser
-python -m vram_planner --self-test      # validates the parser + math
+python -m vram_planner --self-test        # validates the parser + math
+python -m vram_planner --self-test --require-refs
+                                          # ...and fail if a real-load check is skipped
 python -m vram_planner --version
+python -m vram_planner --sweep --dry-run  # what --sweep would run (see Measuring it yourself)
 ```
 
 Calibration and benchmark history live in `%LOCALAPPDATA%\vram-planner\`
@@ -122,8 +128,13 @@ The planner detects this from whatever signal the file carries, most explicit fi
 2. `*.attention.layer_types` string list,
 3. a stride integer, or `*.full_attention_interval`,
 4. `SWA_STRIDE_BY_ARCH` for architectures where llama.cpp hardcodes the stride
-   (gemma2/3/3n, cohere2, gpt-oss, llama4, exaone4),
-5. a window with no pattern at all = every layer is windowed (Mistral, Phi-3).
+   (gemma2/3/3n, cohere2, gpt-oss, llama4, exaone4, hunyuan-moe),
+5. an explicit stride of 1 still means "every layer is windowed", and
+6. a window declared on an **unknown** architecture with no pattern anywhere is
+   **not** assumed to be fully windowed any more — that guess can understate KV by
+   10-20x at long context, and this tool's job is to say whether something fits.
+   It charges every layer full and reports the window as ignored, so a plan errs
+   conservative when the pattern is genuinely unknown.
 
 A file with no window size falls through unchanged. Head dims come from
 `key_length_swa` / `value_length_swa` where present.
@@ -337,7 +348,7 @@ measurement would be worse than shipping the defaults:
 | measurements | what gets fitted |
 |---|---|
 | 0 | shipped defaults |
-| 1 | the constant — the dominant per-machine term |
+| 1 | the floor — MiB of CUDA kernel modules per resident block |
 | 3+ spread over **context** | + the ctx slope |
 | + varied **ubatch** | + the activation slope |
 | + one flash-attention-**off** run | + the score term |

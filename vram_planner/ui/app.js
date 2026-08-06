@@ -16,7 +16,7 @@
 const $ = id => document.getElementById(id);
 let SYS = null, MODELS = [], LAST = null, CTX_MAX = null;
 
-const CALIB_TERMS = ["const", "ctx", "act", "nofa"];
+const CALIB_TERMS = ["floor", "ctx", "act", "nofa"];
 
 /* ---------------------------------------------------------------- escaping */
 const RAW = Symbol("raw");
@@ -316,16 +316,17 @@ function renderVerdict(r){
     ? h`The compute buffer is <b style="color:var(--kv)">calibrated for your GPU</b> from ${
         r.calibration.n} measurement${r.calibration.n == 1 ? "" : "s"} (${
         r.calibration.free.join(", ")} fitted, in-sample ${r.calibration.residual_pct}%). `
-    : "The compute buffer uses shipped defaults, fitted to measured llama.cpp runs across 4 " +
-      "architectures (4.8% mean, 12% worst on one CUDA card). It is the only term that depends " +
-      "on your hardware rather than the model &mdash; press <b>Measure running model</b> with a " +
-      "model loaded to calibrate it for yours. ";
+    : "The compute buffer uses shipped defaults, fitted to 146 measured llama.cpp loads over 5 " +
+      "models. Held out by architecture it scores 22.5% mean / 85.6% worst on the buffer alone, " +
+      "and the whole plan lands at 7.6% mean / 39.6% worst against the process counter. It is " +
+      "the only term that depends on your hardware rather than the model &mdash; press " +
+      "<b>Measure running model</b> with a model loaded to calibrate it for yours. ";
 
   const split = p.cpu_compute_mib > 0.5
     ? h`Split across backends here: ${fmt(p.compute_mib)} on the GPU, ${fmt(p.cpu_compute_mib)
-        } in RAM. llama.cpp gives every backend running part of the graph its own scratch pool, and the ${
-        fmt(s.compute_logits)} logits tensor (${inp.n_ubatch} × ${num(c.n_vocab || 0)
-        } vocab) belongs to whichever side holds the output head.`
+        } in RAM. llama.cpp gives every backend running part of the graph its own scratch pool. The ${
+        fmt(s.compute_output)} output tensor (4 bytes × ${num(c.n_vocab || 0)
+        } vocab) is host memory wherever the layers run.`
     : h`All of it (${fmt(p.compute_mib)}) is on the GPU at this split.`;
 
   return h`<section class="card lead">
@@ -483,9 +484,11 @@ function renderBreakdown(r){
         ? brow("Recurrent state (fixed, x" + inp.n_seq + " seq)", fmt(s.recurrent_total)) : "")}
       ${raw(brow("Compute buffer (est.)", fmt(s.compute)))}
       ${raw(brow("&nbsp;&nbsp;graph scratch + attn mask", fmt(s.compute_graph)))}
-      ${raw(brow("&nbsp;&nbsp;logits (" + inp.n_ubatch + " x " + num(c.n_vocab || 0) + " vocab)",
-        fmt(s.compute_logits) + '  <span class="muted">' +
-        ((p.cpu_compute_mib > 0.5) ? "on CPU &mdash; the output head is not offloaded" : "on GPU") + "</span>"))}
+      ${raw(brow("&nbsp;&nbsp;CUDA context + kernel modules", fmt(s.compute_floor)))}
+      ${raw(brow("&nbsp;&nbsp;output tensor (4B x " + num(c.n_vocab || 0) + " vocab x " +
+        inp.n_seq + " slot" + (inp.n_seq == 1 ? "" : "s") + ")",
+        fmt(s.compute_output) +
+        '  <span class="muted">host memory, not VRAM</span>'))}
       ${raw(r.mmproj ? brow("Vision projector (" + esc(r.mmproj.name) + ")",
         fmt(r.mmproj.mib) + (r.mmproj.included ? "" : '  <span class="muted">not loaded</span>')) : "")}
       ${raw(brow("File on disk", fmtG(s.file_on_disk) + "  (" + fmtGB(s.file_on_disk) + ")"))}

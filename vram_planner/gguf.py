@@ -128,7 +128,7 @@ def _parse_one(path):
             n_dims = _r(f, 'I')
             dims = [_r(f, 'Q') for _ in range(n_dims)]
             type_id = _r(f, 'I')
-            _offset = _r(f, 'Q')
+            offset = _r(f, 'Q')
             n_elem = 1
             for d in dims:
                 n_elem *= d
@@ -144,8 +144,48 @@ def _parse_one(path):
             tensors.append({
                 "name": name, "dims": dims, "type_id": type_id, "type_name": tname,
                 "n_elements": n_elem, "n_bytes": nbytes, "unknown_type": unknown,
+                "offset": offset,
             })
+        # The data section starts at the first alignment boundary after the tensor
+        # table. Needed to size the last tensor from the file length.
+        align = _as_int_meta(meta.get("general.alignment"), 32) or 32
+        pos = f.tell()
+        data_start = -(-pos // align) * align
+    _size_unknown_from_offsets(tensors, data_start, os.path.getsize(path))
     return version, meta, tensors
+
+
+def _as_int_meta(v, default):
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return default
+
+
+def _size_unknown_from_offsets(tensors, data_start, file_size):
+    """Size tensors of an unrecognised quant from the gaps between tensor offsets.
+
+    A new GGML type used to count as zero bytes, which silently understated the
+    weights - the one number this tool advertises as exact. But the type table is
+    not the only source: tensors are laid out back to back in the data section, so
+    the space a tensor occupies is simply the distance to the next one, and the
+    last one runs to the end of the file. That is exact and needs no type table at
+    all, which is the point - it holds for quants that do not exist yet.
+
+    Only unknown types are filled in this way. Known ones keep their computed size,
+    because the gap includes any inter-tensor padding and would overstate them."""
+    if not tensors or not any(t["unknown_type"] for t in tensors):
+        return
+    order = sorted(tensors, key=lambda t: t["offset"])
+    data_bytes = max(0, file_size - data_start)
+    for i, t in enumerate(order):
+        if not t["unknown_type"]:
+            continue
+        end = order[i + 1]["offset"] if i + 1 < len(order) else data_bytes
+        gap = end - t["offset"]
+        if gap > 0:
+            t["n_bytes"] = gap
+            t["sized_from_offsets"] = True
 
 
 def load_gguf(path):

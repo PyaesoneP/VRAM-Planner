@@ -235,13 +235,21 @@ def extract_config(model):
             if p <= 0 and full_interval > 1 and not ssm_layers:
                 # on hybrid SSM models this key means something else entirely
                 p, src = full_interval, "full_attention_interval"
-            if p <= 0:
-                p, src = SWA_STRIDE_BY_ARCH.get(arch, 1), "arch default (%s)" % arch
+            if p <= 0 and arch in SWA_STRIDE_BY_ARCH:
+                p, src = SWA_STRIDE_BY_ARCH[arch], "arch default (%s)" % arch
             if p > 1:
                 swa_layers, swa_source = {i for i in rng if (i + 1) % p != 0}, src
-            else:
-                # a window with no pattern at all = every layer is windowed
+            elif p == 1:
+                # an explicit stride of 1 really does mean every layer is windowed
                 swa_layers, swa_source = set(rng), "sliding_window (uniform)"
+            else:
+                # Unknown architecture, a window declared but no pattern anywhere.
+                # Assuming "every layer windowed" is the cheap answer and the wrong
+                # direction to be wrong in: it can understate KV by 10-20x at long
+                # context, and this tool's job is to say whether something fits.
+                # Charge the full cache and say the window was ignored.
+                swa_layers, swa_source = set(), \
+                    "ignored - %s declares a window but no pattern this tool knows" % arch
     swa_layers &= set(attn_layers)
 
     # per-layer (head_dim_k, head_dim_v, is_swa) - precomputed so the KV math and

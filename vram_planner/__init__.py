@@ -30,13 +30,23 @@ a DAG and the numbers have one home each:
     speed     bandwidth roofline
     calib     fitting compute/ to this machine's measurements
     plan      analyze() and the layer-split planners
+    sweep     driving llama-server across a config grid, recording what it allocates
+    fit       scoring compute/ against sweep data, held out
     web       UI and JSON endpoints
     selftest  synthetic GGUFs and the test suite
     cli       entry point
 
-Two edges run backwards and are imported inside the function that needs them:
-compute.compute_buffer_terms reads calib.calib_coeffs, and calib.record_calibration
-calls plan.analyze. Both are noted at the call site.
+sweep and fit are the evidence base. sweep launches llama-server itself and reads
+`CUDA0 compute buffer size` out of its -v log, plus the per-process VRAM counter and
+llama.cpp's own layer placement; fit scores the model against those rows with the
+architecture being predicted held out of the fit. Neither is on the path of a normal
+plan - nothing in the DAG above imports them - and the tool works without ever
+running either.
+
+Three edges run backwards and are imported inside the function that needs them:
+compute.compute_buffer_terms reads calib.calib_coeffs, calib.record_calibration calls
+plan.analyze, and calib.migrate_calibration calls it too when re-deriving stored rows
+after a schema change. All three are noted at the call site.
 
 `import vram_planner as v` re-exports the whole public surface, so v.analyze(),
 v.load_gguf(), v.get_gpus() and friends keep working exactly as before.

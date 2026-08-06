@@ -90,14 +90,20 @@ every number has one home:
 | `speed` | bandwidth roofline |
 | `calib` | fitting `compute` to this machine's measurements |
 | `plan` | `analyze()` and the layer-split planners |
+| `sweep` | driving `llama-server` across a config grid, recording what it allocates |
+| `fit` | scoring `compute` against sweep data, held out |
 | `web` | JSON endpoints and static file serving |
 | `ui/` | `index.html`, `app.css`, `app.js` — the front end, as real files |
 | `selftest` | synthetic GGUFs and the test suite |
 | `cli` | entry point |
 
-Two edges run backwards and are imported inside the function that needs them:
-`compute.compute_buffer_terms` reads `calib.calib_coeffs`, and
-`calib.record_calibration` calls `plan.analyze`. Both are marked at the call site.
+`sweep` and `fit` are the evidence base, not part of a plan — nothing above imports
+them and the tool works without ever running either. See **Measuring it yourself**.
+
+Three edges run backwards and are imported inside the function that needs them:
+`compute.compute_buffer_terms` reads `calib.calib_coeffs`, `calib.record_calibration`
+calls `plan.analyze`, and `calib.migrate_calibration` calls it too when re-deriving
+stored rows after a schema change. All three are marked at the call site.
 
 `import vram_planner as v` still re-exports the whole public surface, so
 `v.analyze()`, `v.load_gguf()` and friends work unchanged.
@@ -242,51 +248,72 @@ too much to be worth pretending about.
 
 **Exact**, straight from the GGUF tensor table and your context / KV quant — no
 estimating: **weights**, **KV cache**, the **recurrent state** and the **projector**.
-Validated against real llama.cpp across four architectures; per-layer offload deltas
-match to ~0.1 MiB.
+Per-layer offload deltas match llama.cpp to ~0.1 MiB.
 
-**Estimated**: the compute buffer, and only that. The obvious formula for it is wrong,
-and so was this tool's first attempt at it. The numbers now come from llama.cpp's own
+**Estimated**: the compute buffer, and only that. The numbers come from llama.cpp's own
 allocator — running with `-v` prints `CUDA0 compute buffer size = N MiB`, which is
-exact, where the earlier fit inferred this term by subtracting everything else from
-total process VRAM. Measured that way over 36 loads across four architectures, the
-GPU-side overhead:
+exact. `python -m vram_planner --sweep` drives `llama-server` across a config grid and
+records that line, the per-process VRAM counter, and llama.cpp's own layer placement,
+one JSON row per load. The current model is fitted to **146 usable loads over 5 models
+and 3 architectures**. Measured that way, the GPU-side overhead:
 
-- **is allocated even at `-ngl 0`**, where not one layer is offloaded — 999 MiB at
-  ctx 131072. The tool used to charge the GPU nothing here, which is exactly what let
-  partial-offload plans overcommit and spill into shared memory;
-- does **not** depend on how many layers are offloaded — but **does** depend on whether
-  the graph is *split*. Identical at `-ngl` 0, 8 and 23 (999.38 MiB), and *smaller* at
-  full offload (719.66). A split graph costs more, not less;
-- grows linearly in `n_ctx`, **flat — not as a share of the KV cache**. Qwen3.6-27B has
-  exactly 2x Qwen3.5-9B's KV bytes per token and the identical 7296 B/token here; Gemma
-  4 26B's cache does not grow with context at all (sliding window) yet its buffer still
-  grows at 7379 B/token. Sliding-window layers get no discount in this term;
+- **is allocated even at `-ngl 0`**, where not one layer is offloaded. The tool used to
+  charge the GPU nothing here, which is exactly what let partial-offload plans
+  overcommit and spill into shared memory;
+- depends on whether the graph is *split* far more than on how many layers landed on
+  the GPU — identical at `-ngl` 0, 1, 2, 4, 7, 8 and 15 on Gemma 4 26B (501.13 MiB every
+  time), and smaller once nothing is left on the CPU. A split graph costs more, not less;
+- grows linearly in `n_ctx`, **flat — not as a share of the KV cache**;
 - grows separately in `n_ctx x n_ubatch` — the f16 attention mask, which fitted freely
   to **1.990 B** and is the one term whose textbook value the data actually confirms;
-- costs **more** with a quantised KV cache than with f16 (5120 vs 1024 B/token), the
-  opposite of what the cache sizes do;
-- does **not** depend on `n_batch`, or on `--parallel` (719.66 MiB at `-np` 1 and 4);
-- and sits on a fixed floor that scales with **hidden size** (~147 MiB at hidden 2048,
-  ~759 MiB at hidden 5120) — but only once at least one layer is actually on the GPU.
-  At `-ngl 0` the process holds a bare CUDA context of ~156 MiB and nothing more,
-  because CUDA loads kernel modules lazily.
+- carries a large **context-independent** term on MoE models: the routed-expert
+  activation scratch, `n_expert_used` copies of the expert FFN activation per ubatch
+  token. Adding it is the single change that most improved held-out accuracy;
+- costs **more** with a quantised KV cache than with f16, the opposite of what the
+  cache sizes do;
+- tracks the **full** context, not the per-slot context — worth stating because the
+  host-side buffer does the opposite. `CUDA_Host.compute` halves exactly as `--parallel`
+  doubles, so llama.cpp sizes *that* one from `n_ctx / n_parallel`. Modelling the device
+  side the same way made held-out error worse, so the two really do differ;
+- and sits on a floor of **~156 MiB plus a few MiB per resident block** — the bare CUDA
+  context, then lazily-loaded kernel modules as layers arrive. The 156 is the most
+  reproducible number here: 155.9 to 156.6 MiB at `-ngl 0` across all five models.
 
-That floor is invisible to the allocator log, so it is fitted from total-VRAM
-measurements instead, with the scaling terms held at their allocator-derived values.
-The log fixes the slopes exactly; the perf counters fix the floor.
+That floor is invisible to the allocator log, so it comes from the process counter
+instead. The log fixes the slopes exactly; the perf counters fix the floor.
 
 Plus the f32 score matrix when flash attention is **off** — that term alone is ~3.5 GiB
 at 64k context on a 32-head model, which is why FA is not optional at long context.
 
-Accuracy: **2.7% mean, 8.1% worst over 37 measured loads** across four architectures,
-spanning `-ngl` 0 to full offload, context 2048 to 262144, ubatch 64 to 2048, both cache
-types, with and without the projector and MTP draft cache — on one CUDA card. Measured
-in isolation the buffer itself is only good to ~21%; it looks better than that in a
-plan because it sits alongside weights and KV, which are exact. Residuals run positive
-at short context and negative at long, so the truth is probably a `max()` over several
-buffers rather than a sum, and no additive form will close it. Press **Measure** to pin
-it for your machine (see below).
+### Accuracy
+
+Every number below is **held out by architecture** — fitted on two architectures and
+scored on the third, never on itself. Reproduce with `python -m vram_planner --fit`.
+
+| what | mean | worst |
+| --- | --- | --- |
+| **total GPU VRAM** (what the planner reports) | **7.6%** | 39.6% |
+| the compute buffer alone | 22.5% | 85.6% |
+| the floor, in MiB | 17.2 MiB | 226.7 MiB |
+
+The total is uniformly good across all five models — 4.1%, 5.4%, 6.9%, 9.2%, 12.3% —
+rather than a mean dragged around by one of them. The worst cases are all tiny-context,
+near-zero-offload corners where the whole total is about 1 GiB, so a 200 MiB miss reads
+as 20%. The buffer alone scores worse than the total because it *is* a slice of it; the
+rest is weights and KV, which are exact.
+
+Earlier versions of this file quoted 2.7% mean / 8.1% worst. That was an **in-sample**
+number: the coefficients were fitted on the same loads the self-test then scored them
+against, and it also concealed a pair of compensating errors — a floor formula that
+charged up to 974 MiB where the floor has never been observed above 463.6, cancelling
+against embeddings that were charged to RAM when llama.cpp had put them in VRAM.
+
+A `max()` over candidate peaks was tried, since ggml-alloc reports a peak over the graph
+rather than a sum. It fits better in sample and generalises **worse** — 11.7% in sample
+against 28.2% held out, where the additive form gets 21.7% and 21.8%. It is not in the
+tool because the data does not support it yet, not because it was not tried.
+
+Press **Measure** to pin the machine-dependent coefficients for your card (see below).
 
 - **Parallel seqs** should match LM Studio's "Parallel" / llama.cpp `-np`. It sizes the
   recurrent state on hybrid models and the sliding-window cache on SWA models.
@@ -294,8 +321,9 @@ it for your machine (see below).
 
 ## Calibration
 
-The four compute-buffer coefficients are the only numbers here that depend on your
-hardware rather than the model. Rather than ask you to understand them, the tool fits
+Four compute-buffer coefficients are the only numbers here that depend on your
+hardware rather than the model — `floor` (MiB of CUDA kernel modules per resident
+block), `ctx`, `act` and `nofa`. Rather than ask you to understand them, the tool fits
 them from your own runs.
 
 Load a model in LM Studio, press **Measure running model**. The tool reads the engine
@@ -319,11 +347,46 @@ than 10x from the prior, or negative, is rejected in favour of the default. Rows
 keyed by GPU **and** llama.cpp build, so upgrading the backend does not silently reuse a
 fit that no longer applies.
 
+## Measuring it yourself
+
+The accuracy numbers above are reproducible on your own hardware, and the model can be
+re-fitted to it.
+
+```
+python -m vram_planner --sweep --dry-run     # what it will run, and for how long
+python -m vram_planner --sweep               # hours; resumable, safe to interrupt
+python -m vram_planner --fit                 # the held-out scorecard
+```
+
+`--sweep` finds a `llama-server` under LM Studio's `extensions/backends`, launches it
+once per config with `-v`, and records the allocator's own buffer sizes, the
+per-process VRAM counter, llama.cpp's layer placement and its SWA pattern — one JSON
+row per load under `sweeps/`. A config that fails to allocate is recorded as `oom`
+rather than dropped; a load taken with the card at the wall, where Windows spills to
+shared memory and the counter reports the cap instead of the need, is detected and
+excluded from fitting. `--probe MODEL ctx=A,B,C` runs an explicit ladder when something
+in the grid does not interpolate.
+
 ## Known issues
 
+- **Whether the token embeddings land in VRAM is measured, not understood.** On the
+  three dense models swept they do, as soon as `-ngl` is 1, worth 626–843 MiB; on the
+  two MoE models they do not. Charging them on dense models only takes the end-to-end
+  error from 22.7% to 7.1%, and does it uniformly across all five, so it is clearly the
+  right rule for these models — but the *mechanism* is unknown, and five models over
+  three architectures is enough to measure the split and not to explain it. This is the
+  first thing to re-check against a new architecture. It errs on the safe side for the
+  case it is least sure of: over-charging VRAM makes a plan conservative, under-charging
+  it makes the load spill.
+- **The floor is the weakest term.** ~17 MiB mean absolute error, and the per-block rate
+  genuinely differs by architecture (~10 MiB/layer on Gemma 4, ~2.5 on Qwen3.6-35B-A3B).
+  It is also the term **Measure** is best placed to pin, being a property of the machine.
 - **Non-CUDA backends are unvalidated.** See Supported platforms above.
 - **Multi-GPU is not modelled.** `--tensor-split` is ignored; the plan targets GPU 0
   and the tool warns when it sees more than one card.
+- **MLA is implemented but unmeasured.** DeepSeek-V2/V3 and Kimi cache a compressed
+  latent, not per-head K and V; the width is read from the `attn_kv_a_mqa` tensor. No
+  MLA model has been swept, so this is derived rather than validated.
 - **Two measured anomalies I could not explain from outside the process.** On
   Qwen3.6-35B-A3B the recurrent state does not scale with `-np`, while Qwen3.6-27B's
   scales exactly as modelled (+88.0 MiB measured vs +87.3 predicted). And on

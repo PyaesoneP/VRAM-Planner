@@ -1,10 +1,10 @@
 """Turning a model file plus a budget into a layer split."""
 import os
 from .const import _mib
-from .gguf import load_gguf
+from .gguf import load_gguf, parse_meta_only
 from .model import classify_tensors, extract_config
 from .kv import kv_bytes_per_token, kv_bytes_per_token_growing, kv_bytes_total, kv_bytes_total_at, max_ctx_for_kv_budget, recurrent_bytes, resolve_kv_lengths, swa_cache_len
-from .compute import MTP_SPEC_CONST_MIB, MTP_SPEC_PER_SEQ_MIB, compute_buffer_split, compute_buffer_terms, graph_is_split, output_head_on_gpu
+from .compute import MTP_SPEC_CONST_MIB, MTP_SPEC_PER_SEQ_MIB, compute_buffer_split, compute_buffer_terms, graph_is_split, output_head_on_gpu, vision_config, vision_grid, vision_peak_mib
 from .gpu import gpu_list, platform_support
 from .speed import estimate_speed
 from .calib import calibration_status
@@ -14,7 +14,12 @@ def find_mmproj(model_path):
     """A multimodal model ships a separate vision/audio projector next to the
     weights (mmproj-*.gguf). LM Studio loads it with the model and puts it on the
     GPU, and it counts it in the "model size" it shows you - so it must be part of
-    the VRAM budget. Returns {path, bytes, tensor_bytes} or None."""
+    the VRAM budget. Returns {path, bytes, tensor_bytes, vision} or None.
+
+    `vision` carries the tower's geometry (patch size, merge, block count, head
+    count) so the caller can size the ENCODER TRANSIENTS as well as the weights.
+    Charging only the weights is what let a plan read "fits" and then OOM on the
+    first image - see vision_peak_mib()."""
     try:
         d = os.path.dirname(os.path.abspath(model_path))
         base = os.path.basename(model_path).lower()
@@ -28,7 +33,12 @@ def find_mmproj(model_path):
                     tb = sum(t["n_bytes"] for t in load_gguf(p)["tensors"])
                 except Exception:
                     tb = nb
-                return {"path": p, "name": fn, "bytes": nb, "tensor_bytes": tb}
+                try:
+                    vis = vision_config(parse_meta_only(p))
+                except Exception:
+                    vis = None
+                return {"path": p, "name": fn, "bytes": nb, "tensor_bytes": tb,
+                        "vision": vis}
     except Exception:
         pass
     return None
@@ -40,7 +50,7 @@ def analyze(path, ctx, kv_type, n_ubatch, flash_attn,
             gpu_layers_override=None, ram_free_mib=None, n_seq=1,
             include_mmproj=True, n_cpu_moe_override=None,
             bw_vram_gbs=None, bw_ram_gbs=None, ram_eff=None, ctx_fill=None,
-            bw_note="", mtp_spec=False):
+            bw_note="", mtp_spec=False, image_px=None, vision_flash_attn=True):
     model = load_gguf(path)
     cfg = extract_config(model)
     cl = classify_tensors(model, cfg)
@@ -128,9 +138,30 @@ def analyze(path, ctx, kv_type, n_ubatch, flash_attn,
     # off the top of the budget before any layer split is planned
     mmproj_mib = _mib(mmproj["tensor_bytes"]) if (mmproj and include_mmproj) else 0.0
 
+    # Vision encoder transients. The projector's weights (above) are resident; this
+    # is the pool the tower needs WHILE it encodes an image, and it is quadratic in
+    # patch count. It is only reserved when the caller names an image size, because
+    # a text-only plan should not carry headroom it will never use - but a plan made
+    # without it is a text-only plan, and says so in the warnings below.
+    # Whether the tower fuses attention is worth ~40x here and is a property of the
+    # BACKEND, not the model, so report both ends the way the speed roofline does
+    # rather than pretending to know. vis_peak is the one actually reserved.
+    vis_cfg = (mmproj or {}).get("vision") if include_mmproj else None
+    vis_grid = vis_peak = vis_ceiling = None
+    vis_mib = 0.0
+    if vis_cfg and image_px:
+        try:
+            vis_grid = vision_grid(vis_cfg, image_px[0], image_px[1])
+            vis_peak = vision_peak_mib(vis_cfg, vis_grid, vision_flash_attn)
+            vis_ceiling = vision_peak_mib(vis_cfg, vis_grid, False)
+            vis_mib = vis_peak["total_mib"]
+        except Exception:
+            vis_grid = vis_peak = vis_ceiling = None
+            vis_mib = 0.0
+
     # usable VRAM after reserving driver/OS headroom and a safety margin
     eff_vram = max(0.0, (vram_budget_mib - gpu_reserve_mib) * (1.0 - safety_pct / 100.0))
-    eff_vram = max(0.0, eff_vram - mmproj_mib - spec_mib)
+    eff_vram = max(0.0, eff_vram - mmproj_mib - spec_mib - vis_mib)
 
     result = {
         "ok": True, "warnings": warnings, "config": cfg,
@@ -161,6 +192,10 @@ def analyze(path, ctx, kv_type, n_ubatch, flash_attn,
         "mmproj": ({"name": mmproj["name"], "mib": _mib(mmproj["tensor_bytes"]),
                     "file_mib": _mib(mmproj["bytes"]), "included": bool(include_mmproj)}
                    if mmproj else None),
+        "vision": ({"config": vis_cfg, "grid": vis_grid, "peak": vis_peak,
+                    "ceiling": vis_ceiling, "reserved_mib": vis_mib,
+                    "flash_attn_assumed": bool(vision_flash_attn),
+                    "derived": True} if vis_cfg else None),
         "hybrid": {
             "is_hybrid": cfg["is_hybrid"],
             "n_attn_layers": len(cfg["attn_layers"]),
@@ -259,6 +294,22 @@ def analyze(path, ctx, kv_type, n_ubatch, flash_attn,
             break
         max_ctx_gpu = nxt
 
+    # An explicit layer count means "verify the config I actually ran", and a layer
+    # count is a layer-level idea: the KV-on-GPU planner offloads every block by
+    # definition and splits FFN TENSORS instead, so there is no -ngl for it to
+    # honour. It used to be selected first and silently drop the override, which
+    # made analyze() return the identical plan for -ngl 29 and -ngl 50 - the tool
+    # answering a question the caller had not asked, with no sign it had done so.
+    # _plan_dense and _plan_moe both already handle the override; only this path
+    # did not, so route to the layer-level planner and say why.
+    if gpu_layers_override is not None and kv_on_gpu and not cl["is_moe"] \
+            and not fully_fits and cl["ffn_dense_total"] > 0:
+        warnings.append("You pinned GPU Offload to %d layers, so this is a layer-level split "
+                        "and 'keep all KV on GPU' does not apply - that mode puts every block "
+                        "on the GPU and exiles FFN tensors instead, which no layer count can "
+                        "describe. Clear the layer override to see the KV-on-GPU plan."
+                        % gpu_layers_override)
+
     if cl["is_moe"]:
         plan = _plan_moe(cfg, cl, eff_vram, ram_budget_mib, kv_total_mib, kv_per_layer_mib,
                          compute_mib, weights_mib, expert_total_mib, expert_layer_mean_mib,
@@ -267,7 +318,8 @@ def analyze(path, ctx, kv_type, n_ubatch, flash_attn,
                          n_seq=n_seq, embed=embed_mib, output=output_mib,
                          ngl_override=gpu_layers_override, n_cpu_moe_override=n_cpu_moe_override,
                          compute_fn=compute_fn)
-    elif kv_on_gpu and not fully_fits and cl["ffn_dense_total"] > 0:
+    elif (kv_on_gpu and not fully_fits and cl["ffn_dense_total"] > 0
+          and gpu_layers_override is None):
         plan = _plan_dense_kv_on_gpu(cfg, cl, eff_vram, ram_budget_mib, kv_total_mib,
                                      compute_mib, weights_mib, ffn_dense_total_mib,
                                      ffn_layer_mean_mib, max_ctx_gpu, ctx, kv_type, flash_attn,
@@ -294,6 +346,9 @@ def analyze(path, ctx, kv_type, n_ubatch, flash_attn,
     if spec_mib > 0:
         plan["spec_mib"] = spec_mib
         held_out += spec_mib
+    if vis_mib > 0:
+        plan["vision_mib"] = vis_mib
+        held_out += vis_mib
     if held_out > 0:
         plan["vram_used_mib"] = plan.get("vram_used_mib", 0.0) + held_out
         if plan.get("vram_budget_mib") is not None:
@@ -327,6 +382,43 @@ def analyze(path, ctx, kv_type, n_ubatch, flash_attn,
         result["speed"] = sp
     except Exception as e:
         result["speed"] = {"error": "%s: %s" % (type(e).__name__, e)}
+
+    # ---- vision warnings ---------------------------------------------------
+    if vis_cfg and vis_peak:
+        warnings.append("Vision encoder transients are DERIVED, NOT MEASURED - no sweep backs "
+                        "them, unlike every other term here. Treat %.0f MiB as an order of "
+                        "magnitude." % vis_peak["total_mib"])
+        if vis_peak["scores_mib"] > 0.5 * vis_peak["total_mib"]:
+            warnings.append("At %dx%d that image is %s patches, and the %s attention scores "
+                            "over them are %.0f MiB of the %.0f MiB peak. This term is "
+                            "QUADRATIC in pixels: halving each dimension cuts it ~4x."
+                            % (vis_grid["width"], vis_grid["height"],
+                               f"{vis_grid['n_patches']:,}", vis_cfg["projector"],
+                               vis_peak["scores_mib"], vis_peak["total_mib"]))
+        # The fused/unfused gap is the dominant uncertainty, so name it explicitly
+        # rather than letting a single number imply more confidence than there is.
+        if vis_ceiling and vis_ceiling["total_mib"] > 1.5 * vis_peak["total_mib"]:
+            warnings.append("Reserved %.0f MiB assuming the vision tower FUSES attention. If it "
+                            "does not, the peak is %.0f MiB instead - a %.0fx swing, and the "
+                            "whole uncertainty in this estimate. Head dim is %d; CUDA supports "
+                            "it (fattn.cu) but not on the tensor-core path. Check your load log "
+                            "for 'flash attention is enabled' to settle it for your machine."
+                            % (vis_peak["total_mib"], vis_ceiling["total_mib"],
+                               vis_ceiling["total_mib"] / max(1.0, vis_peak["total_mib"]),
+                               vis_cfg.get("head_dim") or 0))
+        if vis_grid["image_tokens"] > max(1, ctx) * 0.25:
+            warnings.append("Each %dx%d image also adds %s tokens to the context - %.0f%% of "
+                            "the %s you configured. The KV and compute cost of those tokens "
+                            "is on top of the encoder peak."
+                            % (vis_grid["width"], vis_grid["height"],
+                               f"{vis_grid['image_tokens']:,}",
+                               100.0 * vis_grid["image_tokens"] / max(1, ctx), f"{ctx:,}"))
+    elif vis_cfg and not image_px:
+        warnings.append("%s carries a vision encoder, but no image size was given, so this is "
+                        "a TEXT-ONLY plan: the projector's %.0f MiB of weights are charged and "
+                        "its encoder transients are not. Pass an image size to reserve room for "
+                        "them - at screenshot resolutions they are the larger of the two."
+                        % (mmproj["name"], mmproj_mib))
 
     if mmproj and not include_mmproj:
         warnings.append("A vision projector (%s, %.0f MiB) sits next to this model. LM Studio "

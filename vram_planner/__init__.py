@@ -66,7 +66,9 @@ from .compute import (CB_DEFAULTS, CB_FLOOR_PER_LAYER, CB_MOE_ACT_PER_WIDTH,
                       CB_MASK_PER_UB_TOK, CB_CTX_QUANT_BYTES, CB_SPLIT_GRAPH_MIB,
                       CB_SPLIT_PER_TOKEN, CB_NOFA_HEAD_BYTES, MTP_SPEC_CONST_MIB,
                       MTP_SPEC_PER_SEQ_MIB, compute_buffer_terms, compute_buffer_split,
-                      compute_buffer_mib, graph_is_split, output_head_on_gpu)
+                      compute_buffer_mib, graph_is_split, output_head_on_gpu,
+                      VIS_ACT_BYTES, VIS_ACT_LIVE, VIS_SCORE_BYTES,
+                      vision_config, vision_grid, vision_peak_mib)
 from .paths import _data_dir, _user_file
 from .gpu import (get_gpus, gpu_list, platform_support, get_bandwidth,
                   get_gpu_processes, get_ram)

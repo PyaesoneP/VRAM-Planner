@@ -3,9 +3,9 @@ import os, struct
 from .const import _mib
 from .gguf import GGML_TYPES, _parse_one, load_gguf
 from .model import RE_EXPS, extract_config
-from .compute import CB_CUDA_CTX_MIB, CB_DEFAULTS, CB_SPLIT_GRAPH_MIB, CB_SPLIT_PER_TOKEN, compute_buffer_split, compute_buffer_terms, graph_is_split, output_head_on_gpu
-from .lmstudio import REF_GPU, read_lmstudio_runtime, resolve_runtime_ngl
-from .calib import CALIB_TERMS, _CALIB_CACHE, _active_gpu, _design, _struct_offset, calib_coeffs, fit_calibration, mark_unreliable
+from .compute import CB_CUDA_CTX_MIB, CB_DEFAULTS, CB_SPLIT_GRAPH_MIB, CB_SPLIT_PER_TOKEN, compute_buffer_split, compute_buffer_terms, graph_is_split, output_head_on_gpu, vision_grid, vision_peak_mib
+from .lmstudio import REF_GPU, current_backend, read_lmstudio_runtime, resolve_runtime_ngl
+from .calib import CALIB_SCHEMA, CALIB_TERMS, _CALIB_CACHE, _active_gpu, _design, _struct_offset, calib_coeffs, fit_calibration, mark_unreliable
 from .plan import analyze
 
 
@@ -202,6 +202,61 @@ def self_test(require_refs=False):
     # must actually take that branch, or the assertion below proves nothing
     kv_ok = (rk["plan"]["kind"] == "dense_kv_gpu" and sk.get("cpu_mib", 0) > 0
              and rk["plan"].get("ffn_on_cpu"))
+    # 5b) An explicit layer count is a layer-level split, so it must reach a planner
+    #     that HAS a layer count. KV-on-GPU offloads every block by definition and
+    #     splits FFN tensors instead; it used to win the branch and drop the override
+    #     silently, so analyze() returned byte-identical plans for different -ngl.
+    ro_a = analyze(p2, 4096, "f16", 512, False, vram_budget_mib=30, ram_budget_mib=8000,
+                   gpu_reserve_mib=0, compute_override_mib=5, safety_pct=0, kv_on_gpu=True,
+                   gpu_layers_override=1)
+    ro_b = analyze(p2, 4096, "f16", 512, False, vram_budget_mib=30, ram_budget_mib=8000,
+                   gpu_reserve_mib=0, compute_override_mib=5, safety_pct=0, kv_on_gpu=True,
+                   gpu_layers_override=3)
+    ovr_ok = (ro_a["plan"]["kind"] == "dense"                     # routed away from kv_gpu
+              and ro_a["plan"]["n_gpu_layers"] == 1               # ...and honoured
+              and ro_b["plan"]["n_gpu_layers"] == 3
+              and ro_a["plan"]["vram_used_mib"] != ro_b["plan"]["vram_used_mib"]
+              # the recommendation path (no override) must STILL reach kv-on-gpu
+              and rk["plan"]["kind"] == "dense_kv_gpu")
+    print("  NGL-OVR kv_on_gpu + override: kind=%s ngl 1->%.0f MiB, 3->%.0f MiB (differ=%s), "
+          "no-override still %s  %s"
+          % (ro_a["plan"]["kind"], ro_a["plan"]["vram_used_mib"], ro_b["plan"]["vram_used_mib"],
+             ro_a["plan"]["vram_used_mib"] != ro_b["plan"]["vram_used_mib"],
+             rk["plan"]["kind"], "OK" if ovr_ok else "FAIL"))
+    ok = ok and ovr_ok
+
+    # 5c) Vision transients. Derived, not measured - so what is asserted here is the
+    #     SHAPE, not the magnitude: scores are quadratic in patch count while the
+    #     activation terms are linear, image tokens follow the spatial merge, and
+    #     flash attention removes the quadratic term entirely. Those are the claims
+    #     the code makes; the coefficients are not claims at all.
+    vcfg = {"projector": "test", "patch": 16, "merge": 2, "hidden": 1152,
+            "ffn_len": 4304, "blocks": 27, "heads": 16, "image_size": 768,
+            "projection_dim": 5120}
+    g1 = vision_grid(vcfg, 1024, 1024)
+    g2 = vision_grid(vcfg, 2048, 2048)          # 2x each side -> 4x patches
+    # flash_attn=False explicitly: the quadratic term only EXISTS unfused, and that
+    # is the scaling being asserted. The default is True (see vision_peak_mib), so
+    # relying on it here would silently test 0 == 0.
+    p1 = vision_peak_mib(vcfg, g1, flash_attn=False)
+    pk2 = vision_peak_mib(vcfg, g2, flash_attn=False)
+    pfa = vision_peak_mib(vcfg, g2, flash_attn=True)
+    vis_ok = (g1["n_patches"] == 64 * 64 and g2["n_patches"] == 4 * g1["n_patches"]
+              and g1["image_tokens"] == g1["n_patches"] // 4          # merge 2x2
+              # scores go as patches^2 -> 16x for 4x the patches
+              and abs(pk2["scores_mib"] / p1["scores_mib"] - 16.0) < 0.01
+              # activations go as patches -> 4x
+              and abs(pk2["act_mib"] / p1["act_mib"] - 4.0) < 0.01
+              and pfa["scores_mib"] == 0.0 and pfa["total_mib"] < pk2["total_mib"]
+              # snapped down to a whole merge block (16*2 = 32)
+              and vision_grid(vcfg, 1000, 1000)["width"] == 992)
+    print("  VISION 1024px=%s patches -> %s tok; 2048px scores x%.1f, act x%.1f; "
+          "fa removes scores=%s  %s"
+          % (f"{g1['n_patches']:,}", f"{g1['image_tokens']:,}",
+             pk2["scores_mib"] / p1["scores_mib"], pk2["act_mib"] / p1["act_mib"],
+             pfa["scores_mib"] == 0.0, "OK" if vis_ok else "FAIL"))
+    ok = ok and vis_ok
+
     print("  KV-ON-GPU kind=%s ffn_on_cpu=%s cpu_bytes/token=%.1f MiB  %s"
           % (rk["plan"]["kind"], rk["plan"].get("ffn_on_cpu"), sk.get("cpu_mib", 0),
              "OK" if kv_ok else "FAIL"))

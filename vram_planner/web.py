@@ -196,6 +196,11 @@ class Handler(BaseHTTPRequestHandler):
                                      else None),
                 ram_free_mib=(float(data["ram_free_mib"])
                               if data.get("ram_free_mib") else None),
+                # Vision: two numbers, or nothing. Absent means a text-only plan,
+                # which analyze() warns about rather than guessing an image size.
+                image_px=((int(data["image_w"]), int(data["image_h"]))
+                          if data.get("image_w") and data.get("image_h") else None),
+                vision_flash_attn=bool(data.get("vision_flash_attn", True)),
             )
             return self._send(200, res)
         except Exception as e:

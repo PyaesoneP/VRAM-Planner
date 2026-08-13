@@ -405,11 +405,34 @@ in the grid does not interpolate.
   growth at all. Neither affects full-offload planning, which is what these models are
   normally run with, and both are bounded.
 
+- **Vision encoder transients are derived, not measured.** The projector's *weights*
+  are exact (mmproj tensor bytes, charged off the top of the budget). Its
+  *activations* — the pool the ViT needs while encoding an image — are computed from
+  the tower's geometry and nothing else: no sweep backs them, so they are an order of
+  magnitude rather than a prediction. They are also charged deliberately high (f32
+  scores, attention unfused), because under-charging is the failure mode that makes a
+  plan overcommit. Only reserved when you give an image size; without one the plan is
+  text-only and says so.
+
 ## Tips
 
 - Keep the model inside **dedicated** VRAM. On Windows, spilling past it uses "shared
   GPU memory" (system RAM as VRAM) and is very slow — turn on LM Studio's
   **"Limit to Dedicated GPU Memory"**.
+- **A vision model that fits can still OOM on an image**, and *whether the tower fuses
+  attention decides by how much*. Unfused, the encoder is quadratic in pixels — the
+  score matrix is `n_head × n_patches²`, and a 2560×1600 screenshot at 16px patches is
+  16,000 patches, several GiB. Fused, that term vanishes and the same image costs a few
+  hundred MiB. On Qwen3.6-27B the planner brackets it at **342 MiB fused vs 15,967
+  unfused — a 47× swing**, which is the entire uncertainty in the estimate.
+  `clip.cpp` resolves `CLIP_FLASH_ATTN_TYPE_AUTO` by probing the backend, not by model,
+  so read your load log's `flash attention is enabled/disabled` line rather than
+  guessing. On CUDA it is normally enabled: the SigLIP tower these models share is head
+  dim 72, which `fattn.cu` supports, though only off the tensor-core path.
+- **Image tokens are a context cost, not just a VRAM one.** After the spatial merge a
+  2560×1600 image is 4,000 tokens — an eighth of a 32k context per screenshot, with the
+  KV and prefill to match. Downscaling to ~1024px on the long edge cuts that to 640 and
+  is the cheapest fix available whether or not attention is fused.
 - **KV cache is what grows with context.** If a model won't fit, the KV-vs-context
   table shows exactly what dropping to 8k/16k buys you. Quantizing the KV cache
   (q8_0 = about half of f16) needs **Flash Attention ON**.

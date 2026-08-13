@@ -103,6 +103,31 @@
             you set Speculative Decoding to Off.</p>
         </div>
         <p class="hint" id="mmprojhint"></p>
+        <div id="visionrow" hidden>
+          <label class="check"><input type="checkbox" id="visionplan"> Plan for images (reserve encoder headroom)</label>
+          <div id="visioninputs" hidden>
+            <div class="field"><label for="imagew">Image size (px)</label>
+              <span class="mono"><input type="number" id="imagew" step="16" placeholder="1024" style="width:6em">
+                &times; <input type="number" id="imageh" step="16" placeholder="1024" style="width:6em"></span>
+            </div>
+            <label class="check"><input type="checkbox" id="visionfa" checked> Vision tower fuses attention (flash)</label>
+            <p class="hint">The projector's <em>weights</em> are charged above. This reserves what the
+              encoder needs <em>while it runs</em>. Unfused, that is
+              <strong>quadratic in pixels</strong> &mdash; attention is
+              <span class="mono">n_head &times; n_patches&sup2;</span>, so a 2560&times;1600 screenshot at
+              16px patches is 16,000 patches and several GiB, and halving each side cuts it ~4&times;.
+              <b>Fused, the quadratic term vanishes</b>, which is why the tick box matters more than the
+              image size does.</p>
+            <p class="hint">Leave it <b>ticked on CUDA</b>: <span class="mono">clip.cpp</span> resolves
+              <span class="mono">CLIP_FLASH_ATTN_TYPE_AUTO</span> by probing the backend, and the SigLIP
+              tower these models share (head dim 72) is a supported size &mdash; just not on the
+              tensor-core path. Untick it for a backend without a working FA path, to see the ceiling.
+              Either way this is a default, not a measurement: your load log's
+              <span class="mono">flash attention is enabled/disabled</span> line settles it.
+              Note LM Studio's own Flash Attention toggle applies to the language model, not the tower.
+              <strong>These numbers are derived, not measured</strong>, unlike everything else here.</p>
+          </div>
+        </div>
       </div>
 
       <div class="field">

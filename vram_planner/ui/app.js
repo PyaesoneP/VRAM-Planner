@@ -233,7 +233,12 @@ async function run(){
     safety_pct: parseFloat($("safety").value) || 0,
     kv_on_gpu: $("kvgpu").checked,
     gpu_layers_override: $("ngl").value.trim() === "" ? null : parseInt($("ngl").value),
-    ram_free_mib: (SYS && SYS.ram) ? SYS.ram.free_mib : null
+    ram_free_mib: (SYS && SYS.ram) ? SYS.ram.free_mib : null,
+    // Only sent when "Plan for images" is ticked. Absent means a text-only plan,
+    // which the server warns about rather than guessing a size on the user's behalf.
+    image_w: $("visionplan").checked ? (parseInt($("imagew").value) || 1024) : null,
+    image_h: $("visionplan").checked ? (parseInt($("imageh").value) || 1024) : null,
+    vision_flash_attn: $("visionfa").checked
   };
   const btn = $("goBtn");
   btn.disabled = true;
@@ -491,6 +496,22 @@ function renderBreakdown(r){
         '  <span class="muted">host memory, not VRAM</span>'))}
       ${raw(r.mmproj ? brow("Vision projector (" + esc(r.mmproj.name) + ")",
         fmt(r.mmproj.mib) + (r.mmproj.included ? "" : '  <span class="muted">not loaded</span>')) : "")}
+      ${raw(r.vision && r.vision.peak ? brow(
+        "Vision encoder peak (" + num(r.vision.grid.width) + "&times;" + num(r.vision.grid.height) +
+        ", " + num(r.vision.grid.n_patches) + " patches)",
+        fmt(r.vision.peak.total_mib) +
+        '  <span class="muted">transient, derived not measured</span>') : "")}
+      ${raw(r.vision && r.vision.peak ? brow(
+        "&nbsp;&nbsp;attention scores (quadratic in patches)",
+        fmt(r.vision.peak.scores_mib) + (r.vision.peak.flash_attn
+          ? '  <span class="muted">fused away</span>'
+          : '  <span class="muted">' +
+            Math.round(100 * r.vision.peak.scores_mib / Math.max(1, r.vision.peak.total_mib)) +
+            '% of the peak</span>')) : "")}
+      ${raw(r.vision && r.vision.peak ? brow("&nbsp;&nbsp;activations + FFN",
+        fmt(r.vision.peak.act_mib + r.vision.peak.ffn_mib)) : "")}
+      ${raw(r.vision && r.vision.peak ? brow("&nbsp;&nbsp;image tokens added to context",
+        num(r.vision.peak.image_tokens) + " tok") : "")}
       ${raw(brow("File on disk", fmtG(s.file_on_disk) + "  (" + fmtGB(s.file_on_disk) + ")"))}
       ${raw(r.mmproj ? brow("&nbsp;&nbsp;+ projector = LM Studio's &quot;model size&quot;",
         fmtG(s.bundle_on_disk) + "  (" + fmtGB(s.bundle_on_disk) + ")") : "")}
@@ -509,6 +530,10 @@ function render(r){
     $("mmprojhint").innerHTML = h`${r.mmproj.name} &middot; ${fmt(r.mmproj.mib)
       } of VRAM. LM Studio loads it with the model and includes it in the size it shows.`;
   }
+  // The image controls only mean anything for a projector with a VISION tower -
+  // an audio-only mmproj has no patch grid to size.
+  $("visionrow").hidden = !(r.vision && r.vision.config);
+  $("visioninputs").hidden = !$("visionplan").checked;
   $("out").innerHTML = renderVerdict(r) + renderWarnings(r) + renderSettings(r) +
                        renderSpeed(r) + renderSummary(r) + renderKvTable(r) + renderBreakdown(r);
   if(r.speed && !r.speed.error) loadSpeedHistory(r);
@@ -756,6 +781,11 @@ document.addEventListener("click", ev => {
 
 $("controls").addEventListener("submit", ev => { ev.preventDefault(); run(); });
 $("ctx").addEventListener("input", markCtx);
+// Reveal the image-size inputs as soon as the box is ticked, before the next plan
+// runs - the controls appearing only after a re-plan reads as the tick not working.
+$("visionplan").addEventListener("change", () => {
+  $("visioninputs").hidden = !$("visionplan").checked;
+});
 $("model").addEventListener("change", onPick);
 $("dir").addEventListener("keydown", ev => { if(ev.key === "Enter"){ ev.preventDefault(); scanModels(); } });
 

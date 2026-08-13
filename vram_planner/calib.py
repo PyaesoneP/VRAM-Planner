@@ -5,6 +5,7 @@ from .gguf import load_gguf
 from .model import extract_config
 from .kv import is_swa_layer, kv_bytes_per_token_layer, swa_cache_len
 from .compute import CB_CTX_QUANT_BYTES, CB_CUDA_CTX_MIB, CB_DEFAULTS, CB_MASK_PER_UB_TOK, CB_MOE_ACT_PER_WIDTH, CB_SPLIT_GRAPH_MIB, CB_SPLIT_PER_TOKEN, graph_is_split, output_head_on_gpu
+from .cards import have_card, load_card
 from .paths import _user_file
 from .gpu import gpu_list
 from .lmstudio import current_backend, default_models_dir
@@ -189,6 +190,12 @@ def _model_facts(name, roots=None, _cache={}):
                      (cfg.get("n_expert_used") or 0) * (cfg.get("expert_ffn_len") or 0))
         except Exception:
             facts = None
+    if facts is None:                     # the file is gone; the card remembers
+        card = load_card(name)
+        if card:
+            cfg = card[0]
+            facts = (cfg.get("n_layers") or 0, cfg.get("n_vocab") or 0,
+                     (cfg.get("n_expert_used") or 0) * (cfg.get("expert_ffn_len") or 0))
     _cache[name] = facts
     return facts
 
@@ -274,11 +281,12 @@ def _recompute_overheads(data, rows):
         # A stored card is enough to re-derive the exact terms: analyze() falls
         # back to it by file name. Without this a deleted model stranded every
         # row it ever produced, permanently, on the next schema bump.
-        path = _model_file(r.get("model") or "")
+        path = _model_file(r.get("model") or "") or (
+            r.get("model") if have_card(r.get("model") or "") else None)
         if not path:
             r["stale"] = ("recorded under an older model of what counts as exact, and "
-                          "%s is no longer on disk to re-derive it from"
-                          % (r.get("model") or "the model"))
+                          "%s is neither on disk nor in the card store to re-derive it "
+                          "from" % (r.get("model") or "the model"))
             continue
         try:
             rr = analyze(path, r["ctx"], r.get("kv_type", "f16"), r["ub"],

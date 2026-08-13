@@ -2,11 +2,11 @@
 import os, struct
 from .const import _mib
 from .gguf import GGML_TYPES, _parse_one, load_gguf
-from .model import RE_EXPS, extract_config
+from .model import RE_EXPS, classify_tensors, extract_config
 from .compute import CB_CUDA_CTX_MIB, CB_DEFAULTS, CB_SPLIT_GRAPH_MIB, CB_SPLIT_PER_TOKEN, compute_buffer_split, compute_buffer_terms, graph_is_split, output_head_on_gpu, vision_grid, vision_peak_mib
 from .lmstudio import REF_GPU, current_backend, read_lmstudio_runtime, resolve_runtime_ngl
 from .calib import CALIB_SCHEMA, CALIB_TERMS, _CALIB_CACHE, _active_gpu, _design, _struct_offset, calib_coeffs, fit_calibration, mark_unreliable
-from .plan import analyze
+from .plan import analyze, find_mmproj
 
 
 # ---------------------------------------------------------------------------
@@ -85,6 +85,24 @@ def self_test(require_refs=False):
     calib._CALIB_LOADED = True
     import tempfile
     tmp = tempfile.mkdtemp(prefix="vramtest_")
+    ok = True
+
+    # The suite analyses synthetic fixtures (dense/moe/hybrid/swa.gguf), and
+    # analyze() records a model card for everything it reads. Left alone that
+    # writes four fake models into the user's real card store, which then offers
+    # them in the model list. Point the store at the scratch directory for the
+    # whole run - the test must not have side effects on user data.
+    from . import cards as _cardsmod
+    _real_cards_store = _cardsmod._cards_store
+    _cardsmod._cards_store = lambda: os.path.join(tmp, "test_cards.json")
+    try:
+        return _run_suite(require_refs, tmp, skipped_real)
+    finally:
+        _cardsmod._cards_store = _real_cards_store
+
+
+def _run_suite(require_refs, tmp, skipped_real):
+    from . import calib
     ok = True
 
     # 1) byte-precision test
@@ -777,6 +795,59 @@ def self_test(require_refs=False):
         try: os.remove(_tmp)
         except OSError: pass
 
+    # 9d) A card must reproduce the file EXACTLY. It is not an approximation or a
+    #     summary - it is the same three structures analyze() would have computed,
+    #     stored. If a plan from a card differs from a plan from the file by even a
+    #     MiB, the card is lying and every downstream number inherits it.
+    #     The failure mode this guards is silent: JSON has no integer keys, so
+    #     per_layer_bytes round-trips as {"0": n} and every per_layer[i] lookup
+    #     misses, which reads as a model with no layers rather than as an error.
+    import vram_planner.cards as _cards
+    card_ok = True
+    try:
+        _mfile = load_gguf(p3)
+        _mcfg = extract_config(_mfile)
+        _card = _cards.make_card(p3, _mcfg, classify_tensors(_mfile, _mcfg),
+                                 find_mmproj(p3))
+        _cfg2, _cl2, _mm2, _meta2 = _cards._rehydrate(_json.loads(_json.dumps(_card)))
+        # the int-keyed maps are the whole hazard
+        _cl1 = classify_tensors(_mfile, _mcfg)
+        key_ok = all(_cl2[k] == _cl1[k] for k in
+                     ("per_layer_bytes", "per_layer_expert_bytes", "per_layer_ffn_bytes"))
+        # ...and the plans themselves must agree to the MiB
+        _saved_store2 = _cards._cards_store
+        _tmp2 = os.path.join(_tf.gettempdir(), "vram_planner_cards_test.json")
+        try:
+            _cards._cards_store = lambda: _tmp2
+            _cards.save_cards({"cards": {os.path.basename(p3): _card}})
+            a = analyze(p3, 32768, "q8_0", 512, True, vram_budget_mib=9000,
+                        ram_budget_mib=32000, gpu_reserve_mib=512,
+                        compute_override_mib=0, safety_pct=5)
+            b = analyze(os.path.basename(p3), 32768, "q8_0", 512, True,
+                        vram_budget_mib=9000, ram_budget_mib=32000,
+                        gpu_reserve_mib=512, compute_override_mib=0, safety_pct=5)
+        finally:
+            _cards._cards_store = _saved_store2
+            try: os.remove(_tmp2)
+            except OSError: pass
+        # Every key, not a chosen few: a hand-picked list is exactly how a field
+        # that only the file path populates slips through unnoticed.
+        pdiff = [k for k in a["plan"] if a["plan"][k] != b["plan"][k]]
+        cdiff = [k for k in a["config"] if a["config"][k] != b["config"][k]]
+        sdiff = [k for k in (a.get("speed") or {})
+                 if (a.get("speed") or {})[k] != (b.get("speed") or {}).get(k)]
+        plan_ok = (not pdiff and not cdiff and not sdiff
+                   and b["from_card"] and not a["from_card"])
+        card_ok = key_ok and plan_ok
+        print("  CARD  int keys survive JSON=%s | card==file across %d plan / %d config "
+              "/ %d speed keys%s  %s"
+              % (key_ok, len(a["plan"]), len(a["config"]), len(a.get("speed") or {}),
+                 "" if plan_ok else "  DIFFER: %s" % (pdiff + cdiff + sdiff)[:6],
+                 "OK" if card_ok else "FAIL"))
+    except Exception as e:
+        card_ok = False
+        print("  CARD  raised %s: %s  FAIL" % (type(e).__name__, e))
+    ok = ok and card_ok
 
     # 10) --n-cpu-moe must move expert bytes to the RAM side of the speed model
     rm2 = analyze(p3, 4096, "f16", 512, False, vram_budget_mib=300, ram_budget_mib=8000,

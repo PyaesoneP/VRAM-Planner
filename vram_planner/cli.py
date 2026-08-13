@@ -1,6 +1,7 @@
 """Argument parsing and the process entry point."""
-import argparse, datetime, sys
+import argparse, datetime, os, sys
 from .const import __version__
+from .paths import _user_file
 from .web import serve
 from .selftest import self_test
 
@@ -39,7 +40,45 @@ def main():
                          "nothing else refits it except pressing Measure")
     ap.add_argument("--show-calibration", action="store_true",
                     help="print the stored fit and where it came from, change nothing")
+    ap.add_argument("--cards", action="store_true",
+                    help="list stored model cards - models that can be planned "
+                         "without the .gguf being on disk")
+    ap.add_argument("--add-card", nargs="+", metavar="GGUF",
+                    help="record a model card for these files so they stay plannable "
+                         "after the weights are deleted")
+    ap.add_argument("--forget-card", nargs="+", metavar="NAME",
+                    help="delete stored model cards by file name")
     args = ap.parse_args()
+    if args.add_card or args.forget_card or args.cards:
+        from .cards import forget_card, list_cards, remember_card
+        for p in (args.add_card or []):
+            if not os.path.exists(p):
+                print("skipped, not found: %s" % p)
+                continue
+            from .gguf import load_gguf
+            from .model import classify_tensors, extract_config
+            from .plan import find_mmproj
+            m = load_gguf(p)
+            cfg = extract_config(m)
+            remember_card(p, cfg, classify_tensors(m, cfg), find_mmproj(p))
+            print("recorded: %s" % os.path.basename(p))
+        for n in (args.forget_card or []):
+            print(("forgot: %s" if forget_card(n) else "no card for: %s") % n)
+        cards = list_cards()
+        if not cards:
+            print("no model cards stored. One is recorded automatically every time "
+                  "you analyse a model, or use --add-card.")
+            sys.exit(0)
+        print("\n%-46s %8s %7s %9s  %s" % ("model", "params", "layers", "weights", "recorded"))
+        for c in cards:
+            print("%-46s %7.1fB %7d %8.1fG  %s%s"
+                  % (c["name"][:46], (c["params"] or 0) / 1e9, c["n_layers"],
+                     (c["weights_bytes"] or 0) / 1e9,
+                     datetime.datetime.fromtimestamp(c["when"]).strftime("%Y-%m-%d")
+                     if c.get("when") else "?",
+                     "  +mmproj" if c["has_mmproj"] else ""))
+        print("\n%d card(s) in %s" % (len(cards), _user_file("model_cards.json")))
+        sys.exit(0)
     if args.show_calibration or args.recalibrate:
         from .calib import calibration_status, refresh_calibration
         if args.recalibrate:

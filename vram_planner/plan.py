@@ -8,6 +8,7 @@ from .compute import MTP_SPEC_CONST_MIB, MTP_SPEC_PER_SEQ_MIB, compute_buffer_sp
 from .gpu import gpu_list, platform_support
 from .speed import estimate_speed
 from .calib import calibration_status
+from .cards import load_card, remember_card
 
 
 def find_mmproj(model_path):
@@ -51,13 +52,37 @@ def analyze(path, ctx, kv_type, n_ubatch, flash_attn,
             include_mmproj=True, n_cpu_moe_override=None,
             bw_vram_gbs=None, bw_ram_gbs=None, ram_eff=None, ctx_fill=None,
             bw_note="", mtp_spec=False, image_px=None, vision_flash_attn=True):
-    model = load_gguf(path)
-    cfg = extract_config(model)
-    cl = classify_tensors(model, cfg)
-    mmproj = find_mmproj(path)
+    # The file is authoritative when it is here; the stored card stands in when it
+    # is not. Reading a real file also refreshes the card, so the library builds
+    # up as a side effect of ordinary use rather than needing to be curated.
+    from_card = False
+    if os.path.exists(path):
+        model = load_gguf(path)
+        cfg = extract_config(model)
+        cl = classify_tensors(model, cfg)
+        mmproj = find_mmproj(path)
+        file_bytes, n_shards = model["file_bytes"], len(model["shards"])
+        remember_card(path, cfg, cl, mmproj, file_bytes, n_shards)
+    else:
+        card = load_card(path)
+        if not card:
+            raise FileNotFoundError(
+                "%s is not on disk and no stored card exists for it. Analyse it "
+                "once while the file is present to record one." % os.path.basename(path))
+        cfg, cl, mmproj, cmeta = card
+        file_bytes, n_shards = cmeta["file_bytes"], cmeta["n_shards"]
+        from_card = True
 
     n_layers = cfg["n_layers"] or 0
     warnings = []
+    if from_card:
+        # Said plainly rather than hidden: everything below is real arithmetic on
+        # real recorded numbers, but nothing here was re-read from the weights.
+        warnings.append(
+            "Planned from a stored model card - %s is not on disk. Layer sizes, "
+            "KV geometry and the projector are the ones recorded when the file was "
+            "last read, so this is exact for that file and wrong for any other "
+            "build or quant sharing its name." % os.path.basename(path))
     if cl["unknown_types"]:
         warnings.append("Unrecognized quant type(s) %s. Their sizes were recovered from the "
                         "gaps between tensor offsets rather than from the type table, which "
@@ -85,7 +110,7 @@ def analyze(path, ctx, kv_type, n_ubatch, flash_attn,
     expert_layer_mean_mib = _mib(cl["expert_layer_mean"])
     ffn_dense_total_mib = _mib(cl["ffn_dense_total"])
     ffn_layer_mean_mib = _mib(cl["ffn_layer_mean"])
-    file_on_disk_mib = _mib(model["file_bytes"])
+    file_on_disk_mib = _mib(file_bytes)
 
     # Resolve each block's cache length first: with sliding-window attention the
     # windowed blocks cap out at their window and every later number depends on it.
@@ -166,7 +191,7 @@ def analyze(path, ctx, kv_type, n_ubatch, flash_attn,
     result = {
         "ok": True, "warnings": warnings, "config": cfg,
         "model_name": cfg["name"], "arch": cfg["arch"],
-        "shards": len(model["shards"]),
+        "shards": n_shards,
         "params_total": cl["params_total"], "active_params": cl["active_params"],
         "is_moe": cl["is_moe"], "n_expert": cfg["n_expert"], "n_expert_used": cfg["n_expert_used"],
         "n_expert_layers": cl["n_expert_layers"],
@@ -204,6 +229,7 @@ def analyze(path, ctx, kv_type, n_ubatch, flash_attn,
             "interval": cfg["full_attention_interval"],
         },
         "calibration": calibration_status(),
+        "from_card": from_card,
         "swa": {
             "enabled": bool(cfg["swa_layers"]),
             "n_swa": cfg["n_swa"],

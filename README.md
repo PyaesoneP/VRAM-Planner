@@ -382,6 +382,42 @@ A fit made under a different llama.cpp build, or by an older version of the fitt
 **reported as outdated** in the terminal and the UI rather than silently replaced —
 whether the numbers change is your call, not the tool's.
 
+## Model cards — planning without the weights
+
+`analyze()` touches the `.gguf` for exactly three things: the config, the per-layer
+tensor byte sums, and the projector next to it. All three are pure functions of the
+header and tensor table, and together they are a few kilobytes. Everything after them is
+arithmetic.
+
+So they get cached as a **model card**, automatically, every time a model is read — about
+8 KB each. When the file is gone, the card stands in:
+
+```
+python -m vram_planner --cards                 # what is stored
+python -m vram_planner --add-card path/to.gguf # record one explicitly
+python -m vram_planner --forget-card NAME.gguf # drop one
+```
+
+This means you can plan for a model you have **deleted**, or one you have not downloaded
+yet — copy its card in — and on a machine that never held the weights at all. Cards for
+models not on disk appear in the UI dropdown marked `○ … stored card, not on disk`, and
+any plan built from one carries a warning saying so.
+
+A card is not an approximation. It is the same three structures the file would have
+produced, so a plan from a card is **identical to the plan from the file** — the
+self-test asserts equality across every plan, config and speed key, not a sampled few.
+The `CARD` check exists because the failure mode is silent: JSON has no integer keys, so
+`per_layer_bytes` round-trips as `{"0": n}` and every lookup misses, which reads as a
+model with no layers rather than as an error.
+
+Cards are keyed by **file name**. Two genuinely different models sharing one name is the
+single thing this cannot survive; a name whose size no longer matches is treated as stale
+and rebuilt from the file.
+
+They also rescue calibration rows. A stored measurement whose model has since been
+deleted used to be stranded permanently on the next schema bump, because `overhead_mib`
+could not be re-derived without the file. With a card it can.
+
 ## Measuring it yourself
 
 The accuracy numbers above are reproducible on your own hardware, and the model can be

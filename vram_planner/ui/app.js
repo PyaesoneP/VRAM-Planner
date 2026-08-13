@@ -185,10 +185,17 @@ async function scanModels(){
     MODELS = r.models || [];
     $("model").innerHTML =
       h`<option value="">&mdash; ${MODELS.length} models found &mdash;</option>` +
-      MODELS.map((m, i) => h`<option value="${i}">${m.name}  (${fmtG(m.size_mix || m.size_mib)})${
-        m.n_ctx_train ? "  · " + ctxLabel(m.n_ctx_train) + " ctx" : ""}</option>`).join("");
+      MODELS.map((m, i) => h`<option value="${i}">${m.from_card ? "○ " : ""}${m.name}  (${
+        fmtG(m.size_mix || m.size_mib)})${
+        m.from_card ? "  · stored card, not on disk"
+                    : (m.n_ctx_train ? "  · " + ctxLabel(m.n_ctx_train) + " ctx" : "")
+        }</option>`).join("");
+    const onDisk = MODELS.length - (r.n_cards || 0);
     $("scanhint").textContent = MODELS.length
-      ? MODELS.length + " GGUF found in folder" : "no .gguf found here";
+      ? onDisk + " GGUF found in folder"
+        + (r.n_cards ? " + " + r.n_cards + " stored card"
+                       + (r.n_cards == 1 ? "" : "s") + " (model not on disk)" : "")
+      : "no .gguf found here";
   }catch(e){ $("scanhint").textContent = "scan failed: " + e; }
 }
 

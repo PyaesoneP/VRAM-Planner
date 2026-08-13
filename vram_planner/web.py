@@ -11,6 +11,7 @@ from .paths import _data_dir
 from .gpu import get_bandwidth, get_gpu_processes, get_gpus, get_ram, platform_support
 from .lmstudio import benchmark_server, default_models_dir, load_benchmarks, match_speed_history, read_lmstudio_runtime, resolve_runtime_ngl, save_benchmark, scan_models, scan_server_logs, scan_speed_history
 from .calib import _active_gpu, calibration_status, record_calibration, refresh_calibration
+from .cards import forget_card, have_card, list_cards
 from .plan import analyze
 
 
@@ -149,9 +150,21 @@ class Handler(BaseHTTPRequestHandler):
             q = parse_qs(u.query)
             d = (q.get("dir", [""])[0]) or default_models_dir()
             try:
-                return self._send(200, {"models": scan_models(d), "dir": d})
+                found = scan_models(d)
             except Exception as e:
                 return self._send(200, {"models": [], "error": str(e)})
+            # Cards for models that are not on disk are offered alongside the real
+            # files, flagged, so a deleted model stays plannable. A card whose file
+            # IS present adds nothing and is not listed twice.
+            here = {os.path.basename(m["path"]) for m in found}
+            offline = [{"name": c["name"], "path": c["name"], "from_card": True,
+                        "size_mib": (c["weights_bytes"] or c["file_bytes"]) / (1 << 20),
+                        "n_ctx_train": 0}
+                       for c in list_cards() if c["name"] not in here]
+            return self._send(200, {"models": found + offline, "dir": d,
+                                    "n_cards": len(offline)})
+        if u.path == "/api/cards":
+            return self._send(200, {"cards": list_cards()})
         return self._send(404, {"error": "not found"})
 
     def do_POST(self):
@@ -169,8 +182,9 @@ class Handler(BaseHTTPRequestHandler):
             path = data["path"]
             # A missing file is not an error when we have a card for it - that is
             # the whole point of the card. analyze() raises if there is neither.
-            if not os.path.exists(path):
-                return self._send(200, {"ok": False, "error": "file not found: %s" % path})
+            if not os.path.exists(path) and not have_card(path):
+                return self._send(200, {"ok": False, "error":
+                    "file not found and no stored card: %s" % path})
             res = analyze(
                 path=path,
                 ctx=int(data.get("context", 8192)),

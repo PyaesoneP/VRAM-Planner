@@ -11,6 +11,7 @@ from .paths import _data_dir
 from .gpu import get_bandwidth, get_gpu_processes, get_gpus, get_ram, platform_support
 from .lmstudio import benchmark_server, default_models_dir, load_benchmarks, match_speed_history, read_lmstudio_runtime, resolve_runtime_ngl, save_benchmark, scan_models, scan_server_logs, scan_speed_history
 from .calib import _active_gpu, calibration_status, record_calibration, refresh_calibration
+from .cards import forget_card, have_card, list_cards
 from .plan import analyze
 
 
@@ -149,9 +150,21 @@ class Handler(BaseHTTPRequestHandler):
             q = parse_qs(u.query)
             d = (q.get("dir", [""])[0]) or default_models_dir()
             try:
-                return self._send(200, {"models": scan_models(d), "dir": d})
+                found = scan_models(d)
             except Exception as e:
                 return self._send(200, {"models": [], "error": str(e)})
+            # Cards for models that are not on disk are offered alongside the real
+            # files, flagged, so a deleted model stays plannable. A card whose file
+            # IS present adds nothing and is not listed twice.
+            here = {os.path.basename(m["path"]) for m in found}
+            offline = [{"name": c["name"], "path": c["name"], "from_card": True,
+                        "size_mib": (c["weights_bytes"] or c["file_bytes"]) / (1 << 20),
+                        "n_ctx_train": 0}
+                       for c in list_cards() if c["name"] not in here]
+            return self._send(200, {"models": found + offline, "dir": d,
+                                    "n_cards": len(offline)})
+        if u.path == "/api/cards":
+            return self._send(200, {"cards": list_cards()})
         return self._send(404, {"error": "not found"})
 
     def do_POST(self):
@@ -167,8 +180,11 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, self._calibrate(data))
         try:
             path = data["path"]
-            if not os.path.exists(path):
-                return self._send(200, {"ok": False, "error": "file not found: %s" % path})
+            # A missing file is not an error when we have a card for it - that is
+            # the whole point of the card. analyze() raises if there is neither.
+            if not os.path.exists(path) and not have_card(path):
+                return self._send(200, {"ok": False, "error":
+                    "file not found and no stored card: %s" % path})
             res = analyze(
                 path=path,
                 ctx=int(data.get("context", 8192)),
@@ -196,6 +212,11 @@ class Handler(BaseHTTPRequestHandler):
                                      else None),
                 ram_free_mib=(float(data["ram_free_mib"])
                               if data.get("ram_free_mib") else None),
+                # Vision: two numbers, or nothing. Absent means a text-only plan,
+                # which analyze() warns about rather than guessing an image size.
+                image_px=((int(data["image_w"]), int(data["image_h"]))
+                          if data.get("image_w") and data.get("image_h") else None),
+                vision_flash_attn=bool(data.get("vision_flash_attn", True)),
             )
             return self._send(200, res)
         except Exception as e:
@@ -207,20 +228,33 @@ class Handler(BaseHTTPRequestHandler):
 def serve(host, port, open_browser):
     httpd = ThreadingHTTPServer((host, port), Handler)
     url = "http://%s:%d/" % ("localhost" if host in ("127.0.0.1", "0.0.0.0") else host, port)
+    # A read, not a refit: the stored fit is what plans are made against until
+    # someone presses Measure or runs --recalibrate. Starting the server must
+    # not change anyone's numbers.
     refresh_calibration()
     st = calibration_status()
     plat = platform_support()
     print("\n  VRAM Planner %s  running at  %s" % (__version__, url))
     print("  models folder default :  %s" % default_models_dir())
     print("  user data             :  %s" % _data_dir())
-    print("  compute-buffer model  :  %s"
-          % ("calibrated from %d measurement(s) on %s (fitted: %s, in-sample %.1f%%)"
-             % (st["n"], st["gpu"] or "this GPU", ", ".join(st["free"]), st["residual_pct"])
-             if st["calibrated"] else
-             "shipped defaults - press Measure on a loaded model to calibrate"))
+    if st["calibrated"]:
+        import datetime
+        when = (datetime.datetime.fromtimestamp(st["when"]).strftime("%Y-%m-%d %H:%M")
+                if st.get("when") else "an earlier version")
+        print("  compute-buffer model  :  calibrated from %d measurement(s) on %s "
+              "(fitted: %s, in-sample %.1f%%)"
+              % (st["n"], st["gpu"] or "this GPU", ", ".join(st["free"]),
+                 st["residual_pct"]))
+        print("  fit frozen since      :  %s (press Measure or run --recalibrate "
+              "to refit)" % when)
+    else:
+        print("  compute-buffer model  :  shipped defaults - press Measure on a "
+              "loaded model to calibrate")
     if st.get("skipped_rows"):
         print("  measurements skipped  :  %d (reading did not respond to the config, or "
               "no layer count recorded)" % st["skipped_rows"])
+    if st.get("outdated"):
+        print("\n  !! STORED FIT MAY NOT MATCH THIS MACHINE\n     %s" % st["outdated"])
     if not plat["supported"]:
         print("\n  !! UNVALIDATED PLATFORM\n     %s" % plat["reason"])
     print("  press Ctrl+C to stop\n")

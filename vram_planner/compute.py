@@ -127,6 +127,136 @@ CB_DEFAULTS = {"floor": CB_FLOOR_PER_LAYER, "act": CB_ACT_PER_HIDDEN,
                "ctx": CB_CTX_PER_TOKEN, "nofa": CB_NOFA_HEAD_BYTES}
 
 
+# ---------------------------------------------------------------------------
+# Vision encoder transients.
+#
+# DERIVED, NOT MEASURED - the only block in this file with no sweep behind it.
+# Everything above came from llama.cpp's own allocator log; nothing here did, and
+# it is written the way it is so that saying so is easy. See the limitation in the
+# README, and treat these numbers as an order of magnitude, not a prediction.
+#
+# The gap this fills: the projector's WEIGHTS were charged (mmproj tensor bytes,
+# exact, off the top of the budget) and its ACTIVATIONS were not charged at all.
+# The weights are a flat few hundred MiB and load once; the activations are
+# quadratic in patch count, allocate only when an image actually arrives, and on a
+# 12 GB card are the larger of the two by an order of magnitude at screenshot
+# resolutions. A plan could therefore read "fits" and OOM the moment it was shown
+# a picture, which is the failure this models.
+#
+# The quadratic term is the whole story. A ViT runs global attention over every
+# patch, so the score matrix is [n_head x n_patches x n_patches]; at 16px patches a
+# 2560x1600 screenshot is 16,000 patches and that single tensor is multiple GiB
+# while every other term is tens of MiB. Everything else here is bookkeeping around
+# it.
+#
+# Deliberately conservative, in the direction the rest of the file already argues
+# for (see the embeddings note in plan.py): scores are charged f32 and unfused
+# unless the caller says otherwise. Over-charging makes a plan cautious;
+# under-charging makes it overcommit and spill, which is the failure being fixed.
+VIS_ACT_BYTES     = 2.0   # f16 activations in the tower
+VIS_SCORE_BYTES   = 4.0   # f32 attention scores, materialised without flash attention
+VIS_ACT_LIVE      = 6.0   # live [n_patches x D] tensors at peak: residual, q, k, v,
+                          # projection, norm scratch. ggml reuses the pool across
+                          # blocks, so this is a peak over one block, not a sum.
+
+
+def vision_config(meta):
+    """Read a vision tower's geometry out of an mmproj GGUF's metadata.
+
+    Returns None when the file carries no vision encoder (an audio-only projector,
+    or a plain model file picked by mistake)."""
+    if not meta or not meta.get("clip.has_vision_encoder"):
+        return None
+
+    def _i(k, default=0):
+        try:
+            return int(meta.get(k) or default)
+        except (TypeError, ValueError):
+            return default
+
+    hid = _i("clip.vision.embedding_length", 1024) or 1024
+    heads = _i("clip.vision.attention.head_count", 16) or 16
+    return {
+        "projector": meta.get("clip.projector_type") or "?",
+        # What the backend's flash-attention probe actually keys on - see
+        # vision_peak_mib(). 72 (SigLIP-so400m: 1152/16) is the common awkward case.
+        "head_dim": _i("clip.vision.attention.head_dim", 0) or (hid // max(1, heads)),
+        "patch": _i("clip.vision.patch_size", 14) or 14,
+        "merge": _i("clip.vision.spatial_merge_size", 1) or 1,
+        "hidden": _i("clip.vision.embedding_length", 1024) or 1024,
+        "ffn_len": _i("clip.vision.feed_forward_length", 4096) or 4096,
+        "blocks": _i("clip.vision.block_count", 24) or 24,
+        "heads": _i("clip.vision.attention.head_count", 16) or 16,
+        "image_size": _i("clip.vision.image_size", 0),
+        "projection_dim": _i("clip.vision.projection_dim", 0),
+    }
+
+
+def vision_grid(vis, width, height):
+    """Patch grid for one image at a given pixel size.
+
+    Models in the Qwen-VL line are DYNAMIC RESOLUTION: clip.vision.image_size is a
+    reference, not a resize target, so patch count tracks the image the user
+    actually sends rather than a fixed 224/336/768 grid. Dimensions are snapped down
+    to a whole number of merge blocks, which is what the preprocessors do and what
+    keeps the merge exact."""
+    if not vis:
+        return None
+    step = max(1, vis["patch"] * max(1, vis["merge"]))
+    w = max(step, (int(width) // step) * step)
+    h = max(step, (int(height) // step) * step)
+    gw, gh = w // vis["patch"], h // vis["patch"]
+    n_patches = gw * gh
+    m2 = max(1, vis["merge"] ** 2)
+    return {"width": w, "height": h, "grid_w": gw, "grid_h": gh,
+            "n_patches": n_patches, "image_tokens": n_patches // m2}
+
+
+def vision_peak_mib(vis, grid, flash_attn=True):
+    """Peak VRAM the vision tower needs *while encoding one image*, in MiB.
+
+    Transient: it is allocated when an image arrives and released afterwards, so it
+    does not belong in the resident total the way the projector's weights do. It is
+    returned split into terms because the quadratic one dominates so completely that
+    showing only a sum would hide the reason.
+
+    flash_attn folds the score matrix and removes the quadratic term entirely, which
+    is a ~40x swing at screenshot resolutions - so which side of it you are on is the
+    single most important thing about this estimate, and it is NOT a property of the
+    model. clip.cpp holds one context-level `flash_attn_type`, defaulted to
+    CLIP_FLASH_ATTN_TYPE_AUTO and resolved at load time by probing the backend;
+    build_attn() then either calls ggml_flash_attn_ext or falls back to an explicit
+    ggml_soft_max_ext over the full [n_head x n_patches x n_patches] matrix. There is
+    no per-projector gate.
+
+    What the probe turns on is the ViT's head dimension. The SigLIP-so400m tower
+    shared by the Qwen3-VL and Gemma families is 1152 wide over 16 heads = 72, which
+    CUDA's fattn.cu lists as a supported size but excludes from the tensor-core MMA
+    paths (`Q->ne[0] != 40 && Q->ne[0] != 72`), leaving the slower tile kernel. Slower,
+    but still flash attention and still O(n) memory - so on CUDA the quadratic term
+    does not materialise for these models.
+
+    Hence flash_attn defaults to True. An earlier version defaulted it False on the
+    theory that assuming fusion would under-charge; that reasoning was backwards for
+    the common case, because charging the unfused ceiling on a CUDA box overstates the
+    peak by ~40x and would reject configurations that run fine. Callers on a backend
+    without a working FA path should pass False and get the ceiling. The load-time log
+    line (`clip_init: flash attention is enabled/disabled`) is the ground truth for
+    any specific machine; this is a default, not a measurement."""
+    if not vis or not grid:
+        return None
+    n = grid["n_patches"]
+    d, f, h = vis["hidden"], vis["ffn_len"], vis["heads"]
+    act = VIS_ACT_BYTES * n * d * VIS_ACT_LIVE
+    ffn = VIS_ACT_BYTES * n * f
+    scores = 0.0 if flash_attn else VIS_SCORE_BYTES * h * n * n
+    return {"act_mib": round(_mib(act), 1), "ffn_mib": round(_mib(ffn), 1),
+            "scores_mib": round(_mib(scores), 1),
+            "total_mib": round(_mib(act + ffn + scores), 1),
+            "flash_attn": bool(flash_attn), "n_patches": n,
+            "image_tokens": grid["image_tokens"]}
+
+
 def compute_buffer_terms(cfg, context, n_ubatch, flash_attn, n_seq=1, kv_type="f16",
                          coeffs=None):
     """The GPU-side runtime overhead beyond weights and KV, in MiB.

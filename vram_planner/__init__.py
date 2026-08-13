@@ -66,7 +66,9 @@ from .compute import (CB_DEFAULTS, CB_FLOOR_PER_LAYER, CB_MOE_ACT_PER_WIDTH,
                       CB_MASK_PER_UB_TOK, CB_CTX_QUANT_BYTES, CB_SPLIT_GRAPH_MIB,
                       CB_SPLIT_PER_TOKEN, CB_NOFA_HEAD_BYTES, MTP_SPEC_CONST_MIB,
                       MTP_SPEC_PER_SEQ_MIB, compute_buffer_terms, compute_buffer_split,
-                      compute_buffer_mib, graph_is_split, output_head_on_gpu)
+                      compute_buffer_mib, graph_is_split, output_head_on_gpu,
+                      VIS_ACT_BYTES, VIS_ACT_LIVE, VIS_SCORE_BYTES,
+                      vision_config, vision_grid, vision_peak_mib)
 from .paths import _data_dir, _user_file
 from .gpu import (get_gpus, gpu_list, platform_support, get_bandwidth,
                   get_gpu_processes, get_ram)
@@ -77,11 +79,15 @@ from .lmstudio import (scan_speed_history, scan_server_logs, benchmark_server,
                        _lmstudio_home, REF_GPU, REF_BACKEND)
 from .speed import GPU_EFF, RAM_EFF_HI, RAM_EFF_LO, per_token_bytes, estimate_speed
 from .calib import (CALIB_TERMS, CALIB_SCHEMA, CALIB_MIN_SPREAD, CALIB_MIN_FREE_MIB,
-                    CALIB_FLAT_RATIO, CALIB_FLAT_MIN_MIB, calib_coeffs,
+                    CALIB_FLAT_RATIO, CALIB_FLAT_MIN_MIB, CALIB_FIT_SCHEMA,
+                    calib_coeffs,
                     load_calibration, save_calibration, migrate_calibration,
                     mark_unreliable, fit_calibration, refresh_calibration,
                     calibration_status, record_calibration, _calib_store, _row_flags,
-                    _design, _struct_offset, _active_gpu)
+                    _design, _struct_offset, _active_gpu, _load_fits, _outdated)
+from .cards import (CARD_SCHEMA, card_name, forget_card, have_card, list_cards,
+                    load_card, load_cards, make_card, remember_card, save_cards,
+                    _cards_store, _rehydrate)
 from .plan import analyze, find_mmproj
 from .web import serve, Handler, read_ui
 from .selftest import self_test

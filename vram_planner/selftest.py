@@ -2,11 +2,11 @@
 import os, struct
 from .const import _mib
 from .gguf import GGML_TYPES, _parse_one, load_gguf
-from .model import RE_EXPS, extract_config
-from .compute import CB_CUDA_CTX_MIB, CB_DEFAULTS, CB_SPLIT_GRAPH_MIB, CB_SPLIT_PER_TOKEN, compute_buffer_split, compute_buffer_terms, graph_is_split, output_head_on_gpu
-from .lmstudio import REF_GPU, read_lmstudio_runtime, resolve_runtime_ngl
-from .calib import CALIB_TERMS, _CALIB_CACHE, _active_gpu, _design, _struct_offset, calib_coeffs, fit_calibration, mark_unreliable
-from .plan import analyze
+from .model import RE_EXPS, classify_tensors, extract_config
+from .compute import CB_CUDA_CTX_MIB, CB_DEFAULTS, CB_SPLIT_GRAPH_MIB, CB_SPLIT_PER_TOKEN, compute_buffer_split, compute_buffer_terms, graph_is_split, output_head_on_gpu, vision_grid, vision_peak_mib
+from .lmstudio import REF_GPU, current_backend, read_lmstudio_runtime, resolve_runtime_ngl
+from .calib import CALIB_SCHEMA, CALIB_TERMS, _CALIB_CACHE, _active_gpu, _design, _struct_offset, calib_coeffs, fit_calibration, mark_unreliable
+from .plan import analyze, find_mmproj
 
 
 # ---------------------------------------------------------------------------
@@ -85,6 +85,24 @@ def self_test(require_refs=False):
     calib._CALIB_LOADED = True
     import tempfile
     tmp = tempfile.mkdtemp(prefix="vramtest_")
+    ok = True
+
+    # The suite analyses synthetic fixtures (dense/moe/hybrid/swa.gguf), and
+    # analyze() records a model card for everything it reads. Left alone that
+    # writes four fake models into the user's real card store, which then offers
+    # them in the model list. Point the store at the scratch directory for the
+    # whole run - the test must not have side effects on user data.
+    from . import cards as _cardsmod
+    _real_cards_store = _cardsmod._cards_store
+    _cardsmod._cards_store = lambda: os.path.join(tmp, "test_cards.json")
+    try:
+        return _run_suite(require_refs, tmp, skipped_real)
+    finally:
+        _cardsmod._cards_store = _real_cards_store
+
+
+def _run_suite(require_refs, tmp, skipped_real):
+    from . import calib
     ok = True
 
     # 1) byte-precision test
@@ -202,6 +220,61 @@ def self_test(require_refs=False):
     # must actually take that branch, or the assertion below proves nothing
     kv_ok = (rk["plan"]["kind"] == "dense_kv_gpu" and sk.get("cpu_mib", 0) > 0
              and rk["plan"].get("ffn_on_cpu"))
+    # 5b) An explicit layer count is a layer-level split, so it must reach a planner
+    #     that HAS a layer count. KV-on-GPU offloads every block by definition and
+    #     splits FFN tensors instead; it used to win the branch and drop the override
+    #     silently, so analyze() returned byte-identical plans for different -ngl.
+    ro_a = analyze(p2, 4096, "f16", 512, False, vram_budget_mib=30, ram_budget_mib=8000,
+                   gpu_reserve_mib=0, compute_override_mib=5, safety_pct=0, kv_on_gpu=True,
+                   gpu_layers_override=1)
+    ro_b = analyze(p2, 4096, "f16", 512, False, vram_budget_mib=30, ram_budget_mib=8000,
+                   gpu_reserve_mib=0, compute_override_mib=5, safety_pct=0, kv_on_gpu=True,
+                   gpu_layers_override=3)
+    ovr_ok = (ro_a["plan"]["kind"] == "dense"                     # routed away from kv_gpu
+              and ro_a["plan"]["n_gpu_layers"] == 1               # ...and honoured
+              and ro_b["plan"]["n_gpu_layers"] == 3
+              and ro_a["plan"]["vram_used_mib"] != ro_b["plan"]["vram_used_mib"]
+              # the recommendation path (no override) must STILL reach kv-on-gpu
+              and rk["plan"]["kind"] == "dense_kv_gpu")
+    print("  NGL-OVR kv_on_gpu + override: kind=%s ngl 1->%.0f MiB, 3->%.0f MiB (differ=%s), "
+          "no-override still %s  %s"
+          % (ro_a["plan"]["kind"], ro_a["plan"]["vram_used_mib"], ro_b["plan"]["vram_used_mib"],
+             ro_a["plan"]["vram_used_mib"] != ro_b["plan"]["vram_used_mib"],
+             rk["plan"]["kind"], "OK" if ovr_ok else "FAIL"))
+    ok = ok and ovr_ok
+
+    # 5c) Vision transients. Derived, not measured - so what is asserted here is the
+    #     SHAPE, not the magnitude: scores are quadratic in patch count while the
+    #     activation terms are linear, image tokens follow the spatial merge, and
+    #     flash attention removes the quadratic term entirely. Those are the claims
+    #     the code makes; the coefficients are not claims at all.
+    vcfg = {"projector": "test", "patch": 16, "merge": 2, "hidden": 1152,
+            "ffn_len": 4304, "blocks": 27, "heads": 16, "image_size": 768,
+            "projection_dim": 5120}
+    g1 = vision_grid(vcfg, 1024, 1024)
+    g2 = vision_grid(vcfg, 2048, 2048)          # 2x each side -> 4x patches
+    # flash_attn=False explicitly: the quadratic term only EXISTS unfused, and that
+    # is the scaling being asserted. The default is True (see vision_peak_mib), so
+    # relying on it here would silently test 0 == 0.
+    p1 = vision_peak_mib(vcfg, g1, flash_attn=False)
+    pk2 = vision_peak_mib(vcfg, g2, flash_attn=False)
+    pfa = vision_peak_mib(vcfg, g2, flash_attn=True)
+    vis_ok = (g1["n_patches"] == 64 * 64 and g2["n_patches"] == 4 * g1["n_patches"]
+              and g1["image_tokens"] == g1["n_patches"] // 4          # merge 2x2
+              # scores go as patches^2 -> 16x for 4x the patches
+              and abs(pk2["scores_mib"] / p1["scores_mib"] - 16.0) < 0.01
+              # activations go as patches -> 4x
+              and abs(pk2["act_mib"] / p1["act_mib"] - 4.0) < 0.01
+              and pfa["scores_mib"] == 0.0 and pfa["total_mib"] < pk2["total_mib"]
+              # snapped down to a whole merge block (16*2 = 32)
+              and vision_grid(vcfg, 1000, 1000)["width"] == 992)
+    print("  VISION 1024px=%s patches -> %s tok; 2048px scores x%.1f, act x%.1f; "
+          "fa removes scores=%s  %s"
+          % (f"{g1['n_patches']:,}", f"{g1['image_tokens']:,}",
+             pk2["scores_mib"] / p1["scores_mib"], pk2["act_mib"] / p1["act_mib"],
+             pfa["scores_mib"] == 0.0, "OK" if vis_ok else "FAIL"))
+    ok = ok and vis_ok
+
     print("  KV-ON-GPU kind=%s ffn_on_cpu=%s cpu_bytes/token=%.1f MiB  %s"
           % (rk["plan"]["kind"], rk["plan"].get("ffn_on_cpu"), sk.get("cpu_mib", 0),
              "OK" if kv_ok else "FAIL"))
@@ -651,6 +724,130 @@ def self_test(require_refs=False):
           % (all(r.get("unreliable") for r in flat),
              not any(r.get("unreliable") for r in moving), "OK" if flat_ok else "FAIL"))
     ok = ok and flat_ok
+
+    # 9c) THE FREEZE. calib_coeffs() must be a pure read: the same call, twice,
+    #     with the store changing underneath, has to return the same numbers.
+    #     Before the fit was stored, every call refitted from whatever rows
+    #     happened to be present, so pressing Measure in the UI - or a schema bump
+    #     re-deriving overhead_mib on every row - silently moved the coefficients
+    #     of a plan already on screen. The symptom is a planner that reports two
+    #     different answers for one config minutes apart, which is indistinguish-
+    #     able from a bug in the model itself.
+    import json as _json, tempfile as _tf, vram_planner.calib as _cal
+    _saved_cache, _saved_loaded = dict(_CALIB_CACHE), _cal._CALIB_LOADED
+    _saved_store = _cal._calib_store
+    _tmp = os.path.join(_tf.gettempdir(), "vram_planner_calfrz_store.json")
+    def _row(ngl, overhead):
+        return dict(synth(32768, 512, True, ngl=ngl), model="frz.gguf", gpu="g",
+                    backend=current_backend(), exact_mib=10000.0,
+                    measured_mib=10000.0 + overhead, overhead_mib=overhead)
+    try:
+        _cal._calib_store = lambda: _tmp
+        _cal._CALIB_LOADED = True                # we drive the load path by hand
+
+        # one measurement, fitted and stored
+        _json.dump({"rows": [_row(20, 520.0)], "schema": CALIB_SCHEMA},
+                   open(_tmp, "w", encoding="utf-8"))
+        _cal.refresh_calibration("g", force=True)
+        first = calib_coeffs("g")["floor"]
+        stored = _json.load(open(_tmp, encoding="utf-8")).get("fits", {}).get("g", {})
+
+        # now the rows change underneath - a Measure from another window, or a
+        # migration re-deriving overhead_mib. Reads must not notice.
+        d = _json.load(open(_tmp, encoding="utf-8"))
+        d["rows"] = [_row(20, 520.0), _row(30, 2400.0), _row(10, 90.0)]
+        _json.dump(d, open(_tmp, "w", encoding="utf-8"))
+        _cal.refresh_calibration("g")            # a read, not a refit
+        second = calib_coeffs("g")["floor"]
+
+        # ...until the refit is actually asked for.
+        _cal.refresh_calibration("g", force=True)
+        third = calib_coeffs("g")["floor"]
+
+        frozen_ok = (stored.get("coeffs", {}).get("floor") == first
+                     and second == first and third != first)
+        print("  CALFRZ fit stored=%.2f, survives new rows=%.2f, refits on demand=%.2f"
+              "  %s" % (first, second, third, "OK" if frozen_ok else "FAIL"))
+        ok = ok and frozen_ok
+
+        _CALIB_CACHE["g"] = {"n": 3, "free": ["floor"], "residual_pct": 1.0,
+                             "coeffs": dict(CB_DEFAULTS, floor=7.25),
+                             "backend": "b1", "fit_schema": _cal.CALIB_FIT_SCHEMA,
+                             "row_schema": CALIB_SCHEMA}
+
+        # ...and a fit made under a different llama.cpp build must be REPORTED as
+        # outdated, not quietly replaced. Silently refitting on a build change is
+        # exactly the drift this design removes.
+        _CALIB_CACHE["g"]["backend"] = "some-old-build"
+        stale_msg = _cal._outdated(_CALIB_CACHE["g"])
+        cur_b = current_backend()
+        # With no detectable backend there is nothing to compare, so no claim.
+        stale_ok = bool(stale_msg) if cur_b else stale_msg == ""
+        print("  CALFRZ build change reported not applied: %s  %s"
+              % (("%r" % stale_msg[:38]) if stale_msg else "no backend to compare",
+                 "OK" if stale_ok else "FAIL"))
+        ok = ok and stale_ok
+    finally:
+        _cal._calib_store = _saved_store
+        _CALIB_CACHE.clear()
+        _CALIB_CACHE.update(_saved_cache)
+        _cal._CALIB_LOADED = _saved_loaded
+        try: os.remove(_tmp)
+        except OSError: pass
+
+    # 9d) A card must reproduce the file EXACTLY. It is not an approximation or a
+    #     summary - it is the same three structures analyze() would have computed,
+    #     stored. If a plan from a card differs from a plan from the file by even a
+    #     MiB, the card is lying and every downstream number inherits it.
+    #     The failure mode this guards is silent: JSON has no integer keys, so
+    #     per_layer_bytes round-trips as {"0": n} and every per_layer[i] lookup
+    #     misses, which reads as a model with no layers rather than as an error.
+    import vram_planner.cards as _cards
+    card_ok = True
+    try:
+        _mfile = load_gguf(p3)
+        _mcfg = extract_config(_mfile)
+        _card = _cards.make_card(p3, _mcfg, classify_tensors(_mfile, _mcfg),
+                                 find_mmproj(p3))
+        _cfg2, _cl2, _mm2, _meta2 = _cards._rehydrate(_json.loads(_json.dumps(_card)))
+        # the int-keyed maps are the whole hazard
+        _cl1 = classify_tensors(_mfile, _mcfg)
+        key_ok = all(_cl2[k] == _cl1[k] for k in
+                     ("per_layer_bytes", "per_layer_expert_bytes", "per_layer_ffn_bytes"))
+        # ...and the plans themselves must agree to the MiB
+        _saved_store2 = _cards._cards_store
+        _tmp2 = os.path.join(_tf.gettempdir(), "vram_planner_cards_test.json")
+        try:
+            _cards._cards_store = lambda: _tmp2
+            _cards.save_cards({"cards": {os.path.basename(p3): _card}})
+            a = analyze(p3, 32768, "q8_0", 512, True, vram_budget_mib=9000,
+                        ram_budget_mib=32000, gpu_reserve_mib=512,
+                        compute_override_mib=0, safety_pct=5)
+            b = analyze(os.path.basename(p3), 32768, "q8_0", 512, True,
+                        vram_budget_mib=9000, ram_budget_mib=32000,
+                        gpu_reserve_mib=512, compute_override_mib=0, safety_pct=5)
+        finally:
+            _cards._cards_store = _saved_store2
+            try: os.remove(_tmp2)
+            except OSError: pass
+        # Every key, not a chosen few: a hand-picked list is exactly how a field
+        # that only the file path populates slips through unnoticed.
+        pdiff = [k for k in a["plan"] if a["plan"][k] != b["plan"][k]]
+        cdiff = [k for k in a["config"] if a["config"][k] != b["config"][k]]
+        sdiff = [k for k in (a.get("speed") or {})
+                 if (a.get("speed") or {})[k] != (b.get("speed") or {}).get(k)]
+        plan_ok = (not pdiff and not cdiff and not sdiff
+                   and b["from_card"] and not a["from_card"])
+        card_ok = key_ok and plan_ok
+        print("  CARD  int keys survive JSON=%s | card==file across %d plan / %d config "
+              "/ %d speed keys%s  %s"
+              % (key_ok, len(a["plan"]), len(a["config"]), len(a.get("speed") or {}),
+                 "" if plan_ok else "  DIFFER: %s" % (pdiff + cdiff + sdiff)[:6],
+                 "OK" if card_ok else "FAIL"))
+    except Exception as e:
+        card_ok = False
+        print("  CARD  raised %s: %s  FAIL" % (type(e).__name__, e))
+    ok = ok and card_ok
 
     # 10) --n-cpu-moe must move expert bytes to the RAM side of the speed model
     rm2 = analyze(p3, 4096, "f16", 512, False, vram_budget_mib=300, ram_budget_mib=8000,

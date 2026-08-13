@@ -185,10 +185,17 @@ async function scanModels(){
     MODELS = r.models || [];
     $("model").innerHTML =
       h`<option value="">&mdash; ${MODELS.length} models found &mdash;</option>` +
-      MODELS.map((m, i) => h`<option value="${i}">${m.name}  (${fmtG(m.size_mix || m.size_mib)})${
-        m.n_ctx_train ? "  · " + ctxLabel(m.n_ctx_train) + " ctx" : ""}</option>`).join("");
+      MODELS.map((m, i) => h`<option value="${i}">${m.from_card ? "○ " : ""}${m.name}  (${
+        fmtG(m.size_mix || m.size_mib)})${
+        m.from_card ? "  · stored card, not on disk"
+                    : (m.n_ctx_train ? "  · " + ctxLabel(m.n_ctx_train) + " ctx" : "")
+        }</option>`).join("");
+    const onDisk = MODELS.length - (r.n_cards || 0);
     $("scanhint").textContent = MODELS.length
-      ? MODELS.length + " GGUF found in folder" : "no .gguf found here";
+      ? onDisk + " GGUF found in folder"
+        + (r.n_cards ? " + " + r.n_cards + " stored card"
+                       + (r.n_cards == 1 ? "" : "s") + " (model not on disk)" : "")
+      : "no .gguf found here";
   }catch(e){ $("scanhint").textContent = "scan failed: " + e; }
 }
 
@@ -233,7 +240,12 @@ async function run(){
     safety_pct: parseFloat($("safety").value) || 0,
     kv_on_gpu: $("kvgpu").checked,
     gpu_layers_override: $("ngl").value.trim() === "" ? null : parseInt($("ngl").value),
-    ram_free_mib: (SYS && SYS.ram) ? SYS.ram.free_mib : null
+    ram_free_mib: (SYS && SYS.ram) ? SYS.ram.free_mib : null,
+    // Only sent when "Plan for images" is ticked. Absent means a text-only plan,
+    // which the server warns about rather than guessing a size on the user's behalf.
+    image_w: $("visionplan").checked ? (parseInt($("imagew").value) || 1024) : null,
+    image_h: $("visionplan").checked ? (parseInt($("imageh").value) || 1024) : null,
+    vision_flash_attn: $("visionfa").checked
   };
   const btn = $("goBtn");
   btn.disabled = true;
@@ -315,7 +327,14 @@ function renderVerdict(r){
   const cal = r.calibration && r.calibration.calibrated
     ? h`The compute buffer is <b style="color:var(--kv)">calibrated for your GPU</b> from ${
         r.calibration.n} measurement${r.calibration.n == 1 ? "" : "s"} (${
-        r.calibration.free.join(", ")} fitted, in-sample ${r.calibration.residual_pct}%). `
+        r.calibration.free.join(", ")} fitted, in-sample ${r.calibration.residual_pct}%)${
+        r.calibration.when ? ", fitted " + new Date(r.calibration.when * 1000)
+          .toLocaleDateString(undefined, {year:"numeric", month:"short", day:"numeric"}) : ""
+        }. These coefficients are frozen until you press <b>Measure running model</b> again, so
+        the same plan always gives the same numbers. ` +
+      (r.calibration.outdated
+        ? h`<b style="color:var(--warn)">The stored fit may not match this machine:</b> ${
+            r.calibration.outdated}. ` : "")
     : "The compute buffer uses shipped defaults, fitted to 146 measured llama.cpp loads over 5 " +
       "models. Held out by architecture it scores 22.5% mean / 85.6% worst on the buffer alone, " +
       "and the whole plan lands at 7.6% mean / 39.6% worst against the process counter. It is " +
@@ -491,6 +510,22 @@ function renderBreakdown(r){
         '  <span class="muted">host memory, not VRAM</span>'))}
       ${raw(r.mmproj ? brow("Vision projector (" + esc(r.mmproj.name) + ")",
         fmt(r.mmproj.mib) + (r.mmproj.included ? "" : '  <span class="muted">not loaded</span>')) : "")}
+      ${raw(r.vision && r.vision.peak ? brow(
+        "Vision encoder peak (" + num(r.vision.grid.width) + "&times;" + num(r.vision.grid.height) +
+        ", " + num(r.vision.grid.n_patches) + " patches)",
+        fmt(r.vision.peak.total_mib) +
+        '  <span class="muted">transient, derived not measured</span>') : "")}
+      ${raw(r.vision && r.vision.peak ? brow(
+        "&nbsp;&nbsp;attention scores (quadratic in patches)",
+        fmt(r.vision.peak.scores_mib) + (r.vision.peak.flash_attn
+          ? '  <span class="muted">fused away</span>'
+          : '  <span class="muted">' +
+            Math.round(100 * r.vision.peak.scores_mib / Math.max(1, r.vision.peak.total_mib)) +
+            '% of the peak</span>')) : "")}
+      ${raw(r.vision && r.vision.peak ? brow("&nbsp;&nbsp;activations + FFN",
+        fmt(r.vision.peak.act_mib + r.vision.peak.ffn_mib)) : "")}
+      ${raw(r.vision && r.vision.peak ? brow("&nbsp;&nbsp;image tokens added to context",
+        num(r.vision.peak.image_tokens) + " tok") : "")}
       ${raw(brow("File on disk", fmtG(s.file_on_disk) + "  (" + fmtGB(s.file_on_disk) + ")"))}
       ${raw(r.mmproj ? brow("&nbsp;&nbsp;+ projector = LM Studio's &quot;model size&quot;",
         fmtG(s.bundle_on_disk) + "  (" + fmtGB(s.bundle_on_disk) + ")") : "")}
@@ -509,6 +544,10 @@ function render(r){
     $("mmprojhint").innerHTML = h`${r.mmproj.name} &middot; ${fmt(r.mmproj.mib)
       } of VRAM. LM Studio loads it with the model and includes it in the size it shows.`;
   }
+  // The image controls only mean anything for a projector with a VISION tower -
+  // an audio-only mmproj has no patch grid to size.
+  $("visionrow").hidden = !(r.vision && r.vision.config);
+  $("visioninputs").hidden = !$("visionplan").checked;
   $("out").innerHTML = renderVerdict(r) + renderWarnings(r) + renderSettings(r) +
                        renderSpeed(r) + renderSummary(r) + renderKvTable(r) + renderBreakdown(r);
   if(r.speed && !r.speed.error) loadSpeedHistory(r);
@@ -699,10 +738,13 @@ async function calibrate(){
   const fit = st.calibrated
     ? h`<b style="color:var(--kv)">Calibrated</b> from ${st.n} measurement${st.n == 1 ? "" : "s"}
         on this GPU &mdash; fitted: ${st.free.join(", ")} (in-sample ${st.residual_pct}%).` +
+      h`<br><span class="muted">Saved &mdash; these coefficients are now frozen and will not
+        change on their own. Measuring again is the only thing that refits them.</span>` +
       (st.skipped_rows ? h`<br><span class="muted">${st.skipped_rows} stored measurement${
         st.skipped_rows == 1 ? " was" : "s were"} left out: the reading did not respond to the
         config, or the layer count was never recorded. Re-measure with VRAM to spare to bring
-        them back.</span>` : "")
+        them back.</span>` : "") +
+      (st.outdated ? h`<br><span style="color:var(--warn)">${st.outdated}</span>` : "")
     : '<b style="color:var(--warn)">Recorded, but not fitted yet.</b> The measurement is saved; ' +
       'it did not produce a usable fit on its own, so the shipped defaults still apply. ' +
       'Measure once more at a different context length.';
@@ -756,6 +798,11 @@ document.addEventListener("click", ev => {
 
 $("controls").addEventListener("submit", ev => { ev.preventDefault(); run(); });
 $("ctx").addEventListener("input", markCtx);
+// Reveal the image-size inputs as soon as the box is ticked, before the next plan
+// runs - the controls appearing only after a re-plan reads as the tick not working.
+$("visionplan").addEventListener("change", () => {
+  $("visioninputs").hidden = !$("visionplan").checked;
+});
 $("model").addEventListener("change", onPick);
 $("dir").addEventListener("keydown", ev => { if(ev.key === "Enter"){ ev.preventDefault(); scanModels(); } });
 

@@ -358,6 +358,66 @@ than 10x from the prior, or negative, is rejected in favour of the default. Rows
 keyed by GPU **and** llama.cpp build, so upgrading the backend does not silently reuse a
 fit that no longer applies.
 
+### The fit is frozen once made
+
+Measuring writes the fitted coefficients to the store, and **nothing recomputes them on
+its own** — not starting the server, not importing the package, not adding rows. The
+same plan gives the same numbers today and next week.
+
+This matters more than it sounds. When the fit was derived on demand, it was a function
+of whatever the store happened to contain at that instant, so pressing Measure in one
+window moved the coefficients under a plan already on screen in another, and a schema
+bump re-derived `overhead_mib` on every stored row at import. Two runs of one config
+disagreed with nothing in the config having changed, which is indistinguishable from a
+bug in the model.
+
+Only two things refit: pressing **Measure running model**, and `--recalibrate`.
+
+```
+python -m vram_planner --show-calibration    # the stored fit and where it came from
+python -m vram_planner --recalibrate         # refit from stored rows, save, exit
+```
+
+A fit made under a different llama.cpp build, or by an older version of the fitter, is
+**reported as outdated** in the terminal and the UI rather than silently replaced —
+whether the numbers change is your call, not the tool's.
+
+## Model cards — planning without the weights
+
+`analyze()` touches the `.gguf` for exactly three things: the config, the per-layer
+tensor byte sums, and the projector next to it. All three are pure functions of the
+header and tensor table, and together they are a few kilobytes. Everything after them is
+arithmetic.
+
+So they get cached as a **model card**, automatically, every time a model is read — about
+8 KB each. When the file is gone, the card stands in:
+
+```
+python -m vram_planner --cards                 # what is stored
+python -m vram_planner --add-card path/to.gguf # record one explicitly
+python -m vram_planner --forget-card NAME.gguf # drop one
+```
+
+This means you can plan for a model you have **deleted**, or one you have not downloaded
+yet — copy its card in — and on a machine that never held the weights at all. Cards for
+models not on disk appear in the UI dropdown marked `○ … stored card, not on disk`, and
+any plan built from one carries a warning saying so.
+
+A card is not an approximation. It is the same three structures the file would have
+produced, so a plan from a card is **identical to the plan from the file** — the
+self-test asserts equality across every plan, config and speed key, not a sampled few.
+The `CARD` check exists because the failure mode is silent: JSON has no integer keys, so
+`per_layer_bytes` round-trips as `{"0": n}` and every lookup misses, which reads as a
+model with no layers rather than as an error.
+
+Cards are keyed by **file name**. Two genuinely different models sharing one name is the
+single thing this cannot survive; a name whose size no longer matches is treated as stale
+and rebuilt from the file.
+
+They also rescue calibration rows. A stored measurement whose model has since been
+deleted used to be stranded permanently on the next schema bump, because `overhead_mib`
+could not be re-derived without the file. With a card it can.
+
 ## Measuring it yourself
 
 The accuracy numbers above are reproducible on your own hardware, and the model can be
@@ -405,11 +465,34 @@ in the grid does not interpolate.
   growth at all. Neither affects full-offload planning, which is what these models are
   normally run with, and both are bounded.
 
+- **Vision encoder transients are derived, not measured.** The projector's *weights*
+  are exact (mmproj tensor bytes, charged off the top of the budget). Its
+  *activations* — the pool the ViT needs while encoding an image — are computed from
+  the tower's geometry and nothing else: no sweep backs them, so they are an order of
+  magnitude rather than a prediction. They are also charged deliberately high (f32
+  scores, attention unfused), because under-charging is the failure mode that makes a
+  plan overcommit. Only reserved when you give an image size; without one the plan is
+  text-only and says so.
+
 ## Tips
 
 - Keep the model inside **dedicated** VRAM. On Windows, spilling past it uses "shared
   GPU memory" (system RAM as VRAM) and is very slow — turn on LM Studio's
   **"Limit to Dedicated GPU Memory"**.
+- **A vision model that fits can still OOM on an image**, and *whether the tower fuses
+  attention decides by how much*. Unfused, the encoder is quadratic in pixels — the
+  score matrix is `n_head × n_patches²`, and a 2560×1600 screenshot at 16px patches is
+  16,000 patches, several GiB. Fused, that term vanishes and the same image costs a few
+  hundred MiB. On Qwen3.6-27B the planner brackets it at **342 MiB fused vs 15,967
+  unfused — a 47× swing**, which is the entire uncertainty in the estimate.
+  `clip.cpp` resolves `CLIP_FLASH_ATTN_TYPE_AUTO` by probing the backend, not by model,
+  so read your load log's `flash attention is enabled/disabled` line rather than
+  guessing. On CUDA it is normally enabled: the SigLIP tower these models share is head
+  dim 72, which `fattn.cu` supports, though only off the tensor-core path.
+- **Image tokens are a context cost, not just a VRAM one.** After the spatial merge a
+  2560×1600 image is 4,000 tokens — an eighth of a 32k context per screenshot, with the
+  KV and prefill to match. Downscaling to ~1024px on the long edge cuts that to 640 and
+  is the cheapest fix available whether or not attention is fused.
 - **KV cache is what grows with context.** If a model won't fit, the KV-vs-context
   table shows exactly what dropping to 8k/16k buys you. Quantizing the KV cache
   (q8_0 = about half of f16) needs **Flash Attention ON**.

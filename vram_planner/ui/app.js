@@ -320,7 +320,14 @@ function renderVerdict(r){
   const cal = r.calibration && r.calibration.calibrated
     ? h`The compute buffer is <b style="color:var(--kv)">calibrated for your GPU</b> from ${
         r.calibration.n} measurement${r.calibration.n == 1 ? "" : "s"} (${
-        r.calibration.free.join(", ")} fitted, in-sample ${r.calibration.residual_pct}%). `
+        r.calibration.free.join(", ")} fitted, in-sample ${r.calibration.residual_pct}%)${
+        r.calibration.when ? ", fitted " + new Date(r.calibration.when * 1000)
+          .toLocaleDateString(undefined, {year:"numeric", month:"short", day:"numeric"}) : ""
+        }. These coefficients are frozen until you press <b>Measure running model</b> again, so
+        the same plan always gives the same numbers. ` +
+      (r.calibration.outdated
+        ? h`<b style="color:var(--warn)">The stored fit may not match this machine:</b> ${
+            r.calibration.outdated}. ` : "")
     : "The compute buffer uses shipped defaults, fitted to 146 measured llama.cpp loads over 5 " +
       "models. Held out by architecture it scores 22.5% mean / 85.6% worst on the buffer alone, " +
       "and the whole plan lands at 7.6% mean / 39.6% worst against the process counter. It is " +
@@ -724,10 +731,13 @@ async function calibrate(){
   const fit = st.calibrated
     ? h`<b style="color:var(--kv)">Calibrated</b> from ${st.n} measurement${st.n == 1 ? "" : "s"}
         on this GPU &mdash; fitted: ${st.free.join(", ")} (in-sample ${st.residual_pct}%).` +
+      h`<br><span class="muted">Saved &mdash; these coefficients are now frozen and will not
+        change on their own. Measuring again is the only thing that refits them.</span>` +
       (st.skipped_rows ? h`<br><span class="muted">${st.skipped_rows} stored measurement${
         st.skipped_rows == 1 ? " was" : "s were"} left out: the reading did not respond to the
         config, or the layer count was never recorded. Re-measure with VRAM to spare to bring
-        them back.</span>` : "")
+        them back.</span>` : "") +
+      (st.outdated ? h`<br><span style="color:var(--warn)">${st.outdated}</span>` : "")
     : '<b style="color:var(--warn)">Recorded, but not fitted yet.</b> The measurement is saved; ' +
       'it did not produce a usable fit on its own, so the shipped defaults still apply. ' +
       'Measure once more at a different context length.';

@@ -707,6 +707,77 @@ def self_test(require_refs=False):
              not any(r.get("unreliable") for r in moving), "OK" if flat_ok else "FAIL"))
     ok = ok and flat_ok
 
+    # 9c) THE FREEZE. calib_coeffs() must be a pure read: the same call, twice,
+    #     with the store changing underneath, has to return the same numbers.
+    #     Before the fit was stored, every call refitted from whatever rows
+    #     happened to be present, so pressing Measure in the UI - or a schema bump
+    #     re-deriving overhead_mib on every row - silently moved the coefficients
+    #     of a plan already on screen. The symptom is a planner that reports two
+    #     different answers for one config minutes apart, which is indistinguish-
+    #     able from a bug in the model itself.
+    import json as _json, tempfile as _tf, vram_planner.calib as _cal
+    _saved_cache, _saved_loaded = dict(_CALIB_CACHE), _cal._CALIB_LOADED
+    _saved_store = _cal._calib_store
+    _tmp = os.path.join(_tf.gettempdir(), "vram_planner_calfrz_store.json")
+    def _row(ngl, overhead):
+        return dict(synth(32768, 512, True, ngl=ngl), model="frz.gguf", gpu="g",
+                    backend=current_backend(), exact_mib=10000.0,
+                    measured_mib=10000.0 + overhead, overhead_mib=overhead)
+    try:
+        _cal._calib_store = lambda: _tmp
+        _cal._CALIB_LOADED = True                # we drive the load path by hand
+
+        # one measurement, fitted and stored
+        _json.dump({"rows": [_row(20, 520.0)], "schema": CALIB_SCHEMA},
+                   open(_tmp, "w", encoding="utf-8"))
+        _cal.refresh_calibration("g", force=True)
+        first = calib_coeffs("g")["floor"]
+        stored = _json.load(open(_tmp, encoding="utf-8")).get("fits", {}).get("g", {})
+
+        # now the rows change underneath - a Measure from another window, or a
+        # migration re-deriving overhead_mib. Reads must not notice.
+        d = _json.load(open(_tmp, encoding="utf-8"))
+        d["rows"] = [_row(20, 520.0), _row(30, 2400.0), _row(10, 90.0)]
+        _json.dump(d, open(_tmp, "w", encoding="utf-8"))
+        _cal.refresh_calibration("g")            # a read, not a refit
+        second = calib_coeffs("g")["floor"]
+
+        # ...until the refit is actually asked for.
+        _cal.refresh_calibration("g", force=True)
+        third = calib_coeffs("g")["floor"]
+
+        frozen_ok = (stored.get("coeffs", {}).get("floor") == first
+                     and second == first and third != first)
+        print("  CALFRZ fit stored=%.2f, survives new rows=%.2f, refits on demand=%.2f"
+              "  %s" % (first, second, third, "OK" if frozen_ok else "FAIL"))
+        ok = ok and frozen_ok
+
+        _CALIB_CACHE["g"] = {"n": 3, "free": ["floor"], "residual_pct": 1.0,
+                             "coeffs": dict(CB_DEFAULTS, floor=7.25),
+                             "backend": "b1", "fit_schema": _cal.CALIB_FIT_SCHEMA,
+                             "row_schema": CALIB_SCHEMA}
+
+        # ...and a fit made under a different llama.cpp build must be REPORTED as
+        # outdated, not quietly replaced. Silently refitting on a build change is
+        # exactly the drift this design removes.
+        _CALIB_CACHE["g"]["backend"] = "some-old-build"
+        stale_msg = _cal._outdated(_CALIB_CACHE["g"])
+        cur_b = current_backend()
+        # With no detectable backend there is nothing to compare, so no claim.
+        stale_ok = bool(stale_msg) if cur_b else stale_msg == ""
+        print("  CALFRZ build change reported not applied: %s  %s"
+              % (("%r" % stale_msg[:38]) if stale_msg else "no backend to compare",
+                 "OK" if stale_ok else "FAIL"))
+        ok = ok and stale_ok
+    finally:
+        _cal._calib_store = _saved_store
+        _CALIB_CACHE.clear()
+        _CALIB_CACHE.update(_saved_cache)
+        _cal._CALIB_LOADED = _saved_loaded
+        try: os.remove(_tmp)
+        except OSError: pass
+
+
     # 10) --n-cpu-moe must move expert bytes to the RAM side of the speed model
     rm2 = analyze(p3, 4096, "f16", 512, False, vram_budget_mib=300, ram_budget_mib=8000,
                   gpu_reserve_mib=0, compute_override_mib=5, safety_pct=0,

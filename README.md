@@ -358,6 +358,30 @@ than 10x from the prior, or negative, is rejected in favour of the default. Rows
 keyed by GPU **and** llama.cpp build, so upgrading the backend does not silently reuse a
 fit that no longer applies.
 
+### The fit is frozen once made
+
+Measuring writes the fitted coefficients to the store, and **nothing recomputes them on
+its own** — not starting the server, not importing the package, not adding rows. The
+same plan gives the same numbers today and next week.
+
+This matters more than it sounds. When the fit was derived on demand, it was a function
+of whatever the store happened to contain at that instant, so pressing Measure in one
+window moved the coefficients under a plan already on screen in another, and a schema
+bump re-derived `overhead_mib` on every stored row at import. Two runs of one config
+disagreed with nothing in the config having changed, which is indistinguishable from a
+bug in the model.
+
+Only two things refit: pressing **Measure running model**, and `--recalibrate`.
+
+```
+python -m vram_planner --show-calibration    # the stored fit and where it came from
+python -m vram_planner --recalibrate         # refit from stored rows, save, exit
+```
+
+A fit made under a different llama.cpp build, or by an older version of the fitter, is
+**reported as outdated** in the terminal and the UI rather than silently replaced —
+whether the numbers change is your call, not the tool's.
+
 ## Measuring it yourself
 
 The accuracy numbers above are reproducible on your own hardware, and the model can be

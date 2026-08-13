@@ -14,17 +14,54 @@ _CALIB_CACHE = {}                     # (gpu, backend) key -> fitted coefficient
 _CALIB_LOADED = False                 # the store is read once, lazily
 
 
+# ---------------------------------------------------------------------------
+# The fit is stored, not recomputed
+# ---------------------------------------------------------------------------
+# A fit used to be derived on demand from the rows, every process start. That
+# makes the planner's output a function of the store's *current* contents rather
+# than of anything the user chose, and the store moves on its own: pressing
+# Measure adds a row, and a schema bump silently re-derives `overhead_mib` on
+# every existing row through _recompute_overheads(). The visible symptom is the
+# same call returning different numbers minutes apart, with nothing in the plan
+# having changed - which is indistinguishable from a bug in the model.
+#
+# So the fitted coefficients are now a stored artefact with provenance, and
+# fitting happens only when someone asks for it: a Measure, or --recalibrate.
+# Reading the store never refits. The fit records the build and schema it was
+# made under, so one that no longer matches this machine is REPORTED as
+# outdated rather than quietly replaced.
+CALIB_FIT_SCHEMA = 1
+
+
+def _load_fits(data=None):
+    """Stored fits, keyed by GPU name. Never fits anything."""
+    data = load_calibration() if data is None else data
+    fits = data.get("fits")
+    return dict(fits) if isinstance(fits, dict) else {}
+
+
 def _ensure_calibration():
-    """Load the store on first use. Without this, calibration only ever applied
-    inside serve(), so importing the module and calling analyze() silently fell
-    back to the shipped defaults."""
+    """Publish the stored fit on first use. Without this, calibration only ever
+    applied inside serve(), so importing the module and calling analyze()
+    silently fell back to the shipped defaults.
+
+    A store holding rows but no fit predates the stored-fit format; it is fitted
+    once here and written back, so an existing calibration is not lost on
+    upgrade. That is the only implicit fit left in the codebase."""
     global _CALIB_LOADED
-    if not _CALIB_LOADED:
-        _CALIB_LOADED = True          # set first: a failed load must not retry forever
-        try:
-            refresh_calibration()
-        except Exception:
-            pass
+    if _CALIB_LOADED:
+        return
+    _CALIB_LOADED = True              # set first: a failed load must not retry forever
+    try:
+        data = load_calibration()
+        fits = _load_fits(data)
+        if fits:
+            _CALIB_CACHE.clear()
+            _CALIB_CACHE.update(fits)
+        elif data.get("rows"):
+            refresh_calibration(force=True)
+    except Exception:
+        pass
 
 
 def calib_coeffs(gpu=None):
@@ -234,6 +271,9 @@ def _recompute_overheads(data, rows):
     for r in rows:
         if not r.get("measured_mib"):
             continue
+        # A stored card is enough to re-derive the exact terms: analyze() falls
+        # back to it by file name. Without this a deleted model stranded every
+        # row it ever produced, permanently, on the next schema bump.
         path = _model_file(r.get("model") or "")
         if not path:
             r["stale"] = ("recorded under an older model of what counts as exact, and "
@@ -453,21 +493,34 @@ def fit_calibration(rows, prior=None):
             "residual_pct": round(sum(errs) / len(errs), 1)}
 
 
-def refresh_calibration(gpu=None):
-    """Refit every GPU present in the store and publish the results.
+def refresh_calibration(gpu=None, force=False):
+    """Publish the stored fit. With force=True, refit from the rows first and
+    write the result back to the store.
 
-    Rows are also filtered by llama.cpp build: a backend upgrade changes graph
+    force=False is a READ: it loads what was fitted last time and does not touch
+    the rows, so repeated calls in one session - or across sessions - always
+    yield the same coefficients. Only an explicit Measure or --recalibrate
+    refits, which is what makes a plan reproducible.
+
+    Rows are filtered by llama.cpp build: a backend upgrade changes graph
     allocation, so mixing builds fits a curve through two different machines. If
     the current build is known and any row matches it, only those rows are used;
     otherwise everything for that GPU is used and the mismatch is reported."""
+    if not force:
+        fits = _load_fits()
+        _CALIB_CACHE.clear()
+        _CALIB_CACHE.update(fits)
+        return _CALIB_CACHE.get(gpu if gpu is not None else _active_gpu())
+
     data = load_calibration()
-    if migrate_calibration(data):
-        save_calibration(data)
+    # Migration re-derives overhead_mib on every row, so it belongs here - behind
+    # the explicit refit - and not on a read path.
+    migrate_calibration(data)
     cur = current_backend()
     by_gpu = {}
     for r in data.get("rows", []):
         by_gpu.setdefault(r.get("gpu") or "", []).append(r)
-    _CALIB_CACHE.clear()
+    fits = {}
     for g, rows in by_gpu.items():
         # Only drop a row when its build is KNOWN and different. Rows recorded
         # before builds were tracked carry no backend; discarding those would
@@ -478,8 +531,33 @@ def refresh_calibration(gpu=None):
         if f:
             f["stale_rows"] = stale
             f["backend"] = cur
-            _CALIB_CACHE[g] = f
+            f["when"] = int(time.time())
+            f["fit_schema"] = CALIB_FIT_SCHEMA
+            f["row_schema"] = data.get("schema") or CALIB_SCHEMA
+            fits[g] = f
+    data["fits"] = fits
+    save_calibration(data)
+    _CALIB_CACHE.clear()
+    _CALIB_CACHE.update(fits)
     return _CALIB_CACHE.get(gpu if gpu is not None else _active_gpu())
+
+
+def _outdated(f):
+    """Why the stored fit no longer matches this machine, or "".
+
+    Reported, never acted on. Silently refitting because the build moved is the
+    behaviour this design removed - the user decides when the numbers change."""
+    cur = current_backend()
+    was = f.get("backend") or ""
+    if cur and was and cur != was:
+        return ("fitted against llama.cpp build %s, this machine now runs %s - "
+                "re-measure to refit" % (was, cur))
+    if (f.get("fit_schema") or 0) != CALIB_FIT_SCHEMA:
+        return "fitted by an older version of the fitter - re-measure to refit"
+    if (f.get("row_schema") or 0) != CALIB_SCHEMA:
+        return ("fitted before the current definition of the exact terms - "
+                "re-measure to refit")
+    return ""
 
 
 def calibration_status(gpu=None):
@@ -489,11 +567,13 @@ def calibration_status(gpu=None):
     if not f:
         return {"calibrated": False, "gpu": g, "n": 0, "coeffs": dict(CB_DEFAULTS),
                 "free": [], "residual_pct": None, "stale_rows": 0,
-                "skipped_rows": 0, "backend": current_backend()}
+                "skipped_rows": 0, "backend": current_backend(),
+                "when": None, "outdated": ""}
     return {"calibrated": True, "gpu": g, "n": f["n"], "coeffs": f["coeffs"],
             "free": f["free"], "residual_pct": f["residual_pct"],
             "stale_rows": f.get("stale_rows", 0),
-            "skipped_rows": f.get("skipped_rows", 0), "backend": f.get("backend", "")}
+            "skipped_rows": f.get("skipped_rows", 0), "backend": f.get("backend", ""),
+            "when": f.get("when"), "outdated": _outdated(f)}
 
 
 def record_calibration(path, ctx, kv_type, n_ubatch, n_seq, flash_attn, ngl,
@@ -553,6 +633,8 @@ def record_calibration(path, ctx, kv_type, n_ubatch, n_seq, flash_attn, ngl,
     data["schema"] = CALIB_SCHEMA
     mark_unreliable(rows)
     save_calibration(data)
-    refresh_calibration()
+    # The one place a refit is implied rather than requested: the user just
+    # measured, so they are asking for the numbers to move.
+    refresh_calibration(force=True)
     return {"ok": True, "row": row, "status": calibration_status(row["gpu"]),
             "unreliable": row.get("unreliable", "")}

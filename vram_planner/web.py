@@ -167,6 +167,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, self._calibrate(data))
         try:
             path = data["path"]
+            # A missing file is not an error when we have a card for it - that is
+            # the whole point of the card. analyze() raises if there is neither.
             if not os.path.exists(path):
                 return self._send(200, {"ok": False, "error": "file not found: %s" % path})
             res = analyze(
@@ -212,20 +214,33 @@ class Handler(BaseHTTPRequestHandler):
 def serve(host, port, open_browser):
     httpd = ThreadingHTTPServer((host, port), Handler)
     url = "http://%s:%d/" % ("localhost" if host in ("127.0.0.1", "0.0.0.0") else host, port)
+    # A read, not a refit: the stored fit is what plans are made against until
+    # someone presses Measure or runs --recalibrate. Starting the server must
+    # not change anyone's numbers.
     refresh_calibration()
     st = calibration_status()
     plat = platform_support()
     print("\n  VRAM Planner %s  running at  %s" % (__version__, url))
     print("  models folder default :  %s" % default_models_dir())
     print("  user data             :  %s" % _data_dir())
-    print("  compute-buffer model  :  %s"
-          % ("calibrated from %d measurement(s) on %s (fitted: %s, in-sample %.1f%%)"
-             % (st["n"], st["gpu"] or "this GPU", ", ".join(st["free"]), st["residual_pct"])
-             if st["calibrated"] else
-             "shipped defaults - press Measure on a loaded model to calibrate"))
+    if st["calibrated"]:
+        import datetime
+        when = (datetime.datetime.fromtimestamp(st["when"]).strftime("%Y-%m-%d %H:%M")
+                if st.get("when") else "an earlier version")
+        print("  compute-buffer model  :  calibrated from %d measurement(s) on %s "
+              "(fitted: %s, in-sample %.1f%%)"
+              % (st["n"], st["gpu"] or "this GPU", ", ".join(st["free"]),
+                 st["residual_pct"]))
+        print("  fit frozen since      :  %s (press Measure or run --recalibrate "
+              "to refit)" % when)
+    else:
+        print("  compute-buffer model  :  shipped defaults - press Measure on a "
+              "loaded model to calibrate")
     if st.get("skipped_rows"):
         print("  measurements skipped  :  %d (reading did not respond to the config, or "
               "no layer count recorded)" % st["skipped_rows"])
+    if st.get("outdated"):
+        print("\n  !! STORED FIT MAY NOT MATCH THIS MACHINE\n     %s" % st["outdated"])
     if not plat["supported"]:
         print("\n  !! UNVALIDATED PLATFORM\n     %s" % plat["reason"])
     print("  press Ctrl+C to stop\n")

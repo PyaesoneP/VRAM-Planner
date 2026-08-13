@@ -1,5 +1,5 @@
 """Argument parsing and the process entry point."""
-import argparse, sys
+import argparse, datetime, sys
 from .const import __version__
 from .web import serve
 from .selftest import self_test
@@ -33,7 +33,35 @@ def main():
     ap.add_argument("--fit", action="store_true",
                     help="score the compute-buffer model against recorded sweep data, "
                          "held out - see --sweep")
+    ap.add_argument("--recalibrate", action="store_true",
+                    help="refit the compute-buffer coefficients from the stored "
+                         "measurements and save them. The fit is otherwise frozen: "
+                         "nothing else refits it except pressing Measure")
+    ap.add_argument("--show-calibration", action="store_true",
+                    help="print the stored fit and where it came from, change nothing")
     args = ap.parse_args()
+    if args.show_calibration or args.recalibrate:
+        from .calib import calibration_status, refresh_calibration
+        if args.recalibrate:
+            refresh_calibration(force=True)
+        st = calibration_status()
+        if not st["calibrated"]:
+            print("no stored fit for %s - the shipped defaults are in use.\n"
+                  "Load a model in LM Studio and press Measure to make one."
+                  % (st["gpu"] or "this GPU"))
+            sys.exit(1)
+        print("GPU        : %s" % st["gpu"])
+        print("fitted     : %s from %d measurement(s)"
+              % (datetime.datetime.fromtimestamp(st["when"]).strftime("%Y-%m-%d %H:%M")
+                 if st.get("when") else "unknown", st["n"]))
+        print("build      : %s" % (st["backend"] or "unknown"))
+        print("free terms : %s (in-sample %.1f%%)"
+              % (", ".join(st["free"]), st["residual_pct"]))
+        for k, v in sorted(st["coeffs"].items()):
+            print("  %-6s %s" % (k, v))
+        if st["outdated"]:
+            print("\n!! %s" % st["outdated"])
+        sys.exit(0)
     if args.fit:
         from .fit import report
         sys.exit(0 if report() else 1)

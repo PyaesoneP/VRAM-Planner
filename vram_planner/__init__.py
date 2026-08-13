@@ -79,11 +79,12 @@ from .lmstudio import (scan_speed_history, scan_server_logs, benchmark_server,
                        _lmstudio_home, REF_GPU, REF_BACKEND)
 from .speed import GPU_EFF, RAM_EFF_HI, RAM_EFF_LO, per_token_bytes, estimate_speed
 from .calib import (CALIB_TERMS, CALIB_SCHEMA, CALIB_MIN_SPREAD, CALIB_MIN_FREE_MIB,
-                    CALIB_FLAT_RATIO, CALIB_FLAT_MIN_MIB, calib_coeffs,
+                    CALIB_FLAT_RATIO, CALIB_FLAT_MIN_MIB, CALIB_FIT_SCHEMA,
+                    calib_coeffs,
                     load_calibration, save_calibration, migrate_calibration,
                     mark_unreliable, fit_calibration, refresh_calibration,
                     calibration_status, record_calibration, _calib_store, _row_flags,
-                    _design, _struct_offset, _active_gpu)
+                    _design, _struct_offset, _active_gpu, _load_fits, _outdated)
 from .plan import analyze, find_mmproj
 from .web import serve, Handler, read_ui
 from .selftest import self_test

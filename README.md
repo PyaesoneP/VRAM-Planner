@@ -74,6 +74,8 @@ python -m vram_planner --self-test --require-refs
                                           # ...and fail if a real-load check is skipped
 python -m vram_planner --version
 python -m vram_planner --sweep --dry-run  # what --sweep would run (see Measuring it yourself)
+python -m vram_planner --speed-sweep      # measure tok/s across configs (see Measuring speed)
+python -m vram_planner --speed-report     # every measured config, fastest first
 ```
 
 Calibration and benchmark history live in `%LOCALAPPDATA%\vram-planner\`
@@ -97,14 +99,16 @@ every number has one home:
 | `calib` | fitting `compute` to this machine's measurements |
 | `plan` | `analyze()` and the layer-split planners |
 | `sweep` | driving `llama-server` across a config grid, recording what it allocates |
+| `bench` | driving it across a grid and recording how fast it **generates** |
 | `fit` | scoring `compute` against sweep data, held out |
 | `web` | JSON endpoints and static file serving |
 | `ui/` | `index.html`, `app.css`, `app.js` — the front end, as real files |
 | `selftest` | synthetic GGUFs and the test suite |
 | `cli` | entry point |
 
-`sweep` and `fit` are the evidence base, not part of a plan — nothing above imports
-them and the tool works without ever running either. See **Measuring it yourself**.
+`sweep`, `bench` and `fit` are the evidence base, not part of a plan — nothing above
+imports them and the tool works without ever running any of them. See **Measuring it
+yourself** and **Measuring speed**.
 
 Three edges run backwards and are imported inside the function that needs them:
 `compute.compute_buffer_terms` reads `calib.calib_coeffs`, `calib.record_calibration`
@@ -437,6 +441,45 @@ rather than dropped; a load taken with the card at the wall, where Windows spill
 shared memory and the counter reports the cap instead of the need, is detected and
 excluded from fitting. `--probe MODEL ctx=A,B,C` runs an explicit ladder when something
 in the grid does not interpolate.
+
+## Measuring speed
+
+The roofline above predicts decode from bytes and bandwidth. Two settings move real
+tok/s a long way and are invisible to it, so there is a second harness for them:
+
+- **Speculative decoding.** `speed.py` has no acceptance-rate term, and
+  `per_token_bytes()` skips MTP blocks because they do not run during ordinary decode.
+  The planner can price what speculation *costs* — an f16 draft cache, whatever
+  `--cache-type-k` says — and nothing of what it saves.
+- **Prompt processing**, which is not modelled anywhere here on purpose.
+
+```
+python -m vram_planner --speed-sweep --dry-run     # the grid and the estimate
+python -m vram_planner --speed-sweep               # hours; resumable
+python -m vram_planner --speed-report              # every row, fastest first
+python -m vram_planner --speed-sweep --speed-axes "ngl=28,30 spec=draft-mtp spec_n_max=1,2,3"
+```
+
+It launches `llama-server` per config, sizes the prompt with the server's own
+`/tokenize` so "32k of context" means 32k, runs **one cold pass** (that is the prefill
+measurement) and then **three cache-warm passes** (pure decode, median reported), and
+stores the whole `timings` block — including `draft_n` / `draft_n_accepted`, so a
+speculative result arrives with the acceptance rate that explains it.
+
+Rows go to `speed/`, **not** `sweeps/`. That separation is load-bearing: `fit.py` globs
+every `.jsonl` under `sweeps/` and fits anything `suspect_reason()` accepts, and
+`compute.py` has no term for a draft cache — those megabytes would be absorbed into
+`floor` and `ctx` and quietly corrupt every future plan.
+
+Two traps it is built around. The filler prompt is this repository's own README and
+sources, snapshotted once per process: real prose and code, because a prompt built by
+repeating one paragraph hands n-gram speculation a result it could never reproduce on
+real work, and re-reading a live working tree mid-campaign makes early and late rows
+incomparable. And each row records a sample of what was generated plus a
+`distinct_ratio` over its 8-word windows, because `temperature 0` with `ignore_eos` can
+put a model in a repetition loop, which is exactly what n-gram speculation predicts
+perfectly — the ratio is how you tell a real speculative win from an artefact of the
+harness.
 
 ## Known issues
 

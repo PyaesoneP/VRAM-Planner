@@ -31,6 +31,25 @@ def main():
     ap.add_argument("--probe", nargs="+", metavar="MODEL AXIS=V,V",
                     help="run an explicit config ladder on one model, e.g. "
                          "--probe gemma ctx=20480,24576,32768")
+    ap.add_argument("--speed-sweep", action="store_true",
+                    help="drive llama-server across a config grid and record how "
+                         "fast it GENERATES - speculative decoding and prefill are "
+                         "not modelled anywhere in this tool, so they can only be "
+                         "measured. Rows go to speed/, never to sweeps/")
+    ap.add_argument("--speed-axes", nargs="+", default=None, metavar="AXIS=V,V",
+                    help="with --speed-sweep: run an explicit ladder instead of the "
+                         "staged grid, e.g. --speed-axes ngl=26,28,30 spec=none")
+    ap.add_argument("--speed-stages", default="abcd", metavar="LETTERS",
+                    help="with --speed-sweep: which stages to run (a=ngl wall, "
+                         "b=projector placement, c=ubatch, d=speculation)")
+    ap.add_argument("--speed-fill", type=int, default=None, metavar="TOKENS",
+                    help="with --speed-sweep: prompt length to measure at")
+    ap.add_argument("--speed-report", action="store_true",
+                    help="print every recorded speed row, fastest first")
+    ap.add_argument("--n-predict", type=int, default=128,
+                    help="with --speed-sweep: tokens generated per measured pass")
+    ap.add_argument("--repeat", type=int, default=3,
+                    help="with --speed-sweep: measured passes per config (median)")
     ap.add_argument("--fit", action="store_true",
                     help="score the compute-buffer model against recorded sweep data, "
                          "held out - see --sweep")
@@ -101,6 +120,19 @@ def main():
         if st["outdated"]:
             print("\n!! %s" % st["outdated"])
         sys.exit(0)
+    if args.speed_report:
+        from .bench import report as speed_report
+        sys.exit(0 if speed_report() else 1)
+    if args.speed_sweep:
+        from .bench import speed_sweep         # deferred: needs subprocess work
+        from .sweep import parse_overrides
+        axes = parse_overrides(args.speed_axes) if args.speed_axes else None
+        r = speed_sweep(models=args.models, backend=args.backend,
+                        dry_run=args.dry_run, timeout=args.sweep_timeout,
+                        limit=args.limit, axes=axes, stages=args.speed_stages,
+                        fill=args.speed_fill, n_predict=args.n_predict,
+                        repeat=args.repeat)
+        sys.exit(0 if r else 1)
     if args.fit:
         from .fit import report
         sys.exit(0 if report() else 1)

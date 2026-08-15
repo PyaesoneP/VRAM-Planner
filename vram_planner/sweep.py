@@ -20,7 +20,7 @@ OOM is a hard upper bound on what fits, and it is the one observation the old
 Measure-button store could never contain: you cannot press Measure on a load that
 never started.
 """
-import json, os, re, subprocess, sys, time
+import contextlib, json, os, re, subprocess, sys, time
 from .const import MiB
 from .gguf import load_gguf
 from .model import extract_config
@@ -223,34 +223,97 @@ def build_argv(exe, model_path, c, port):
     """The full command line for one config.
 
     -fa takes on|off|auto in current builds, not a bare boolean, and passing it as
-    a flag silently swallows the next argument."""
+    a flag silently swallows the next argument.
+
+    Every key past the six the allocation grid uses is optional and absent by
+    default, so a config written by build_grid() produces exactly the command line
+    it always did. The extras exist for bench.py, which measures generation rather
+    than allocation and therefore needs the projector, the speculation flags, and
+    a warmup pass."""
     av = [exe, "-m", model_path,
           "-c", str(c["ctx"]), "-ub", str(c["ub"]), "-np", str(c["seq"]),
           "-ngl", str(c["ngl"]),
           "-fa", "on" if c["fa"] else "off",
           "-ctk", c["kv"], "-ctv", c["kv"],
           "--host", "127.0.0.1", "--port", str(port),
-          "--no-warmup",          # we want the allocation, not a generated token
           "--cache-ram", "0",     # host-side prompt cache; noise for our purposes
           "-v"]
+    if not c.get("warmup"):
+        # right for an allocation probe - we want the allocation, not a generated
+        # token - and wrong for a speed one, where the first generation would
+        # otherwise pay for lazily-loaded kernels
+        av.append("--no-warmup")
     if c.get("ncmoe"):
         av += ["--n-cpu-moe", str(c["ncmoe"])]
+    if c.get("mmproj"):
+        av += ["--mmproj", c["mmproj"]]
+        # The projector's 885 MiB can live in system RAM instead of VRAM. Images
+        # then encode more slowly, but nothing changes for text tokens - so on a
+        # card this tight it can buy back several GPU blocks without giving up
+        # vision. Absent means the llama.cpp default, which is to offload it.
+        if c.get("mmproj_offload") is False:
+            av.append("--no-mmproj-offload")
+    spec = c.get("spec")
+    if spec and spec != "none":
+        # --draft-max was REMOVED in this build generation; the knob is
+        # --spec-draft-n-max (default 3). Passing the old name is accepted and
+        # then ignored with a deprecation line, which looks exactly like a
+        # setting that had no effect.
+        av += ["--spec-type", spec]
+        if c.get("spec_n_max"):
+            av += ["--spec-draft-n-max", str(c["spec_n_max"])]
+        if c.get("spec_n_min"):
+            av += ["--spec-draft-n-min", str(c["spec_n_min"])]
     return av
 
 
-def run_one(backend, model_path, c, port=8231, timeout=420.0, settle=2.0, log_dir=None):
-    """Launch one config, read what the allocator reports, kill it.
+class _Server:
+    """One launched llama-server, plus everything read out of its startup log.
+
+    `status` is "ok" only when the ready line appeared; "oom", "exit" and
+    "timeout" describe the ways it did not."""
+
+    def __init__(self, port, log_path):
+        self.port = port
+        self.log_path = log_path
+        self.proc = None
+        self.status = "error"
+        self.error = None
+        self.exit_code = None
+        self.parsed = {}
+        self.proc_vram = None
+        self.free_before = None
+        self.load_s = 0.0
+
+    @property
+    def ok(self):
+        return self.status == "ok"
+
+    @property
+    def url(self):
+        return "http://127.0.0.1:%d" % self.port
+
+
+@contextlib.contextmanager
+def serve(backend, model_path, c, port=8231, timeout=420.0, settle=2.0,
+          log_dir=None, log_name="run.log"):
+    """Launch one config and hold it up for as long as the caller wants it.
+
+    Two callers want different things from the same startup: run_one() reads the
+    allocator's report and leaves immediately, while bench.py needs the server to
+    stay alive afterwards so it can generate against it. Everything up to and
+    including the ready line is identical for both, which is why it lives here.
 
     stderr goes to a file rather than a pipe: llama.cpp emits thousands of lines
     under -v and a pipe nobody drains fills its buffer and deadlocks the child
-    somewhere in the middle of loading."""
+    somewhere in the middle of loading.
+
+    The process is killed on the way out, on every path."""
     log_dir = log_dir or os.path.join(_data_dir(), "sweep-logs")
     os.makedirs(log_dir, exist_ok=True)
-    log_path = os.path.join(log_dir, "run.log")
-    row = {"status": "error", "config": dict(c),
-           "model": os.path.basename(model_path), "backend": backend["build"]}
-
-    free_before = _free_mib()
+    log_path = os.path.join(log_dir, log_name)
+    srv = _Server(port, log_path)
+    srv.free_before = _free_mib()
     t0 = time.time()
     with open(log_path, "wb") as fh:
         kw = {}
@@ -258,60 +321,87 @@ def run_one(backend, model_path, c, port=8231, timeout=420.0, settle=2.0, log_di
             # so terminate() cannot take our own console down with it
             kw["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
         try:
-            p = subprocess.Popen(build_argv(backend["exe"], model_path, c, port),
-                                 stdout=subprocess.DEVNULL,
-                                 stderr=fh, cwd=backend["dir"], env=_env_for(backend), **kw)
+            srv.proc = subprocess.Popen(
+                build_argv(backend["exe"], model_path, c, port),
+                stdout=subprocess.DEVNULL,
+                stderr=fh, cwd=backend["dir"], env=_env_for(backend), **kw)
         except Exception as e:
-            row["error"] = "launch failed: %s" % e
-            return row
+            srv.error = "launch failed: %s" % e
+            srv.load_s = round(time.time() - t0, 1)
+            yield srv
+            return
 
-        proc_vram, parsed = None, {}
+        p = srv.proc
         try:
             while True:
                 if time.time() - t0 > timeout:
-                    row["status"], row["error"] = "timeout", "no ready line in %.0fs" % timeout
+                    srv.status = "timeout"
+                    srv.error = "no ready line in %.0fs" % timeout
                     break
                 rc = p.poll()
-                text = _read(log_path)
-                parsed = parse_log(text)
-                if parsed["ready"]:
+                srv.parsed = parse_log(_read(log_path))
+                if srv.parsed["ready"]:
                     # let the allocator settle before reading the process counter
                     time.sleep(settle)
-                    proc_vram = _proc_vram(p.pid)
-                    row["status"] = "ok"
+                    srv.proc_vram = _proc_vram(p.pid)
+                    srv.status = "ok"
                     break
                 if rc is not None:
-                    row["status"] = "oom" if parsed["oom"] else "exit"
-                    row["exit_code"] = rc
+                    srv.status = "oom" if srv.parsed["oom"] else "exit"
+                    srv.exit_code = rc
                     break
                 time.sleep(0.5)
+            srv.load_s = round(time.time() - t0, 1)
+            yield srv
         finally:
             _kill(p)
 
-    row["load_s"] = round(time.time() - t0, 1)
-    row["log"] = parse_log(_read(log_path)) if not parsed else parsed
-    if row["status"] == "ok":
+
+def finish_row(row, srv, log_dir=None):
+    """Fold a finished _Server into a result row: the VRAM split, the floor, and
+    whether the measurement is trustworthy. Shared by run_one() and bench.py so
+    both produce rows suspect_reason() and fit.py can read the same way."""
+    if srv.error:
+        row["error"] = srv.error
+    if srv.exit_code is not None:
+        row["exit_code"] = srv.exit_code
+    row["status"] = srv.status
+    row["load_s"] = srv.load_s
+    row["log"] = srv.parsed or parse_log(_read(srv.log_path))
+    if srv.ok:
         gpu_alloc, host_alloc = gpu_side(row["log"]["buffers"])
         row["alloc_gpu_mib"] = gpu_alloc
         row["alloc_host_mib"] = host_alloc
-        row["proc_vram_mib"] = proc_vram
+        row["proc_vram_mib"] = srv.proc_vram
         # The floor: what the process holds that the allocator never reports.
         # Negative would mean the counter read low, which happens if we sampled
         # before allocation settled - keep it, do not clamp, so it shows up as bad
         # data rather than as a plausible small number.
-        row["floor_mib"] = (round(proc_vram - gpu_alloc, 1)
-                            if proc_vram is not None else None)
-    row["gpu_free_before_mib"] = free_before
+        row["floor_mib"] = (round(srv.proc_vram - gpu_alloc, 1)
+                            if srv.proc_vram is not None else None)
+    row["gpu_free_before_mib"] = srv.free_before
     row["gpu_free_after_mib"] = _free_mib()
     row["gpu_total_mib"] = _total_mib()
     row["suspect"] = suspect_reason(row)
     if log_dir and row["status"] != "ok":
         # keep the evidence for anything that did not work
         try:
-            os.replace(log_path, os.path.join(log_dir, "fail-%d.log" % int(time.time())))
+            os.replace(srv.log_path,
+                       os.path.join(log_dir, "fail-%d.log" % int(time.time())))
         except OSError:
             pass
     return row
+
+
+def run_one(backend, model_path, c, port=8231, timeout=420.0, settle=2.0, log_dir=None):
+    """Launch one config, read what the allocator reports, kill it."""
+    log_dir = log_dir or os.path.join(_data_dir(), "sweep-logs")
+    row = {"status": "error", "config": dict(c),
+           "model": os.path.basename(model_path), "backend": backend["build"]}
+    with serve(backend, model_path, c, port=port, timeout=timeout, settle=settle,
+               log_dir=log_dir) as srv:
+        pass
+    return finish_row(row, srv, log_dir=log_dir)
 
 
 def _read(path):
@@ -486,8 +576,16 @@ def sweep_path(gpu_name, build):
 
 
 def _key(model, c):
+    """Identity of one config, for resuming without re-running it.
+
+    The optional axes are read with defaults that match what an allocation-grid
+    config produces, so rows recorded before those keys existed still key the same
+    way and a resumed --sweep does not re-run the whole grid."""
     return (model, c["ctx"], c["ngl"], c["ub"], c["seq"], bool(c["fa"]),
-            c["kv"], c.get("ncmoe") or 0)
+            c["kv"], c.get("ncmoe") or 0,
+            c.get("spec") or "none", c.get("spec_n_max") or 0,
+            bool(c.get("mmproj")), c.get("mmproj_offload") is not False,
+            c.get("fill") or 0)
 
 
 def load_rows(path):
@@ -537,9 +635,9 @@ def parse_overrides(specs):
                 x = x.strip()
                 if not x:
                     continue
-                if k == "kv":
+                if k in ("kv", "spec", "mmproj"):
                     vals.append(x)
-                elif k == "fa":
+                elif k in ("fa", "mmproj_offload", "warmup"):
                     vals.append(x not in ("0", "off", "false"))
                 else:
                     vals.append(int(x))

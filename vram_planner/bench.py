@@ -23,7 +23,7 @@ absorbed into `floor` and `ctx` and quietly corrupt every future plan. Same
 format, same resume discipline, different tree.
 """
 import datetime, hashlib, json, os, re, socket, statistics, time, urllib.error, urllib.request
-from .gpu import get_gpu_processes, gpu_list
+from .gpu import get_gpu_processes, gpu_list, gpu_shared_mib
 from .lmstudio import default_models_dir
 from .paths import _data_dir
 from .sweep import (build_argv, discover_models, finish_row, model_facts,
@@ -393,6 +393,13 @@ def bench_one(backend, model_path, c, port=BENCH_PORT, timeout=420.0,
     row = {"status": "error", "config": dict(c),
            "model": os.path.basename(model_path), "backend": backend["build"],
            "speed": True, "n_predict": n_predict, "repeat": repeat}
+    # Which frozen corpus this row measured against. Everything a deep-fill
+    # number means lives or dies on this: two rows from different corpora are
+    # different experiments, and resume and every comparison below treat them
+    # that way. Stamped BEFORE the server starts, so a row that never loads -
+    # OOM, EXIT, genfail - still belongs to the campaign: resume must be able
+    # to skip a wall it already paid to discover.
+    row["prompt_id"] = prompt_identity()
     cfg = dict(c)
     cfg["warmup"] = True          # a speed run should not pay for lazy init
     # Resolved per config, not once per campaign: the collision only appears
@@ -411,11 +418,6 @@ def bench_one(backend, model_path, c, port=BENCH_PORT, timeout=420.0,
                 # unusable rows. Recorded per row because it is a property of
                 # the BACKEND, so it can differ between two rows in one file.
                 row["templated"] = bool(templated)
-                # Which frozen corpus this row measured against. Everything a
-                # deep-fill number means lives or dies on this: two rows from
-                # different corpora are different experiments, and resume and
-                # every comparison below treat them that way.
-                row["prompt_id"] = prompt_identity()
                 samp = sampling_of(c)
                 row["sampling"] = samp
                 cold = generate(srv.url, prompt, min(16, n_predict), gen_timeout,
@@ -460,6 +462,14 @@ def bench_one(backend, model_path, c, port=BENCH_PORT, timeout=420.0,
             except Exception as e:
                 row["status"] = "genfail"
                 row["gen_error"] = "%s: %s" % (type(e).__name__, e)
+            # Read INSIDE the serve() block, while the process still exists:
+            # a demotion is a property of the running process and the counter
+            # instance disappears with it. gpu_free_after_mib is read after
+            # teardown and is identical on every row for exactly that reason.
+            try:
+                row["shared_mib"] = gpu_shared_mib(srv.proc.pid)
+            except Exception:
+                row["shared_mib"] = None
     finish_row(row, srv, log_dir=log_dir)
     # finish_row takes its verdict from the server, which came up fine; a
     # generation that then failed is still a failed measurement.
@@ -472,8 +482,33 @@ def bench_one(backend, model_path, c, port=BENCH_PORT, timeout=420.0,
     # into system RAM and the load SUCCEEDS, so the row says "ok" and only the
     # numbers give it away: a negative floor, and decode falling off a cliff.
     # Naming it on the row means the ngl ladder can be read without knowing that.
-    row["spilled"] = bool(row.get("suspect")) and row.get("status") == "ok"
+    row["spilled"] = (row.get("status") == "ok"
+                      and (bool(row.get("suspect")) or demoted(row)))
     return row
+
+
+# Shared memory below this is ordinary WDDM housekeeping - a few megabytes of
+# staging and presentation buffers exist even on a process that fits easily.
+# Above it, model or cache bytes are living in system RAM and every token that
+# touches them crosses PCIe.
+SHARED_SPILL_MIB = 64.0
+
+
+def demoted(row):
+    """Did WDDM move part of this process into system RAM?
+
+    The direct reading, and the one suspect_reason() cannot make: its test is
+    `floor_mib < FLOOR_MIN_MIB`, which only catches a floor so small it is
+    nonsensical. A PARTIAL demotion leaves a perfectly plausible floor - 1114
+    MiB where its neighbours held 1360 - and sails through, while decode has
+    already fallen off a cliff. The other check, on gpu_free_after_mib, is read
+    after teardown and reports the same value on every row, so it never fires
+    at all.
+
+    None means the counters could not be read, and that is not evidence of
+    absence: an unmeasured row is not called clean."""
+    s = row.get("shared_mib")
+    return s is not None and s > SHARED_SPILL_MIB
 
 
 # ---------------------------------------------------------------------------
@@ -1253,10 +1288,12 @@ def _fmt_row(c, row, i=None, n=None):
         row.get("proc_vram_mib") or 0.0,
         ("%.0f%%" % (100 * row["accept_rate"])) if row.get("accept_rate") else "-",
         ("%.2f" % dr) if dr is not None else "-",
-        ("  SPILLED" if row.get("spilled") else "")
-        + ("  [filler repeats - speculative rate inflated]"
-           if row.get("corpus_repeated") and row["config"].get("spec") not in (None, "none")
-           else "")
+        # _degenerate_note carries the spill line now, with the megabytes and
+        # the evidence behind them, so a bare "SPILLED" here would repeat it
+        # while saying strictly less.
+        ("  [filler repeats - speculative rate inflated]"
+         if row.get("corpus_repeated") and row["config"].get("spec") not in (None, "none")
+         else "")
         + _degenerate_note(row))
 
 
@@ -1286,10 +1323,11 @@ def _degenerate_note(row):
     # backend had no /apply-template, so the model was handed raw text with
     # nothing marking it as a request. Said even when the output happens to look
     # fine, because the failure is in how the row was produced.
-    raw = "  RAW - no chat template on this build, so the model was asked " \
-          "nothing and merely continued the text" if row.get("templated") is False else ""
+    raw = ("  RAW - no chat template on this build, so the model was asked "
+           "nothing and merely continued the text"
+           if row.get("templated") is False else "")
     if not (loop or copy):
-        return raw
+        return spill_note(row) + raw
     if copy:
         what = "COPYING - %.0f%% of the output is a verbatim copy of the prompt, so" \
                % (100 * cb)
@@ -1297,9 +1335,28 @@ def _degenerate_note(row):
         what = "LOOPING - output is %.0f%% repetition, so" % (100 * (1 - dr))
     if spec and (row.get("accept_rate") or 0) >= 0.95:
         return ("  %s the %.0f%% acceptance is the %s, not the drafter; "
-                "excluded from conclusions%s"
-                % (what, 100 * row["accept_rate"], "copy" if copy else "loop", raw))
-    return "  %s excluded from conclusions%s" % (what, raw)
+                "excluded from conclusions%s%s"
+                % (what, 100 * row["accept_rate"], "copy" if copy else "loop",
+                   spill_note(row), raw))
+    return "  %s excluded from conclusions%s%s" % (what, spill_note(row), raw)
+
+
+def spill_note(row):
+    """Say WHICH kind of spill, and on what evidence.
+
+    A measured reading and an inference from the campaign's shape are both worth
+    printing, but they are not the same claim, and a row that says "SPILLED"
+    without saying why invites the reader to trust a deduction as a
+    measurement."""
+    sh = row.get("shared_mib")
+    if sh is not None and sh > SHARED_SPILL_MIB:
+        return ("  SPILLED - %.0f MiB of this process is in system RAM, so every "
+                "token that touches it crosses PCIe" % sh)
+    if row.get("spill_inferred"):
+        return ("  SPILLED - floor fell %.0f MiB below the rest of this campaign, "
+                "which is memory the driver moved out of VRAM"
+                % row["spill_inferred"])
+    return ""
 
 
 # ---------------------------------------------------------------------------
@@ -1319,7 +1376,85 @@ def load_speed_rows(path=None):
             # across them. Read-only: nothing writes these rows back.
             r["_file"] = f
             rows.append(r)
+    _infer_demotion(rows)
     return rows
+
+
+# How far a row's floor must fall below its own campaign's before the gap is a
+# demotion rather than allocator noise. The observed collapse was 246 MiB
+# against neighbours that agreed within 12 MiB of each other, so this sits well
+# clear of the noise and well under the signal.
+FLOOR_DROP_MIB = 100.0
+
+
+def _infer_demotion(rows):
+    """Mark pre-counter rows whose floor collapsed against their own campaign.
+
+    `floor` is the CUDA context plus whatever the allocator holds that llama.cpp
+    does not report, and within one campaign it is nearly constant - it moved by
+    12 MiB across five rungs of the ngl ladder. When the process hits the
+    driver's dedicated-memory budget, the next rung cannot grow: alloc_gpu rises
+    by a layer while proc_vram does NOT, and the difference comes out of floor.
+    That collapse is the demotion, visible without any counter.
+
+    Only for rows with no shared_mib. A row that carries the direct reading is
+    judged on it, because a measurement beats an inference.
+
+    What the grouping has to hold constant is everything that moves the floor
+    for a legitimate reason, and speculation is the big one: llama.cpp does not
+    report the draft KV cache in alloc_gpu, so it lands in floor and puts a
+    draft-mtp row near 1050 MiB where its non-speculative twin sits at 230. Mix
+    them and the median lands between, and EVERY ordinary row reads as a 380 MiB
+    collapse - which is exactly what the first version of this did. The
+    projector placement is the same story at ~1100 MiB, and the draft depth
+    scales the cache, so spec_n_max belongs here too.
+
+    prompt_id is in the key for the same reason it is in comparable(): a median
+    has to come from ONE campaign. Without it a fill-32768 group merged rows
+    from three separate runs - pre-freeze, the raw-continuation campaign, and a
+    smoke test - and took its baseline from all of them. floor is a memory fact
+    rather than a prompt fact, so it survives that better than tok/s would, but
+    "better" is not the standard the rest of this module holds. Note this still
+    does not isolate two campaigns that share a prompt_id on different days;
+    driver state can move the floor between them.
+
+    In memory only - nothing is written back to the store."""
+    groups = {}
+    for r in rows:
+        if r.get("status") != "ok" or r.get("floor_mib") is None:
+            continue
+        if r.get("shared_mib") is not None:
+            continue
+        c = r.get("config") or {}
+        groups.setdefault((r.get("model"), r.get("gpu"), r.get("_file"),
+                           r.get("prompt_id"),
+                           c.get("ctx"), c.get("kv"), c.get("ub"),
+                           c.get("mmproj_offload") is not False,
+                           c.get("spec") or "none", c.get("spec_n_max") or 0,
+                           c.get("fill")), []).append(r)
+    for grp in groups.values():
+        if len(grp) < 3:            # two rows cannot say which one is anomalous
+            continue
+        fl = sorted(x["floor_mib"] for x in grp)
+        mid = fl[len(fl) // 2] if len(fl) % 2 else (fl[len(fl) // 2 - 1]
+                                                   + fl[len(fl) // 2]) / 2.0
+        for r in grp:
+            if mid - r["floor_mib"] > FLOOR_DROP_MIB:
+                # Annotated, deliberately NOT gated. Two reasons, and the second
+                # one is the important one.
+                #
+                # It is the weaker evidence: a deduction from three floors, not
+                # a reading. And it can be right about the memory while being
+                # wrong about the row - the ngl 26 draft-mtp row here shows the
+                # exact collapse signature and is still the FASTEST row in its
+                # group, because one more layer on the GPU bought more than the
+                # displaced 240 MiB cost. Gating it would have thrown away the
+                # best config in the campaign.
+                #
+                # More generally, a ladder that slows down at its top rung is
+                # the wall being FOUND. Excluding those rows would hide the very
+                # thing an ngl sweep exists to locate.
+                r["spill_inferred"] = round(mid - r["floor_mib"], 1)
 
 
 def rank_rows(rows):
@@ -1423,6 +1558,9 @@ def _slim(r):
             "proc_vram_mib": r.get("proc_vram_mib"),
             "accept_rate": r.get("accept_rate"), "draft_n": r.get("draft_n"),
             "spilled": r.get("spilled"), "corpus_repeated": r.get("corpus_repeated"),
+            "shared_mib": r.get("shared_mib"),
+            "spill_inferred": r.get("spill_inferred"),
+            "templated": r.get("templated"),
             "distinct_ratio": r.get("distinct_ratio"),
             "copyback_ratio": r.get("copyback_ratio"),
             "prompt_id": r.get("prompt_id"), "when": r.get("when"),
@@ -1703,5 +1841,5 @@ def report(path=None, log=print):
                # back. Marked here for the same reason SPILLED is - the row is
                # real evidence, it just is not evidence about the setting in its
                # own columns.
-               ("  SPILLED" if r.get("spilled") else "") + _degenerate_note(r)))
+               _degenerate_note(r)))
     return True

@@ -1322,6 +1322,72 @@ def _run_suite(require_refs, tmp, skipped_real):
         print("  BENCH busy port falls back instead of dying as EXIT  %s"
               % ("OK" if port_ok else "FAIL"))
 
+        # WDDM does not fail an allocation past the dedicated budget - it moves
+        # part of the process to system RAM and keeps going, so the row says ok
+        # while every token that touches the moved bytes crosses PCIe. The old
+        # detector could not see it: its floor test only catches a NONSENSICAL
+        # floor, and a partial demotion leaves a plausible one.
+        from .bench import (demoted, spill_note, _infer_demotion,
+                            SHARED_SPILL_MIB, FLOOR_DROP_MIB)
+        meas_ok = (demoted({"shared_mib": SHARED_SPILL_MIB + 1})
+                   and not demoted({"shared_mib": SHARED_SPILL_MIB})
+                   # unmeasured is not the same as clean
+                   and not demoted({"shared_mib": None})
+                   and not demoted({}))
+        note = spill_note({"shared_mib": 246.0})
+        meas_ok = meas_ok and "246" in note and "PCIe" in note
+
+        # The inference, for rows recorded before the counter existed. These are
+        # the real numbers from the ngl ladder: five rungs agreeing within 12
+        # MiB, then one that fell 246 MiB when the process could not grow.
+        def frow(ngl, floor, **kw):
+            r = {"model": "M.gguf", "gpu": "G", "_file": "f.jsonl", "status": "ok",
+                 "tok_s": 3.0, "floor_mib": floor,
+                 "config": {"ctx": 131072, "kv": "q8_0", "ub": 512, "ngl": ngl,
+                            "fill": 65536}}
+            r.update(kw)
+            return r
+
+        ladder = [frow(24, 1348.0), frow(25, 1351.9), frow(26, 1355.8),
+                  frow(27, 1356.3), frow(28, 1360.2), frow(29, 1114.1)]
+        _infer_demotion(ladder)
+        inf_ok = (ladder[-1].get("spill_inferred") > FLOOR_DROP_MIB
+                  and not any(r.get("spill_inferred") for r in ladder[:-1])
+                  # marked but NOT gated: an inference is weaker than a reading,
+                  # and a ladder slowing at its top rung is the wall being found
+                  # rather than a row to hide
+                  and not ladder[-1].get("spilled")
+                  and trustworthy(ladder[-1]))
+        # a measured row is judged on its reading, never on the inference - a
+        # measurement beats a deduction about the same fact
+        measured = ladder[:-1] + [frow(29, 1114.1, shared_mib=0.0)]
+        _infer_demotion(measured)
+        inf_ok = inf_ok and not measured[-1].get("spill_inferred")
+        # Speculation moves the floor by ~800 MiB legitimately: llama.cpp does
+        # not report the draft KV cache in alloc_gpu, so it lands in floor. The
+        # first version of this grouped across it, the median landed between the
+        # two populations, and every ORDINARY row read as a 380 MiB collapse.
+        # These are those real floors.
+        spec_mix = [frow(n, f) for n, f in
+                    ((28, 224.2), (30, 230.0), (31, 232.5), (32, 236.4))]
+        for n, f, nmax in ((28, 1000.0, 1), (26, 1049.6, 2), (28, 1058.0, 2),
+                           (28, 1118.0, 3)):
+            r = frow(n, f)
+            r["config"] = dict(r["config"], spec="draft-mtp", spec_n_max=nmax)
+            spec_mix.append(r)
+        _infer_demotion(spec_mix)
+        inf_ok = inf_ok and not any(r.get("spill_inferred") for r in spec_mix)
+        # the projector moves the floor the same way, at ~1100 MiB
+        mixed = ladder[:-1] + [frow(28, 230.0)]
+        mixed[-1]["config"] = dict(mixed[-1]["config"], mmproj_offload=False)
+        _infer_demotion(mixed)
+        inf_ok = inf_ok and not mixed[-1].get("spill_inferred")
+        # and the inference names itself as one rather than claiming a reading
+        inote = spill_note({"spill_inferred": 246.1})
+        inf_ok = inf_ok and "floor fell" in inote and "246" in inote
+        print("  SPILL demotion measured from the counter, inferred for old rows  %s"
+              % ("OK" if (meas_ok and inf_ok) else "FAIL"))
+
         # The frozen corpus is an experiment condition. Two rows measured
         # against different corpora - or one recorded before the corpus was
         # frozen at all - are different experiments and must never meet in a
@@ -1352,7 +1418,8 @@ def _run_suite(require_refs, tmp, skipped_real):
         find_ok = (chain_ok and split_ok and alone_ok and clean_ok and par_ok
                    and dep_ok and warn_ok and gate_ok
                    and copy_ok and metric_ok and id_ok and vc_ok
-                   and tmpl_ok and scheme_ok and port_ok)
+                   and tmpl_ok and scheme_ok and port_ok
+                   and meas_ok and inf_ok)
     except Exception as e:
         find_ok = False
         print("  CHAIN/FIND raised %s: %s  FAIL" % (type(e).__name__, e))

@@ -1208,7 +1208,18 @@ function sweepAllRows(){
 function rowFlags(r){
   const f = [];
   if(r.spilled) f.push(["spilled", "Loaded, but over-committed: WDDM spilled into shared " +
-    "system memory instead of failing. The row says ok and the speed is off a cliff."]);
+    "system memory instead of failing. The row says ok and the speed is off a cliff." +
+    (r.shared_mib != null ? " " + Math.round(r.shared_mib) + " MiB measured in system RAM." : "")]);
+  /* Deduced from the campaign's own floors rather than read from a counter, so it is
+     shown but NOT treated as untrustworthy: the fastest row in one real campaign carried
+     this signature, because the extra layer bought more than the displaced memory cost. */
+  else if(r.spill_inferred) f.push(["at the wall", "This config could not grow: " +
+    Math.round(r.spill_inferred) + " MiB moved out of VRAM into system RAM, deduced from a " +
+    "floor that fell that far below the rest of the campaign. Still a real measurement - a " +
+    "ladder slowing at its top rung is the wall being found."]);
+  if(r.templated === false) f.push(["no template", "This backend had no /apply-template, so " +
+    "the model was handed raw text with nothing marking it as a request and merely continued " +
+    "the document. Not comparable with templated rows."]);
   if(r.corpus_repeated && r.config && r.config.spec && r.config.spec !== "none")
     f.push(["filler repeats", "The prompt had to repeat to reach this depth, which inflates " +
       "any speculative acceptance rate. Compare only against other rows at this depth."]);

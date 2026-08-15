@@ -1329,13 +1329,53 @@ def _run_suite(require_refs, tmp, skipped_real):
         # floor, and a partial demotion leaves a plausible one.
         from .bench import (demoted, spill_note, _infer_demotion,
                             SHARED_SPILL_MIB, FLOOR_DROP_MIB)
-        meas_ok = (demoted({"shared_mib": SHARED_SPILL_MIB + 1})
-                   and not demoted({"shared_mib": SHARED_SPILL_MIB})
+        # The verdict comes from the EXCESS over the ladder, never from the raw
+        # counter. Shared Usage also counts host memory the process holds on
+        # PURPOSE - pinned staging buffers, --no-mmproj-offload - so a threshold
+        # on the absolute value fires on every healthy row. It did: 474.0 MiB
+        # flat across ngl 26/27/28 with the projector in RAM, unmoved by ngl,
+        # and the row carrying it was the fastest ever measured on that model.
+        meas_ok = (demoted({"shared_excess": SHARED_SPILL_MIB + 1})
+                   and not demoted({"shared_excess": SHARED_SPILL_MIB})
+                   # the raw reading, however large, is not the question
+                   and not demoted({"shared_mib": 9999.0})
                    # unmeasured is not the same as clean
-                   and not demoted({"shared_mib": None})
+                   and not demoted({"shared_excess": None})
                    and not demoted({}))
-        note = spill_note({"shared_mib": 246.0})
+        note = spill_note({"shared_excess": 246.0})
         meas_ok = meas_ok and "246" in note and "PCIe" in note
+        # mid-campaign there is no ladder, so the counter is reported as a fact
+        # and given no verdict rather than being called a spill
+        raw = spill_note({"shared_mib": 474.0})
+        meas_ok = meas_ok and "474" in raw and "SPILLED" not in raw
+
+        # The real 65k ladder: three rungs at a flat 474.0 with the projector in
+        # RAM, all of it deliberate. Nothing here is a spill, and the fastest row
+        # is one of them - the shape that broke the first version.
+        def srow(ngl, shared, tok, **kw):
+            r = {"model": "M.gguf", "gpu": "G", "_file": "f.jsonl", "status": "ok",
+                 "tok_s": tok, "floor_mib": 1050.0 + ngl, "shared_mib": shared,
+                 "spilled": True,      # what the first detector wrote to disk
+                 "config": {"ctx": 131072, "kv": "q8_0", "ub": 512, "ngl": ngl,
+                            "fill": 65536, "mmproj_offload": False,
+                            "spec": "draft-mtp", "spec_n_max": 2}}
+            r.update(kw)
+            return r
+        flat = [srow(26, 474.0, 3.61), srow(27, 474.0, 3.86), srow(28, 474.0, 3.95)]
+        _infer_demotion(flat)
+        meas_ok = (meas_ok
+                   and all(r["shared_excess"] == 0.0 for r in flat)
+                   # ...and the stored verdict is CORRECTED, not carried forward,
+                   # or every row of that campaign stays outside trustworthy()
+                   # and best_config() has nothing left to pick
+                   and not any(r["spilled"] for r in flat)
+                   and all(trustworthy(r) for r in flat))
+        # one rung carrying 240 MiB the others do not IS the driver moving
+        # something, and that is the only thing the counter can say
+        step = flat + [srow(29, 714.0, 2.10)]
+        _infer_demotion(step)
+        meas_ok = (meas_ok and step[-1]["shared_excess"] == 240.0
+                   and step[-1]["spilled"] and not trustworthy(step[-1]))
 
         # The inference, for rows recorded before the counter existed. These are
         # the real numbers from the ngl ladder: five rungs agreeing within 12
@@ -1360,7 +1400,7 @@ def _run_suite(require_refs, tmp, skipped_real):
                   and trustworthy(ladder[-1]))
         # a measured row is judged on its reading, never on the inference - a
         # measurement beats a deduction about the same fact
-        measured = ladder[:-1] + [frow(29, 1114.1, shared_mib=0.0)]
+        measured = ladder[:-1] + [frow(29, 1114.1, shared_mib=300.0)]
         _infer_demotion(measured)
         inf_ok = inf_ok and not measured[-1].get("spill_inferred")
         # Speculation moves the floor by ~800 MiB legitimately: llama.cpp does

@@ -1209,7 +1209,11 @@ function rowFlags(r){
   const f = [];
   if(r.spilled) f.push(["spilled", "Loaded, but over-committed: WDDM spilled into shared " +
     "system memory instead of failing. The row says ok and the speed is off a cliff." +
-    (r.shared_mib != null ? " " + Math.round(r.shared_mib) + " MiB measured in system RAM." : "")]);
+    /* The EXCESS over the rest of the ladder, never the raw counter. Shared Usage
+       counts host memory this process holds on purpose - pinned staging buffers,
+       --no-mmproj-offload - so every healthy row reads in the hundreds of MiB. */
+    (r.shared_excess != null ? " " + Math.round(r.shared_excess) +
+      " MiB more host memory than the rest of its ladder." : "")]);
   /* Deduced from the campaign's own floors rather than read from a counter, so it is
      shown but NOT treated as untrustworthy: the fastest row in one real campaign carried
      this signature, because the extra layer bought more than the displaced memory cost. */

@@ -517,34 +517,56 @@ def bench_one(backend, model_path, c, port=BENCH_PORT, timeout=420.0,
     # The Windows failure mode is not an OOM. WDDM spills past dedicated VRAM
     # into system RAM and the load SUCCEEDS, so the row says "ok" and only the
     # numbers give it away: a negative floor, and decode falling off a cliff.
-    # Naming it on the row means the ngl ladder can be read without knowing that.
+    #
+    # Only suspect_reason() can answer that from ONE row. The counter reading
+    # cannot - it needs the rest of the ladder to be excess over (see demoted())
+    # - so `demoted` is False here by construction and the verdict is re-decided
+    # in _infer_demotion() on the way back out of the store, where the ladder
+    # exists. Written anyway, so a row is never missing the field.
     row["spilled"] = (row.get("status") == "ok"
                       and (bool(row.get("suspect")) or demoted(row)))
     return row
 
 
-# Shared memory below this is ordinary WDDM housekeeping - a few megabytes of
-# staging and presentation buffers exist even on a process that fits easily.
-# Above it, model or cache bytes are living in system RAM and every token that
-# touches them crosses PCIe.
+# Excess shared memory over a ladder's own baseline, above which the driver has
+# moved something. NOT an absolute reading - see demoted().
 SHARED_SPILL_MIB = 64.0
 
 
 def demoted(row):
     """Did WDDM move part of this process into system RAM?
 
-    The direct reading, and the one suspect_reason() cannot make: its test is
-    `floor_mib < FLOOR_MIN_MIB`, which only catches a floor so small it is
-    nonsensical. A PARTIAL demotion leaves a perfectly plausible floor - 1114
-    MiB where its neighbours held 1360 - and sails through, while decode has
-    already fallen off a cliff. The other check, on gpu_free_after_mib, is read
-    after teardown and reports the same value on every row, so it never fires
-    at all.
+    Only ever answers from `shared_excess`, which is measured against the row's
+    own ladder. The raw counter cannot answer it, and the first version of this
+    function - `shared_mib > 64` - was wrong for a reason worth writing down,
+    because it is the whole difference between the two.
 
-    None means the counters could not be read, and that is not evidence of
-    absence: an unmeasured row is not called clean."""
-    s = row.get("shared_mib")
-    return s is not None and s > SHARED_SPILL_MIB
+    `\\GPU Process Memory\\Shared Usage` counts every byte of host memory mapped
+    for GPU access. That includes memory that is in system RAM BY CHOICE:
+    llama.cpp's CUDA_Host pinned staging buffers, and `--no-mmproj-offload`,
+    which is a config knob this grid deliberately sweeps. So the counter has a
+    large baseline on a process that fits perfectly:
+
+        ngl 26/27/28 + draft-mtp 2, projector in RAM   shared 474.0 MiB, all three
+        ngl 31       + no spec,     projector in RAM   shared 238.0 MiB
+
+    Two things there. The reading does not move with ngl - 474.0 exactly, while
+    proc_vram climbs 10660 -> 11164 -> 11410 - and demotion under pressure is
+    precisely the thing that would. And the 474 MiB row at ngl 28 is the FASTEST
+    row ever measured on this model at this depth, 3.95 against 3.25 for the 238
+    MiB one. A threshold of 64 called all four spilled, which put every row of
+    the campaign outside trustworthy() and left best_config() with nothing to
+    pick - a detector that fires on everything reports nothing.
+
+    What separates a demotion from a deliberate placement is that a demotion
+    RESPONDS TO PRESSURE. So the signal is the excess over what the rest of the
+    ladder carries, exactly like the floor collapse in _infer_demotion(), and it
+    needs the same grouping to mean anything.
+
+    None means unmeasured, which is not evidence of absence: an unmeasured row
+    is not called clean, it is simply not called demoted either."""
+    x = row.get("shared_excess")
+    return x is not None and x > SHARED_SPILL_MIB
 
 
 # ---------------------------------------------------------------------------
@@ -1439,14 +1461,22 @@ def spill_note(row):
     printing, but they are not the same claim, and a row that says "SPILLED"
     without saying why invites the reader to trust a deduction as a
     measurement."""
-    sh = row.get("shared_mib")
-    if sh is not None and sh > SHARED_SPILL_MIB:
-        return ("  SPILLED - %.0f MiB of this process is in system RAM, so every "
-                "token that touches it crosses PCIe" % sh)
+    x = row.get("shared_excess")
+    if x is not None and x > SHARED_SPILL_MIB:
+        return ("  SPILLED - %.0f MiB more host memory than the rest of this "
+                "ladder, so every token that touches it crosses PCIe" % x)
     if row.get("spill_inferred"):
         return ("  SPILLED - floor fell %.0f MiB below the rest of this campaign, "
                 "which is memory the driver moved out of VRAM"
                 % row["spill_inferred"])
+    sh = row.get("shared_mib")
+    if x is None and sh is not None and sh > SHARED_SPILL_MIB:
+        # Mid-campaign there is no ladder yet, so the counter has no baseline to
+        # be excess OVER. Report the number as a fact and pass no verdict: every
+        # llama.cpp process carries hundreds of MiB here by design, and calling
+        # that a spill is the mistake this whole function was rewritten to stop
+        # making. It resolves into a verdict once the group exists.
+        return ("  host memory %.0f MiB (no ladder yet to compare it against)" % sh)
     return ""
 
 
@@ -1488,8 +1518,12 @@ def _infer_demotion(rows):
     by a layer while proc_vram does NOT, and the difference comes out of floor.
     That collapse is the demotion, visible without any counter.
 
-    Only for rows with no shared_mib. A row that carries the direct reading is
-    judged on it, because a measurement beats an inference.
+    The counter reading gets the SAME treatment, for the reason set out in
+    demoted(): `Shared Usage` counts deliberate host placement - pinned staging
+    buffers, `--no-mmproj-offload` - as well as demotion, so its absolute value
+    says nothing on its own. Only its excess over the ladder's own baseline
+    does. Two signals, one grouping, because both mean "this rung is carrying
+    something the others are not".
 
     What the grouping has to hold constant is everything that moves the floor
     for a legitimate reason, and speculation is the big one: llama.cpp does not
@@ -1514,8 +1548,6 @@ def _infer_demotion(rows):
     for r in rows:
         if r.get("status") != "ok" or r.get("floor_mib") is None:
             continue
-        if r.get("shared_mib") is not None:
-            continue
         c = r.get("config") or {}
         groups.setdefault((r.get("model"), r.get("gpu"), r.get("_file"),
                            r.get("prompt_id"), r.get("template_id"),
@@ -1523,14 +1555,38 @@ def _infer_demotion(rows):
                            c.get("mmproj_offload") is not False,
                            c.get("spec") or "none", c.get("spec_n_max") or 0,
                            c.get("fill")), []).append(r)
+    def _median(vals):
+        v = sorted(vals)
+        return v[len(v) // 2] if len(v) % 2 else (v[len(v) // 2 - 1]
+                                                  + v[len(v) // 2]) / 2.0
+
     for grp in groups.values():
         if len(grp) < 3:            # two rows cannot say which one is anomalous
             continue
-        fl = sorted(x["floor_mib"] for x in grp)
-        mid = fl[len(fl) // 2] if len(fl) % 2 else (fl[len(fl) // 2 - 1]
-                                                   + fl[len(fl) // 2]) / 2.0
+        # The counter, made relative. A row that reads the SAME as its ladder is
+        # carrying the baseline every rung carries and has been demoted by
+        # nothing; only the excess is the driver moving something. Recorded as 0
+        # rather than dropped, because "measured, and it was normal" is a
+        # different statement from "not measured".
+        sh = [x["shared_mib"] for x in grp if x.get("shared_mib") is not None]
+        if len(sh) >= 3:
+            base_sh = _median(sh)
+            for r in grp:
+                if r.get("shared_mib") is None:
+                    continue
+                r["shared_excess"] = round(max(0.0, r["shared_mib"] - base_sh), 1)
+                # Rows written by the first version of demoted() carry a stored
+                # `spilled: true` that came from the raw counter clearing 64
+                # MiB - which every llama.cpp process does. Re-decide it here,
+                # where the ladder is available and the number means something.
+                # suspect_reason()'s verdict is untouched; it never depended on
+                # the counter.
+                r["spilled"] = bool(r.get("suspect")) or demoted(r)
+        # ...and the floor collapse, which is the only signal a row recorded
+        # before the counter existed can offer.
+        mid = _median([x["floor_mib"] for x in grp])
         for r in grp:
-            if mid - r["floor_mib"] > FLOOR_DROP_MIB:
+            if r.get("shared_mib") is None and mid - r["floor_mib"] > FLOOR_DROP_MIB:
                 # Annotated, deliberately NOT gated. Two reasons, and the second
                 # one is the important one.
                 #
@@ -1655,6 +1711,7 @@ def _slim(r):
             "accept_rate": r.get("accept_rate"), "draft_n": r.get("draft_n"),
             "spilled": r.get("spilled"), "corpus_repeated": r.get("corpus_repeated"),
             "shared_mib": r.get("shared_mib"),
+            "shared_excess": r.get("shared_excess"),
             "spill_inferred": r.get("spill_inferred"),
             "templated": r.get("templated"),
             "template_id": r.get("template_id"),

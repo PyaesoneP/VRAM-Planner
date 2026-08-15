@@ -354,6 +354,22 @@ windows, a copy produces nothing but distinct ones. Rows recorded before the gat
 existed carry no `copyback_ratio`; the campaigns report how many of their rows are
 pre-gate, and their deep-fill numbers are not usable for tuning.
 
+### The prompt goes through the chat template
+
+Both degenerate modes above are also a symptom of HOW the model was asked. A raw
+continuation — posting to `/completion` with no role markers — hands an
+instruction-tuned model a wall of source that happens to end in a sentence, and the
+model does the only thing that endpoint asks: it continues the document, echoing the
+instruction or copying the source. One 32k campaign lost all 23 of its rows exactly
+that way, and every one was gated as degenerate. The prompt is therefore wrapped with
+the server's own chat template (`/apply-template`) and measured once so `fill N` still
+means N tokens. A build with no `/apply-template` falls back to raw text and **every
+such row is marked `RAW`** (the `no template` badge in the browser) — the failure is in
+how the row was produced, so it is named even when the output happens to look fine.
+Measured at the depth that failed: copyback **0.598 → 0.035**, distinct **0.184 →
+1.00**, and the output became an actual analysis. Whether the prompt is templated is
+part of the prompt identity, so templated and raw rows never merge.
+
 ### Acceptance rate is conditional on having drafted
 
 A drafter that fires rarely and is always right reports 100% acceptance and buys almost
@@ -409,9 +425,19 @@ real context depth. Splitting them is what makes deep fills affordable at all.
 | `exit` / `timeout` | died, or never printed a ready line |
 | `genfail` | loaded, then the generation failed — e.g. a draft depth whose context could not allocate |
 
-`spilled` marks a row that loaded but whose floor computed negative — on Windows, WDDM
-spills past dedicated VRAM instead of failing, so the load *succeeds* and only the numbers
-give it away.
+`spilled` marks a row that loaded and reported `ok` but was over-committed: WDDM does not
+fail an allocation past the dedicated budget — it moves part of the process into system
+RAM and carries on, so the load *succeeds* while every token that touches the moved
+bytes crosses PCIe. Where possible it is read directly: the row carries `shared_mib`, the
+`\GPU Process Memory(*)\Shared Usage` counter sampled while the server is still alive
+(`None` means the counters could not be read — never a clean zero). Rows recorded before
+that counter existed are covered by `spill_inferred`, deduced from the campaign's own
+floors, which hold steady within ~12 MiB rung to rung — a fall past 100 MiB is the driver
+moving memory, not allocator noise. The two are different claims and the code treats them
+differently: only the **measured** reading gates (excluded from conclusions), while an
+inference marks the row as *at the wall* without discarding it — a ladder slowing at its
+top rung is the wall being found, and one real campaign's fastest row carried the exact
+collapse signature.
 
 ### Depth beats every setting
 

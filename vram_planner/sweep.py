@@ -245,6 +245,35 @@ def build_argv(exe, model_path, c, port, probe=True, host="127.0.0.1"):
           "-fa", "on" if c["fa"] else "off",
           "-ctk", c["kv"], "-ctv", c["kv"],
           "--host", host, "--port", str(port)]
+    # The chat template, when the caller pinned one. Two rules, both learned the
+    # expensive way and both already written down in launch.py:
+    #
+    #   * --jinja MUST come first. Without it the build accepts only its built-in
+    #     template NAMES and rejects a path outright. It is default-on in 2.28 and
+    #     was default-off in older builds, so being explicit is what lets the same
+    #     config be measured on two backends and mean the same thing.
+    #   * a --chat-template-file that does not exist is NOT an error. llama-server
+    #     falls back to the GGUF's own metadata template and says almost nothing,
+    #     which is a whole campaign measured against a template nobody chose.
+    #     Refuse here instead, where it costs one config and not four hours.
+    #
+    # kwargs arrive already serialised; validation belongs at the entry point, so
+    # a bad value is refused before the first server is launched rather than at
+    # whichever config first happens to carry it.
+    #
+    # Probe-only. launch.py emits these two flags itself, conditionally at script
+    # RUNTIME, because they are script parameters someone can override without
+    # regenerating - and `--chat-template-file ''` is an error, not a no-op.
+    tf = c.get("chat_template_file") if probe else None
+    tk = c.get("chat_template_kwargs") if probe else None
+    if tf or tk:
+        av.append("--jinja")
+    if tf:
+        if not os.path.isfile(tf):
+            raise ValueError("no such chat template: %s" % tf)
+        av += ["--chat-template-file", tf]
+    if tk:
+        av += ["--chat-template-kwargs", tk]
     if probe:
         av += ["--cache-ram", "0",   # host-side prompt cache; noise for our purposes
                "-v"]

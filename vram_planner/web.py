@@ -117,6 +117,12 @@ class Handler(BaseHTTPRequestHandler):
             "verify": bool(data.get("verify")),
             "verify_overrides": (parse_overrides(data.get("verify_overrides").split())
                                  if data.get("verify_overrides") else None),
+            # Same two fields the launch-script card already carries, so a
+            # campaign can be MEASURED under the template it will be RUN under.
+            # Absent means the GGUF's own metadata template, which is what every
+            # row recorded before this was measured against.
+            "chat_template_file": data.get("chat_template_file") or None,
+            "chat_template_kwargs": data.get("chat_template_kwargs") or None,
         }
 
     def _speed_start(self, data):

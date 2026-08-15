@@ -1415,11 +1415,76 @@ def _run_suite(require_refs, tmp, skipped_real):
                  and "stage" not in vc)
         print("  FIND  prompt_id splits experiments, verify composes winner+production  %s"
               % ("OK" if (id_ok and vc_ok) else "FAIL"))
+
+        # The chat template is the other half of what a tok/s number means: a
+        # thinking template spends tokens reasoning before it answers. So it
+        # splits experiments exactly like prompt_id, in BOTH directions - and
+        # its identity is the file's CONTENT, not its path, or editing a
+        # template in place would leave the old rows looking current.
+        import tempfile as _tf
+        from vram_planner.bench import template_identity, _ANY
+        from vram_planner.sweep import build_argv
+        td = _tf.mkdtemp()
+        tp = os.path.join(td, "chat template.jinja")
+        with open(tp, "w", encoding="utf-8") as fh:
+            fh.write("{{ messages[0].content }}")
+        kw = '{"enable_thinking":true}'
+        t1 = template_identity(tp, kw)
+        with open(tp, "a", encoding="utf-8") as fh:
+            fh.write("\n{# edited #}")
+        t2 = template_identity(tp, kw)
+        ti_ok = (t1 and t2 and t1 != t2                     # content, not path
+                 and template_identity(tp, None) != t2      # kwargs count too
+                 and template_identity(None, None) is None) # nothing pinned
+        # comparable() filters both ways, and _ANY means "do not filter" -
+        # which is what keeps every row recorded before this from vanishing.
+        cmp_ok = (comparable(row(9.0, template_id=t1), "M.gguf", B, 128, 3,
+                             template_id=t1)
+                  and not comparable(row(9.0, template_id=t1), "M.gguf", B, 128, 3,
+                                     template_id=t2)
+                  # a campaign that pinned NO template must not inherit a
+                  # baseline from one that did
+                  and not comparable(row(9.0, template_id=t1), "M.gguf", B, 128, 3,
+                                     template_id=None)
+                  and not comparable(row(9.0), "M.gguf", B, 128, 3, template_id=t1)
+                  and comparable(row(9.0, template_id=t1), "M.gguf", B, 128, 3)
+                  and comparable(row(9.0), "M.gguf", B, 128, 3, template_id=_ANY)
+                  # ...and it splits effect sizes, never merging two templates
+                  and sorted(v["value"] for v in [e for e in axis_effects(
+                      [row(5.0, {"ub": 512}, template_id=t1),
+                       row(6.0, {"ub": 1024}, template_id=t1),
+                       row(99.0, {"ub": 2048}, template_id=t2)])["effects"]
+                      if e["axis"] == "ub"][0]["values"]) == [512, 1024])
+        # --jinja MUST precede --chat-template-file or the build rejects a path,
+        # and a path that does not exist is a SILENT fallback to the GGUF's own
+        # template - a whole campaign measured against something nobody chose.
+        bc = {"ctx": 4096, "ub": 512, "seq": 1, "ngl": 28, "fa": True, "kv": "q8_0"}
+        av = build_argv("s.exe", "m.gguf", dict(bc, chat_template_file=tp,
+                                                chat_template_kwargs=kw), 8232)
+        arg_ok = (av.index("--jinja") < av.index("--chat-template-file")
+                  and av[av.index("--chat-template-file") + 1] == tp
+                  and av[av.index("--chat-template-kwargs") + 1] == kw
+                  # no flags at all when nothing is pinned
+                  and "--jinja" not in build_argv("s.exe", "m.gguf", dict(bc), 8232)
+                  # probe=False is launch.py's, which emits these itself at
+                  # script runtime; a second copy here would double them
+                  and "--jinja" not in build_argv(
+                      "s.exe", "m.gguf", dict(bc, chat_template_file=tp), 8232,
+                      probe=False))
+        try:
+            build_argv("s.exe", "m.gguf",
+                       dict(bc, chat_template_file=tp + ".nope"), 8232)
+            arg_ok = False
+        except ValueError:
+            pass
+        print("  TMPL  template splits experiments by content, --jinja leads it  %s"
+              % ("OK" if (ti_ok and cmp_ok and arg_ok) else "FAIL"))
         find_ok = (chain_ok and split_ok and alone_ok and clean_ok and par_ok
                    and dep_ok and warn_ok and gate_ok
                    and copy_ok and metric_ok and id_ok and vc_ok
                    and tmpl_ok and scheme_ok and port_ok
-                   and meas_ok and inf_ok)
+                   and meas_ok and inf_ok
+                   and ti_ok and cmp_ok and arg_ok)
     except Exception as e:
         find_ok = False
         print("  CHAIN/FIND raised %s: %s  FAIL" % (type(e).__name__, e))

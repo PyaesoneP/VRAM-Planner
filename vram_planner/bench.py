@@ -232,6 +232,31 @@ def prompt_identity():
     return _CORPUS_ID
 
 
+def template_identity(path=None, kwargs_json=None):
+    """The hash of the chat template a row was measured under, or None.
+
+    Sibling of prompt_identity(), and for the same reason: what the model was
+    asked is half of what a tok/s number means. A thinking template that emits a
+    reasoning block generates a different number of tokens per answer than one
+    that does not, so two rows measured under different templates are different
+    experiments even when every flag matches.
+
+    The FILE'S BYTES are hashed, not its path. Editing a template in place must
+    invalidate the rows measured against the old one - a path would not notice,
+    and the campaign would silently mix both halves. None means no template was
+    pinned and the GGUF's own metadata one was used, which is its own answer and
+    groups separately from every pinned template."""
+    if not path and not kwargs_json:
+        return None
+    h = hashlib.sha256()
+    if path:
+        with open(path, "rb") as fh:
+            h.update(fh.read())
+    h.update(b"\x00")
+    h.update((kwargs_json or "").encode("utf-8"))
+    return h.hexdigest()[:16]
+
+
 def build_prompt(url, fill_tokens, timeout=120):
     """A prompt of approximately `fill_tokens` tokens, ending in an instruction.
 
@@ -390,9 +415,20 @@ def bench_one(backend, model_path, c, port=BENCH_PORT, timeout=420.0,
     measured ~315 tok/s of prefill, a 120k-token prompt is six minutes; paying
     that four times per config would put a single row past twenty minutes."""
     log_dir = os.path.join(_data_dir(), "sweep-logs")
-    row = {"status": "error", "config": dict(c),
+    # The template is a property of the CAMPAIGN, not of one point in the grid,
+    # so it is stamped on the row beside prompt_id rather than left in the config
+    # dict: an absolute path is not a setting anyone is sweeping over, and every
+    # comparison in this file groups on config equality.
+    stored = {k: v for k, v in c.items()
+              if k not in ("chat_template_file", "chat_template_kwargs")}
+    row = {"status": "error", "config": stored,
            "model": os.path.basename(model_path), "backend": backend["build"],
            "speed": True, "n_predict": n_predict, "repeat": repeat}
+    tf, tk = c.get("chat_template_file"), c.get("chat_template_kwargs")
+    if tf or tk:
+        row["template_id"] = template_identity(tf, tk)
+        row["chat_template"] = os.path.basename(tf) if tf else None
+        row["template_kwargs"] = tk
     # Which frozen corpus this row measured against. Everything a deep-fill
     # number means lives or dies on this: two rows from different corpora are
     # different experiments, and resume and every comparison below treat them
@@ -802,7 +838,13 @@ def trustworthy(r):
     return True
 
 
-def comparable(r, model, base, n_predict=None, repeat=None, prompt_id=None):
+# None is a MEANINGFUL template_id - "no template pinned, the GGUF's own was
+# used" - so it cannot double as "do not filter on this". Hence a sentinel.
+_ANY = object()
+
+
+def comparable(r, model, base, n_predict=None, repeat=None, prompt_id=None,
+               template_id=_ANY):
     """Was this row measured under the same conditions as the campaign?
 
     Speed is conditional on all of these, so a row taken at another depth or with
@@ -825,6 +867,13 @@ def comparable(r, model, base, n_predict=None, repeat=None, prompt_id=None):
         return False
     if prompt_id is not None and r.get("prompt_id") != prompt_id:
         return False
+    # A template changes the ANSWER, so it changes tok/s: a thinking template
+    # spends tokens on a reasoning block before it says anything. Filtered in
+    # both directions - a campaign that pinned none must not inherit a baseline
+    # from one that did, which is why None here means "no template" and the
+    # sentinel means "do not filter".
+    if template_id is not _ANY and r.get("template_id") != template_id:
+        return False
     c = r.get("config") or {}
     if not (c.get("ctx") == base.get("ctx")
             and c.get("kv") == base.get("kv")
@@ -841,7 +890,8 @@ def comparable(r, model, base, n_predict=None, repeat=None, prompt_id=None):
 
 
 def best_config(rows, model, base, n_predict=None, repeat=None,
-                incumbent_tok_s=None, margin=CHAIN_MARGIN, prompt_id=None):
+                incumbent_tok_s=None, margin=CHAIN_MARGIN, prompt_id=None,
+                template_id=_ANY):
     """The baseline for the next stage: (config, row) or (None, None).
 
     Reads rows that are already on DISK, not just the ones this process has in
@@ -849,7 +899,7 @@ def best_config(rows, model, base, n_predict=None, repeat=None,
     winner back up instead of falling back to the planner's guess."""
     cand = [r for r in rows
             if trustworthy(r) and comparable(r, model, base, n_predict, repeat,
-                                             prompt_id)]
+                                             prompt_id, template_id)]
     if not cand:
         return None, None
     win = max(cand, key=lambda r: r["tok_s"])
@@ -905,7 +955,8 @@ def verify_config(win_c, overrides=None):
 
 def _verify_step(backend, model_path, facts, name, base, path, pid, gpu,
                  overrides=None, port=BENCH_PORT, timeout=420.0,
-                 n_predict=N_PREDICT, repeat=N_REPEAT, log=print):
+                 n_predict=N_PREDICT, repeat=N_REPEAT, log=print,
+                 template=(None, None), template_id=_ANY):
     """Load the campaign's winner at the PRODUCTION config, exactly once.
 
     The staged search measures each knob at the config the grid asked for, and
@@ -917,11 +968,20 @@ def _verify_step(backend, model_path, facts, name, base, path, pid, gpu,
     the row lands in the same file with the same prompt_id, so the certified
     answer is recorded data rather than a claim."""
     win_c, win_r = best_config(load_rows(path), name, base, n_predict=n_predict,
-                               repeat=repeat, prompt_id=pid)
+                               repeat=repeat, prompt_id=pid,
+                               template_id=template_id)
     if win_c is None:
         log("verify  : nothing to certify - no trustworthy row at this campaign's settings")
         return None
     c = verify_config(win_c, overrides)
+    # The winner came back off DISK, where template keys are deliberately not
+    # stored. Re-attach them, or the one load that certifies the campaign would
+    # be the only load in it measured against a different template.
+    tf, tk = template
+    if tf:
+        c["chat_template_file"] = tf
+    if tk:
+        c["chat_template_kwargs"] = tk
     log("verify  : the winner (%s) does not know the config you actually run -" % _carry_summary(win_c))
     log("          loading %s%s once"
         % (_carry_summary(c),
@@ -1009,7 +1069,8 @@ def speed_sweep(models=None, backend=None, dry_run=False, timeout=420.0,
                 ctx=None, kv=None,
                 n_predict=N_PREDICT, repeat=N_REPEAT, log=print, skip_preflight=False,
                 on_row=None, should_stop=None, on_total=None,
-                chain=False, rounds=1, verify=False, verify_overrides=None):
+                chain=False, rounds=1, verify=False, verify_overrides=None,
+                chat_template_file=None, chat_template_kwargs=None):
     """Run the speed grid and append one row per config. Resumable like --sweep.
 
     `on_row` is called with each finished row, `on_total` when the number of
@@ -1047,7 +1108,25 @@ def speed_sweep(models=None, backend=None, dry_run=False, timeout=420.0,
     facts = model_facts(mp)
     mmproj = find_mmproj_for(mp)
 
+    # Validated before a single server is launched. A bad kwargs string is a
+    # four-hour campaign that dies on config one, or worse - a template path with
+    # a typo is not an error at all, just a silent fallback to the GGUF's own.
+    from .launch import template_args
+    try:
+        tmpl_f, tmpl_k = template_args(chat_template_file, chat_template_kwargs)
+    except ValueError as e:
+        log("template: %s" % e)
+        return None
+    if tmpl_f and not os.path.isfile(tmpl_f):
+        log("template: no such file - %s" % tmpl_f)
+        return None
+    tmpl_id = template_identity(tmpl_f, tmpl_k)
+
     base = dict(SPEED_BASE)
+    if tmpl_f:
+        base["chat_template_file"] = tmpl_f
+    if tmpl_k:
+        base["chat_template_kwargs"] = tmpl_k
     if fill is not None:
         base["fill"] = fill
     if ctx is not None:
@@ -1092,7 +1171,11 @@ def speed_sweep(models=None, backend=None, dry_run=False, timeout=420.0,
     done = {_key(r["model"], r["config"]) for r in load_rows(path)
             if r.get("config") and r.get("status") in ("ok", "oom")
             and r.get("n_predict") == n_predict and r.get("repeat") == repeat
-            and r.get("prompt_id") == pid}
+            and r.get("prompt_id") == pid
+            # ...and under the same chat template. A thinking template answers
+            # at a different length than a terse one, so a row measured without
+            # one is not this campaign's row already done.
+            and r.get("template_id") == tmpl_id}
     plan = [c for c in cfgs if _key(os.path.basename(mp), c) not in done]
     skipped = len(cfgs) - len(plan)
     if limit:
@@ -1104,6 +1187,12 @@ def speed_sweep(models=None, backend=None, dry_run=False, timeout=420.0,
                                            facts["arch"]))
     log("mmproj  : %s" % (os.path.basename(mmproj) if mmproj else "none"))
     log("prompt  : %s (frozen corpus; rows are keyed on it, so a refresh re-measures)" % pid[:12])
+    if tmpl_id:
+        log("template: %s %s  (%s, hashed by content - editing it re-measures)"
+            % (os.path.basename(tmpl_f) if tmpl_f else "(kwargs only)",
+               tmpl_k or "", tmpl_id[:12]))
+    else:
+        log("template: none pinned - the GGUF's own metadata template")
     log("output  : %s" % path)
     log("configs : %d to run, %d already recorded" % (len(plan), skipped))
     log("estimate: ~%.1f h  (load + %d warm + %d x %d tokens per config)"
@@ -1247,7 +1336,8 @@ def speed_sweep(models=None, backend=None, dry_run=False, timeout=420.0,
                     # the ones that say where the previous stage got to.
                     nxt, win = best_config(load_rows(path), name, base,
                                            n_predict=n_predict, repeat=repeat,
-                                           incumbent_tok_s=best_tok, prompt_id=pid)
+                                           incumbent_tok_s=best_tok, prompt_id=pid,
+                                           template_id=tmpl_id)
                     if nxt is None:
                         log("  baseline unchanged: nothing beat %s by more than %.0f%%"
                             % ("%.2f tok/s" % best_tok if best_tok
@@ -1268,7 +1358,8 @@ def speed_sweep(models=None, backend=None, dry_run=False, timeout=420.0,
         verified = _verify_step(b, mp, facts, name, base, path, pid, gpu,
                                 overrides=verify_overrides, port=port,
                                 timeout=timeout, n_predict=n_predict,
-                                repeat=repeat, log=log)
+                                repeat=repeat, log=log,
+                                template=(tmpl_f, tmpl_k), template_id=tmpl_id)
     return {"rows": out, "path": path, "stopped": stopped, "planned": total[0],
             "chained": bool(chain), "verified": verified}
 
@@ -1427,7 +1518,7 @@ def _infer_demotion(rows):
             continue
         c = r.get("config") or {}
         groups.setdefault((r.get("model"), r.get("gpu"), r.get("_file"),
-                           r.get("prompt_id"),
+                           r.get("prompt_id"), r.get("template_id"),
                            c.get("ctx"), c.get("kv"), c.get("ub"),
                            c.get("mmproj_offload") is not False,
                            c.get("spec") or "none", c.get("spec_n_max") or 0,
@@ -1532,7 +1623,12 @@ def _control(r, owned=()):
     c = r.get("config") or {}
     ctl = [("model", r.get("model")), ("gpu", r.get("gpu")),
            ("file", r.get("_file")), ("n_predict", r.get("n_predict")),
-           ("repeat", r.get("repeat")), ("prompt_id", r.get("prompt_id"))]
+           ("repeat", r.get("repeat")), ("prompt_id", r.get("prompt_id")),
+           # What the model was ASKED is held constant too. A thinking template
+           # spends tokens reasoning before it answers, so a row measured under
+           # one is not a faster or slower version of a row measured without -
+           # it is a different question.
+           ("template_id", r.get("template_id"))]
     for k in _CONFIG_KEYS:
         if k in owned:
             continue
@@ -1561,6 +1657,9 @@ def _slim(r):
             "shared_mib": r.get("shared_mib"),
             "spill_inferred": r.get("spill_inferred"),
             "templated": r.get("templated"),
+            "template_id": r.get("template_id"),
+            "chat_template": r.get("chat_template"),
+            "template_kwargs": r.get("template_kwargs"),
             "distinct_ratio": r.get("distinct_ratio"),
             "copyback_ratio": r.get("copyback_ratio"),
             "prompt_id": r.get("prompt_id"), "when": r.get("when"),

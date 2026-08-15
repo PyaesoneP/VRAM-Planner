@@ -69,6 +69,15 @@ def main():
                          "spec=draft-mtp spec_n_max=2 temp=1 top_k=20 top_p=0.95. "
                          "Overlaid on the winner's knobs; absent, the winner is "
                          "verified as itself")
+    ap.add_argument("--chat-template-file", default=None, metavar="PATH",
+                    help="with --speed-sweep: measure under this jinja chat "
+                         "template instead of the GGUF's own. --jinja is passed "
+                         "before it, as that build requires. Rows record the "
+                         "template's CONTENT hash, so editing it re-measures")
+    ap.add_argument("--chat-template-kwargs", default=None, metavar="JSON",
+                    help='template variables as a JSON object, e.g. '
+                         '\'{"enable_thinking":true,"reasoning_effort":"xhigh"}\'. '
+                         "Validated before the first server starts")
     ap.add_argument("--refresh-corpus", action="store_true",
                     help="rebuild the frozen speed-sweep filler corpus from this "
                          "repository's README and sources. Rows record the corpus's "
@@ -181,7 +190,9 @@ def main():
                         fill=args.speed_fill, ctx=args.speed_ctx, kv=args.speed_kv,
                         n_predict=args.n_predict, repeat=args.repeat,
                         chain=args.speed_chain, rounds=args.speed_rounds,
-                        verify=args.speed_verify, verify_overrides=overrides)
+                        verify=args.speed_verify, verify_overrides=overrides,
+                        chat_template_file=args.chat_template_file,
+                        chat_template_kwargs=args.chat_template_kwargs)
         sys.exit(0 if r else 1)
     if args.fit:
         from .fit import report

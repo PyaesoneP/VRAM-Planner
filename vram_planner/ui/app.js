@@ -98,15 +98,30 @@ async function showPastSweeps(){
   // recorded yet - that is exactly when the page would otherwise look idle
   // while the GPU is busy.
   if(!n && !(SWEEP.status && SWEEP.status.status === "running")) return;
-  const busy = !!(SWEEP.status && SWEEP.status.status === "running");
-  $("out").innerHTML = busy
-    // A sweep is running from another tab or from before a reload. Show the
-    // whole measured column so it can be watched and stopped, not just listed.
-    ? renderSweep() + renderHistory()
-    : h`<div class="card"><p class="placeholder">Pick a model and press Analyze fit.</p></div>` +
-      renderHistory() +
-      h`<section class="card" id="sweepscriptcard">
-          <h2>Launch script</h2><div id="sweepscript"></div></section>`;
+  renderIdle();
+}
+
+/** The page with no model analyzed. Same three steps, with step 1 asking for the
+ *  one thing it needs instead of being empty - and steps 2 and 3 fully usable,
+ *  because browsing a recorded campaign and building a script from one of its
+ *  rows needs no plan and touches no GPU. */
+function renderIdle(){
+  if(LAST) return;
+  const busy = !!(SWEEP && SWEEP.status && SWEEP.status.status === "running");
+  const step = stepNow();
+  let panel;
+  if(step === "fit"){
+    panel = h`<section class="card lead">
+      <p class="placeholder">Pick a model on the left and press <b>Analyze fit</b>.</p>
+      <p class="note">Steps 2 and 3 work without this: a recorded campaign can be read and a
+        launch script built from any of its rows with nothing analyzed and the GPU untouched.</p>
+    </section>`;
+  }else if(step === "measure"){
+    panel = renderSweep() + renderHistory();
+  }else{
+    panel = renderScriptStep();
+  }
+  $("out").innerHTML = renderStepper(null) + panel;
   drawSweep({ grid: busy, results: busy, script: true, history: true });
 }
 
@@ -288,7 +303,13 @@ async function run(){
     });
     const r = await res.json();
     if(!r.ok) $("out").innerHTML = h`<div class="card warns"><b>Error:</b> ${r.error || "unknown"}</div>`;
-    else render(r);
+    else {
+      // Pressing Analyze is a question about FIT, so answer that one - even if
+      // the last thing looked at was a script. Without this the step stuck
+      // wherever it was left and Analyze appeared to do nothing at all.
+      STEP = null;
+      render(r);
+    }
   }catch(e){
     $("out").innerHTML = h`<div class="card warns"><b>Request failed:</b> ${e}</div>`;
   }
@@ -586,12 +607,24 @@ function render(r){
   // an audio-only mmproj has no patch grid to size.
   $("visionrow").hidden = !(r.vision && r.vision.config);
   $("visioninputs").hidden = !$("visionplan").checked;
-  $("out").innerHTML =
-    renderVerdict(r) + renderWarnings(r) +
-    renderSweep() + renderHistory() +
-    tier("PREDICTED", "calculated, not measured — the cards above supersede these once you have rows") +
-    renderSettings(r) + renderSpeed(r) + renderSummary(r) +
-    renderKvTable(r) + renderBreakdown(r);
+  const step = stepNow();
+  let panel;
+  if(step === "fit"){
+    // The gate, and then everything the planner DERIVED - which is reference
+    // material, not a next action, so it opens closed.
+    panel = renderVerdict(r) + renderWarnings(r) +
+      tier("PREDICTED", "calculated from the model's own metadata — step 2 supersedes it") +
+      h`<details class="adv derived"><summary>Settings the planner suggests, its speed
+        estimate, and where the memory goes</summary>` +
+      renderSettings(r) + renderSpeed(r) + renderSummary(r) +
+      renderKvTable(r) + renderBreakdown(r) +
+      h`</details>`;
+  }else if(step === "measure"){
+    panel = renderSweep() + renderHistory();
+  }else{
+    panel = renderScriptStep();
+  }
+  $("out").innerHTML = renderStepper(r) + panel;
   if(r.speed && !r.speed.error) loadSpeedHistory(r);
   // Filled in asynchronously: it needs a live GPU reading and the recorded rows,
   // and neither should hold up the plan the user actually pressed the button for.
@@ -840,23 +873,26 @@ function sweepDefaults(){
  * text inputs, and rebuilding it under the poll destroyed whatever was being
  * typed into them once every second and a half. */
 function renderSweep(){
-  return h`<section class="card" id="sweepcard">
-    <h2>Measure real speed</h2>
-    <p class="note">Everything above is calculated. Two of the settings that matter most to
-      tokens/second are <b>not calculable</b>: speculative decoding has no acceptance rate
-      until you run it, and prompt processing is compute bound and is not modelled here at
-      all. This drives <span class="mono">llama-server</span> across a grid and records what
-      it actually does &mdash; then writes the launch script for whatever wins.</p>
+  return h`<section class="card lead" id="sweepcard">
+    <p class="note">Two of the settings that matter most to tokens/second cannot be calculated:
+      speculative decoding has no acceptance rate until you run it, and prompt processing is
+      compute bound and is not modelled at all. This drives
+      <span class="mono">llama-server</span> across a grid and records what it really does.</p>
     <div id="sweepbody"><p class="muted small">checking the GPU&hellip;</p></div>
   </section>
   <section class="card" id="sweepresultcard">
     <h2>Measured results</h2>
     <div id="sweepresults"><p class="muted small">looking for recorded rows&hellip;</p></div>
-  </section>
-  <section class="card" id="sweepscriptcard">
-    <h2>Launch script</h2>
-    <div id="sweepscript"></div>
   </section>`;
+}
+
+/** Step 3 on its own. Kept out of renderSweep() because it must NOT be rewritten
+ *  on the 1.5s poll - it holds a dozen text inputs, and redrawing it under the
+ *  poll destroyed whatever was being typed once every second and a half. */
+function renderScriptStep(){
+  return h`<section class="card lead" id="sweepscriptcard">
+    <div id="sweepscript"></div>
+  </section>` + renderHistory();
 }
 
 function renderHistory(){
@@ -871,6 +907,89 @@ function renderHistory(){
 
 function tier(label, note){
   return h`<div class="tier"><span>${label}</span><i>${note}</i></div>`;
+}
+
+/* ---------------------------------------------------------------- the steps
+ *
+ *  Three things anyone actually comes here to do, in the order they depend on
+ *  each other: does it FIT, how FAST is it really, and what do I RUN.
+ *
+ *  They used to be twelve stacked sections in one scrolling column - verdict,
+ *  notes, measure, results, script, past sweeps, predicted settings, speed
+ *  estimate, model, KV table, memory breakdown - with no signal about which
+ *  ones were answers and which were controls. Every one of them was visible at
+ *  once, so none of them was the next thing to do.
+ *
+ *  Only the active step renders. The others collapse into the stepper's own
+ *  labels, which carry their answer - "FITS · 11.4 GB", "MEASURED · 3.95 tok/s"
+ *  - so nothing is hidden that you would have to go looking for. */
+const STEPS = [
+  ["fit",     "Does it fit"],
+  ["measure", "Measure real speed"],
+  ["script",  "Launch script"],
+];
+
+let STEP = null;          // null = follow the default for the current state
+
+function stepNow(){
+  if(STEP) return STEP;
+  // A campaign running is the thing you opened the page for, whatever else is
+  // on it. Otherwise start at the gate: measuring a config that cannot load is
+  // an hour spent proving it cannot load.
+  if(SWEEP && SWEEP.status && SWEEP.status.status === "running") return "measure";
+  return LAST ? "fit" : "measure";
+}
+
+function stepSummary(id, r){
+  if(id === "fit"){
+    if(!r) return "no model analyzed";
+    const v = r.verdict || {};
+    return (v.fits === false ? "does not fit" : "fits")
+      + (r.totals && r.totals.vram_mib ? " · " + fmtG(r.totals.vram_mib) : "");
+  }
+  if(id === "measure"){
+    const st = SWEEP && SWEEP.status;
+    if(st && st.status === "running")
+      return "measuring " + st.done + "/" + (st.total || "?");
+    const rows = sweepAllRows ? sweepAllRows() : [];
+    const best = rows.find(x => x.tok_s);
+    return best ? best.tok_s.toFixed(2) + " tok/s best" : "nothing measured yet";
+  }
+  const row = (typeof sweepPickedRow === "function") ? sweepPickedRow() : null;
+  const c = row ? row.config : (SWEEP && SWEEP.predicted);
+  return c ? "ngl " + c.ngl + (c.spec && c.spec !== "none" ? " · " + c.spec : "")
+           : "not ready";
+}
+
+function renderStepper(r){
+  const now = stepNow();
+  const tabs = STEPS.map(([id, label], i) => {
+    const on = id === now;
+    const busy = id === "measure" && SWEEP && SWEEP.status
+                 && SWEEP.status.status === "running";
+    return h`<button class="step ${on ? "on" : ""} ${busy ? "busy" : ""}" type="button"
+      data-action="set-step" data-step="${id}" aria-pressed="${on ? "true" : "false"}">
+      <b>${String(i + 1)}</b><span>${label}</span><i>${stepSummary(id, r)}</i></button>`;
+  }).join("");
+  return h`<nav class="steps" id="stepper" aria-label="What do you want to do">${raw(tabs)}</nav>`;
+}
+
+/** Refresh only the tab labels.
+ *
+ *  They carry the answer of every step that is NOT open - "3.95 tok/s best",
+ *  "measuring 4/9" - which is the entire reason collapsing the other two is
+ *  acceptable. Left out of the poll they went stale immediately: rows load
+ *  after the first paint, so step 2 sat on "nothing measured yet" for a model
+ *  with 145 recorded rows. */
+function drawStepper(){
+  const el = $("stepper");
+  if(el) el.outerHTML = renderStepper(LAST);
+}
+
+function setStep(id){
+  STEP = id;
+  if(LAST) render(LAST); else renderIdle();
+  window.scrollTo({ top: 0, behavior: "smooth" });
 }
 
 async function initSweep(r){
@@ -980,6 +1099,7 @@ function drawSweep(what){
     const hh = $("sweephistory");
     if(hh) hh.innerHTML = sweepHistory();
   }
+  drawStepper();
 }
 
 /** Everything, including the panes that hold live inputs. Only safe when the
@@ -1489,14 +1609,20 @@ function sweepScript(){
     ? h`the <b>measured</b> row selected above (${(row.tok_s || 0).toFixed(2)} tok/s)`
     : h`the planner's <b>predicted</b> split &mdash; nothing has been measured for this model yet,
         and the script will say so`;
-  return h`<div style="margin-top:20px">
-    <p class="sublabel">LAUNCH SCRIPT</p>
-    <p class="note">Built from ${raw(src)}. It resolves the llama.cpp backend fresh at every
-      launch, puts the vendor CUDA libraries on the path (without them the process dies with
-      <span class="mono">STATUS_DLL_NOT_FOUND</span> and no message), writes a dated log file,
-      and uses <span class="mono">--load-mode</span> and
-      <span class="mono">--spec-draft-n-max</span> rather than the deprecated and removed
-      spellings that are accepted and then silently ignored.</p>
+  /* No heading here. This renders INTO the "Launch script" card, which already
+     has one - the sublabel was left behind when the block moved out of the
+     "Measure real speed" card into its own, and printed the title twice. */
+  return h`<div>
+    <p class="note">Built from ${raw(src)}.</p>
+    <details class="adv"><summary>What the script takes care of</summary>
+      <p class="hint">Resolves the llama.cpp backend fresh at every launch, so a pinned path
+        cannot stop existing when LM Studio updates. Puts the vendor CUDA libraries on the path
+        &mdash; without them the process dies with <span class="mono">STATUS_DLL_NOT_FOUND</span>
+        and no message at all. Writes a dated log file, because llama.cpp does not rotate one.
+        Uses <span class="mono">--load-mode</span> and
+        <span class="mono">--spec-draft-n-max</span> rather than the deprecated spellings that
+        are accepted and then silently ignored.</p>
+    </details>
     <div class="chips">${raw(shells)}</div>
     <div class="row" style="margin-top:10px">
       <div class="field"><label for="swport">Port</label>
@@ -1856,8 +1982,12 @@ const ACTIONS = {
   "sweep-plan":  () => sweepPlan(),
   "sweep-start": () => sweepStart(),
   "sweep-stop":  () => sweepStop(),
+  // Picking a row IS the step-3 question - "build me this one" - so it goes
+  // there rather than leaving you to find the tab yourself.
   "sweep-pick":  el => { SWEEP.pickKey = el.dataset.key; SWEEP.script = null;
+                         if(stepNow() !== "script"){ setStep("script"); return; }
                          drawSweep({ grid: false, script: true, history: true }); },
+  "set-step":    el => setStep(el.dataset.step),
   "sweep-open":  el => openCampaign(el.dataset.id),
   "sweep-shell": el => { SWEEP.shell = el.value; SWEEP.script = null;
                          drawSweep({ grid: false, results: false, script: true }); },

@@ -328,6 +328,49 @@ tr.cur td{color:var(--kv)}
 }
 .tier > i{font-style:normal;font-size:var(--t-small);color:var(--dim)}
 
+/* -- the three steps ------------------------------------------------------
+   Twelve sections used to stack in this column at once, so nothing in it was
+   the next thing to do. Now one step renders at a time and the others keep
+   their ANSWER on the tab - "fits · 11.4 GB", "3.95 tok/s best" - so what is
+   collapsed is still legible without opening it. */
+.steps{
+  display:grid;grid-template-columns:repeat(3,1fr);gap:6px;
+  margin-bottom:var(--s4);position:sticky;top:0;z-index:5;
+  background:var(--bg);padding:var(--s3) 0;
+}
+.step{
+  display:flex;flex-direction:column;align-items:flex-start;gap:1px;
+  padding:var(--s3) var(--s4);text-align:left;cursor:pointer;
+  border:1px solid var(--line);border-radius:var(--radius-sm);
+  background:var(--panel);color:var(--muted);font:inherit;
+  border-top:2px solid var(--line);
+}
+.step:hover{border-color:var(--line2);color:var(--ink)}
+.step > b{
+  font-family:var(--mono);font-size:var(--t-micro);color:var(--dim);
+  font-weight:600;letter-spacing:.08em;
+}
+.step > span{font-size:var(--t-body);color:var(--ink);font-weight:600}
+.step > i{
+  font-style:normal;font-size:var(--t-small);color:var(--dim);
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:100%;
+}
+.step.on{border-top-color:var(--kv);background:var(--panel2);color:var(--ink)}
+.step.on > b{color:var(--kv)}
+.step.on > i{color:var(--muted)}
+/* A campaign running is worth seeing from any step, so the tab says so. */
+.step.busy > b::after{content:" ●";color:var(--kv)}
+@media (max-width:820px){
+  .steps{grid-template-columns:1fr}
+  .step{flex-direction:row;align-items:baseline;gap:var(--s3)}
+}
+
+/* Everything the planner derives, behind one disclosure: reference material,
+   not a next action. The cards inside it lose their own frames so it reads as
+   one thing rather than five. */
+.derived > .card{border:0;padding:0;margin-top:var(--s4);background:none}
+.derived > .card > h2{font-size:var(--t-body)}
+
 /* -- past sweeps ---------------------------------------------------------- */
 .camps{display:flex;flex-direction:column;gap:6px;margin-bottom:var(--s4)}
 .camp{border:1px solid var(--line);border-radius:8px;background:var(--panel2)}

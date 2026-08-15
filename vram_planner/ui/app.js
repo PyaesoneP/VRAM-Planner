@@ -895,8 +895,13 @@ async function initSweep(r){
                      attachRunningJob()]);
   // Pre-select this model's campaign, so Past sweeps opens on what was just
   // analyzed instead of on whatever ran most recently.
+  // `mine.length === 1` used to be right, because a model had exactly one
+  // campaign entry. Splitting the index by prompt and template means a model
+  // that has been measured more than once now has several, and an equality on
+  // 1 quietly stopped opening anything at all. Campaigns arrive newest first,
+  // so the most recent one is the one to open - which is the same intent.
   const mine = (SWEEP.campaigns || []).filter(g => g.model === SWEEP.model);
-  if(mine.length === 1) openCampaign(campaignId(mine[0]));
+  if(mine.length) openCampaign(campaignId(mine[0]));
   drawSweepAll();
 }
 
@@ -1257,8 +1262,23 @@ function sweepRow(r, i, pickable){
   const c = r.config || {}, flags = rowFlags(r);
   const failed = r.status && r.status !== "ok";
   const key = rowKey(r);
-  if(pickable) PICKABLE[key] = r;
-  const on = SWEEP.pickKey == null ? (pickable && i === 0) : SWEEP.pickKey === key;
+  if(pickable){
+    PICKABLE[key] = r;
+    // The FIRST pickable row to render adopts the selection outright, instead
+    // of merely drawing itself checked and leaving SWEEP.pickKey null.
+    //
+    // Drawing it checked without recording it was two bugs at once. Pressing
+    // Generate with nothing clicked fell through to sweepAllRows()[0], which
+    // before any Analyze is empty - so a page showing a plainly selected row
+    // answered "Analyze a model first". And once a model HAD been analyzed,
+    // two tables each drew their own row 0 checked under one radio name, so
+    // the browser showed the campaign's row selected while the script was
+    // built from the results table's - silently the wrong row, which is worse.
+    //
+    // Now exactly one radio is ever checked, and it is the one that is used.
+    if(SWEEP.pickKey == null) SWEEP.pickKey = key;
+  }
+  const on = pickable && SWEEP.pickKey === key;
   return h`<tr class="${on && pickable ? "best" : ""}">
     <td>${raw(pickable ? h`<input type="radio" name="swpick" data-action="sweep-pick"
       data-key="${key}" ${on ? "checked" : ""}>` : "")}</td>

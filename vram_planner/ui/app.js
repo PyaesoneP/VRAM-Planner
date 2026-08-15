@@ -1527,7 +1527,12 @@ async function loadHistory(){
   }catch(e){ SWEEP.campaigns = []; }
 }
 
-function campaignId(g){ return g.model + " " + g.gpu + " " + g.file; }
+/* prompt_id and template_id are part of the identity, not decoration: the same
+   model on the same build can hold several campaigns that asked different
+   questions, and they must not open each other. */
+function campaignId(g){
+  return [g.model, g.gpu, g.file, g.prompt_id || "", g.template_id || ""].join(" ");
+}
 
 async function openCampaign(id){
   if(SWEEP.openCampaign === id){         // second click closes it
@@ -1541,7 +1546,11 @@ async function openCampaign(id){
   const g = (SWEEP.campaigns || []).find(x => campaignId(x) === id);
   if(!g) return;
   const q = "model=" + encodeURIComponent(g.model) + "&gpu=" + encodeURIComponent(g.gpu) +
-            "&file=" + encodeURIComponent(g.file);
+            "&file=" + encodeURIComponent(g.file) +
+            // always sent, even empty - "" narrows to the rows that have none,
+            // where omitting the key would widen to all of them
+            "&pid=" + encodeURIComponent(g.prompt_id || "") +
+            "&tid=" + encodeURIComponent(g.template_id || "");
   try{ SWEEP.insights = await (await fetch("/api/speed/insights?" + q)).json(); }
   catch(e){ SWEEP.insights = { ok: false, error: String(e) }; }
   drawSweep({ grid: false, results: false, history: true });
@@ -1558,7 +1567,13 @@ function campaignRow(g){
   return h`<div class="camp ${open ? "open" : ""}">
     <button class="camprow" type="button" data-action="sweep-open" data-id="${id}">
       <span class="mono">${g.model}</span>
-      <span class="muted small">${g.gpu || "?"} &middot; ${g.backend} &middot; ${span}</span>
+      <span class="muted small">${g.gpu || "?"} &middot; ${g.backend} &middot; ${span}
+        &middot; ${raw(g.prompt_id ? "prompt " + h`${g.prompt_id.slice(0, 8)}`
+                       : "<i>pre-freeze prompt</i>")}
+        &middot; ${raw(g.chat_template
+                       ? "template " + h`${g.chat_template}`
+                       : (g.template_id ? "template " + h`${g.template_id.slice(0, 8)}`
+                          : "<i>model&rsquo;s own template</i>"))}</span>
       <span class="campnum">${g.n_ok}/${g.n_rows} ok${raw(
         g.n_untrusted ? " &middot; " + g.n_untrusted + " flagged" : "")}${raw(
         g.n_ungated ? " &middot; " + g.n_ungated + " pre-copy-gate" : "")}</span>

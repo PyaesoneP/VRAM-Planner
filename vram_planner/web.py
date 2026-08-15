@@ -352,7 +352,11 @@ class Handler(BaseHTTPRequestHandler):
                                     "dir": bench_dir(), "n_rows": len(rows)})
         if u.path == "/api/speed/insights":
             from .bench import insights, load_speed_rows
-            q = parse_qs(u.query)
+            # keep_blank_values, because "" is a MEANING here and not an absence:
+            # a campaign with no template pinned is identified by an empty
+            # template_id, and dropping the key would widen the filter to every
+            # template instead of narrowing to the one that has none.
+            q = parse_qs(u.query, keep_blank_values=True)
             get = lambda k: (q.get(k) or [""])[0]
             rows = load_speed_rows()
             # Filter BEFORE analysing, not after: the whole correctness of
@@ -362,6 +366,12 @@ class Handler(BaseHTTPRequestHandler):
                 v = get(key)
                 if v:
                     rows = [r for r in rows if r.get(field) == v]
+            # ...and on what the model was ASKED, which is the half sweep_index
+            # keys on. Present-but-empty means "the rows that have none".
+            for key, field in (("pid", "prompt_id"), ("tid", "template_id")):
+                if key in q:
+                    v = get(key)
+                    rows = [r for r in rows if (r.get(field) or "") == v]
             if not rows:
                 return self._send(200, {"ok": False, "error": "no rows match"})
             res = insights(rows)

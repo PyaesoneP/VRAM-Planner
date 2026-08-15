@@ -1602,16 +1602,9 @@ def _infer_demotion(rows):
         if len(sh) >= 3:
             base_sh = _median(sh)
             for r in grp:
-                if r.get("shared_mib") is None:
-                    continue
-                r["shared_excess"] = round(max(0.0, r["shared_mib"] - base_sh), 1)
-                # Rows written by the first version of demoted() carry a stored
-                # `spilled: true` that came from the raw counter clearing 64
-                # MiB - which every llama.cpp process does. Re-decide it here,
-                # where the ladder is available and the number means something.
-                # suspect_reason()'s verdict is untouched; it never depended on
-                # the counter.
-                r["spilled"] = bool(r.get("suspect")) or demoted(r)
+                if r.get("shared_mib") is not None:
+                    r["shared_excess"] = round(
+                        max(0.0, r["shared_mib"] - base_sh), 1)
         # ...and the floor collapse, which is the only signal a row recorded
         # before the counter existed can offer.
         mid = _median([x["floor_mib"] for x in grp])
@@ -1632,6 +1625,21 @@ def _infer_demotion(rows):
                 # the wall being FOUND. Excluding those rows would hide the very
                 # thing an ngl sweep exists to locate.
                 r["spill_inferred"] = round(mid - r["floor_mib"], 1)
+
+    # Every row that carries a counter reading gets its verdict re-decided, and
+    # the ones OUTSIDE any usable group matter most. Rows written by the first
+    # version of demoted() carry a stored `spilled: true` that came from the raw
+    # counter clearing 64 MiB - which every llama.cpp process does - and a lone
+    # measured row has no ladder to be excess over, so nothing in the loop above
+    # would ever reach it. It would keep a verdict from a detector that no
+    # longer exists, permanently outside trustworthy(). That is what happened to
+    # the ngl 31 reference row: one measured row in its group, still flagged.
+    #
+    # demoted() answers from shared_excess, which is None here, so the verdict
+    # falls back to suspect_reason() alone - the one test a single row supports.
+    for r in rows:
+        if r.get("status") == "ok" and r.get("shared_mib") is not None:
+            r["spilled"] = bool(r.get("suspect")) or demoted(r)
 
 
 def rank_rows(rows):
@@ -1755,16 +1763,28 @@ def _slim(r):
 
 
 def sweep_index(rows):
-    """One entry per (model, GPU, backend build) - the browsable list of campaigns.
+    """One entry per EXPERIMENT - the browsable list of campaigns.
 
     Split by build as well as by card, because a llama.cpp version bump moves
-    these numbers and merging two builds into one campaign would hide that."""
+    these numbers and merging two builds into one campaign would hide that.
+
+    And split by prompt_id and template_id, for the reason the rest of this
+    module already splits on them: they are what the model was ASKED. Keying on
+    (model, gpu, build) alone collapsed 145 rows spanning three prompts and two
+    templates into a single line, headlined by whichever prompt_id happened to
+    come first and a best_tok_s taken from a 2k-fill row of an experiment nobody
+    was looking at. The campaign run that morning was inside it and could not be
+    found - which is the whole job of a browsable index.
+
+    The tradeoff is that a campaign whose corpus was refreshed mid-run now shows
+    as two entries. That is the honest shape: it WAS two experiments."""
     groups = {}
     for r in rows:
-        k = (r.get("model") or "?", r.get("gpu") or "", r.get("_file") or "")
+        k = (r.get("model") or "?", r.get("gpu") or "", r.get("_file") or "",
+             r.get("prompt_id") or "", r.get("template_id") or "")
         groups.setdefault(k, []).append(r)
     out = []
-    for (model, gpu, f), rs in groups.items():
+    for (model, gpu, f, pid, tid), rs in groups.items():
         ok = [r for r in rs if trustworthy(r)]
         when = [r.get("when") for r in rs if r.get("when")]
         fills = sorted({(r.get("config") or {}).get("fill") or 0 for r in rs})
@@ -1783,8 +1803,14 @@ def sweep_index(rows):
             # in them. The campaign is real; it is just not fully gated.
             "n_ungated": sum(1 for r in rs if r.get("status") == "ok"
                              and r.get("copyback_ratio") is None),
-            "prompt_id": next((r.get("prompt_id") for r in rs
-                               if r.get("prompt_id")), None),
+            # Now a property of the GROUP rather than of whichever row came
+            # first, because the group is keyed on it.
+            "prompt_id": pid or None,
+            "template_id": tid or None,
+            "chat_template": next((r.get("chat_template") for r in rs
+                                   if r.get("chat_template")), None),
+            "template_kwargs": next((r.get("template_kwargs") for r in rs
+                                     if r.get("template_kwargs")), None),
             "first": min(when) if when else None,
             "last": max(when) if when else None,
             "fills": fills, "stages": stages,

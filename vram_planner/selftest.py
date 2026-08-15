@@ -1412,6 +1412,19 @@ def _run_suite(require_refs, tmp, skipped_real):
         _infer_demotion(step)
         meas_ok = (meas_ok and step[-1]["shared_excess"] == 240.0
                    and step[-1]["spilled"] and not trustworthy(step[-1]))
+        # A LONE measured row has no ladder to be excess over, so nothing in the
+        # grouping can reach it - and it would otherwise keep the stored verdict
+        # of a detector that no longer exists, permanently untrustworthy. This is
+        # the real ngl 31 reference row, the only measured row in its group.
+        lone = [srow(31, 238.0, 3.25, spec="none")]
+        lone[0]["config"] = dict(lone[0]["config"], spec="none", spec_n_max=0)
+        _infer_demotion(lone)
+        meas_ok = (meas_ok and lone[0].get("shared_excess") is None
+                   and not lone[0]["spilled"] and trustworthy(lone[0]))
+        # ...unless suspect_reason() flagged it, which never used the counter
+        sus = [srow(31, 238.0, 3.25, suspect="floor_mib is negative")]
+        _infer_demotion(sus)
+        meas_ok = meas_ok and sus[0]["spilled"]
 
         # The inference, for rows recorded before the counter existed. These are
         # the real numbers from the ngl ladder: five rungs agreeing within 12

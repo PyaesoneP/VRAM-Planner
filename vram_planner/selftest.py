@@ -860,6 +860,298 @@ def _run_suite(require_refs, tmp, skipped_real):
           % (rm2["plan"]["n_cpu_moe"], sm.get("cpu_mib", 0), "OK" if moe_ok else "FAIL"))
     ok = ok and moe_ok
 
+    # 11) build_argv's probe flag, and the launch scripts built on top of it
+    try:
+        from .launch import command_lines, launch_script
+        from .sweep import build_argv, build_grid, model_facts
+
+        # 11a) probe=True must be what it always was. bench and sweep both depend
+        # on this, and a silent change to the probe command line would invalidate
+        # every recorded row without invalidating any recorded row's LOOK.
+        cg = build_grid(model_facts(p3))[0]
+        pro = build_argv("EXE", "M.gguf", cg, 8231)
+        usr = build_argv("EXE", "M.gguf", cg, 8231, probe=False)
+        dropped = [x for x in pro if x not in usr]
+        probe_ok = (pro[:pro.index("--port") + 2] == usr[:usr.index("--port") + 2]
+                    and set(dropped) == {"--cache-ram", "0", "-v", "--no-warmup"}
+                    and not [x for x in usr if x not in pro])
+        print("  ARGV  probe=False drops only %s  %s"
+              % (sorted(set(dropped)), "OK" if probe_ok else "FAIL"))
+
+        # 11b) A generated script must never EXECUTE a flag that this build
+        # ignores. Comments naming them are the useful part, so the check reads
+        # what runs, not what the file contains - see command_lines().
+        DEAD = ("--draft-max", "--no-mmap", "--mlock")
+        base = {"ctx": 8192, "kv": "q8_0", "fa": True, "seq": 1, "ub": 512, "ngl": 20}
+        cases = [
+            ("plain",  dict(base), {}),
+            ("spec",   dict(base, spec="draft-mtp", spec_n_max=2), {}),
+            ("projram", dict(base, mmproj_offload=False), {"mmproj": "mm.gguf"}),
+            ("moe",    dict(base, ngl=99, ncmoe=12), {}),
+        ]
+        gen_ok, why = True, []
+        for shell in ("powershell", "bash"):
+            for name, c, extra in cases:
+                run = "\n".join(command_lines(
+                    launch_script("m.gguf", c, shell=shell, **extra)))
+                for d in DEAD:
+                    if d in run:
+                        gen_ok = False; why.append("%s/%s runs %s" % (shell, name, d))
+                # a flag appears exactly when the config implies it
+                for flag, want in (("--spec-draft-n-max", bool(c.get("spec"))),
+                                   ("--no-mmproj-offload", c.get("mmproj_offload") is False),
+                                   ("--n-cpu-moe", bool(c.get("ncmoe"))),
+                                   ("--load-mode", True)):
+                    if (flag in run) != want:
+                        gen_ok = False
+                        why.append("%s/%s %s=%s" % (shell, name, flag, flag in run))
+                # nothing invents a sampler the caller did not choose
+                for s in ("--temp", "--top-k", "--top-p", "--min-p"):
+                    if s in run:
+                        gen_ok = False; why.append("%s/%s invented %s" % (shell, name, s))
+        run = "\n".join(command_lines(launch_script(
+            "m.gguf", base, shell="bash", sampling={"temp": 1.0, "min_p": ""})))
+        if "--temp" not in run or "--min-p" in run:
+            gen_ok = False; why.append("blank sampler handling")
+        print("  SCRIPT no dead flags, flags match config, blank samplers omitted%s  %s"
+              % ("" if gen_ok else "  " + "; ".join(why[:4]), "OK" if gen_ok else "FAIL"))
+
+        # 11c) The chat template. --jinja HAS to precede --chat-template-file:
+        # without it a build accepts only its built-in template NAMES and rejects
+        # a path, so getting the order wrong produces a script that looks right
+        # and silently serves the wrong template.
+        from .launch import ps_quote, sh_quote, template_args
+        tmpl_ok, twhy = True, []
+        # A space and an apostrophe: the two characters that break a shell literal.
+        tf = "C:\\models\\it's a dir\\my chat.jinja"
+        want = {"powershell": ps_quote(tf), "bash": sh_quote(tf.replace("\\", "/"))}
+        for shell in ("powershell", "bash"):
+            run = command_lines(launch_script(
+                "m.gguf", base, shell=shell, chat_template_file=tf,
+                chat_template_kwargs='{"enable_thinking": false}'))
+            js = [i for i, l in enumerate(run) if "--jinja" in l]
+            fs = [i for i, l in enumerate(run) if "--chat-template-file" in l]
+            ks = [i for i, l in enumerate(run) if "--chat-template-kwargs" in l]
+            if not (js and fs and ks and min(js) < min(fs)):
+                tmpl_ok = False
+                twhy.append("%s ordering jinja=%s file=%s" % (shell, js, fs))
+            # The path and the JSON survive quoting - as a correctly ESCAPED
+            # literal, which is not the same string that went in: the apostrophe
+            # is doubled for PowerShell and spliced out and back for sh.
+            text = "\n".join(run)
+            if want[shell] not in text:
+                tmpl_ok = False; twhy.append("%s mis-quoted the path" % shell)
+            if '{"enable_thinking":false}' not in text:
+                tmpl_ok = False; twhy.append("%s lost the kwargs JSON" % shell)
+            # and blank means BLANK - no flag, not an empty one
+            blank = "\n".join(command_lines(launch_script("m.gguf", base, shell=shell)))
+            if "chat-template" in blank or "--jinja" in blank:
+                tmpl_ok = False; twhy.append("%s emits template flags when unset" % shell)
+        # kwargs that are not a JSON OBJECT are rejected at generation time, which
+        # is the difference between a message and a server that will not start
+        for bad in ("not json", "[1,2]", '"str"', "3"):
+            try:
+                template_args(None, bad)
+                tmpl_ok = False; twhy.append("accepted %r" % bad)
+            except ValueError:
+                pass
+        if template_args(None, {"b": 1, "a": 2})[1] != '{"a":2,"b":1}':
+            tmpl_ok = False; twhy.append("dict kwargs not serialised stably")
+        print("  TMPL  --jinja precedes the template flags, bad kwargs refused%s  %s"
+              % ("" if tmpl_ok else "  " + "; ".join(twhy[:4]), "OK" if tmpl_ok else "FAIL"))
+
+        # Windows PowerShell 5.1 re-quotes native arguments and DROPS double
+        # quotes already inside a value, so a valid '{"a":1}' reaches the exe as
+        # {a:1} and llama-server rejects it with a JSON parse error pointing at
+        # column 2 - which reads like the JSON was wrong. The kwargs are the only
+        # value here that contains quotes, so they are the only one that needs the
+        # escape, and it must be conditional: PowerShell 7.3+ passes the argument
+        # through intact and the backslashes would arrive literally.
+        psk = command_lines(launch_script(
+            "m.gguf", base, shell="powershell",
+            chat_template_kwargs='{"enable_thinking": false}'))
+        add = [l for l in psk if "--chat-template-kwargs" in l and "+=" in l]
+        quote_ok = (any("PSNativeCommandArgumentPassing" in l for l in psk)
+                    and any("-replace" in l and "\\\"" in l for l in psk)
+                    and bool(add) and "$ChatTemplateKwargs" not in add[0])
+        # bash needs none of this: execve takes argv directly, nothing re-parses it
+        bsh = command_lines(launch_script(
+            "m.gguf", base, shell="bash",
+            chat_template_kwargs='{"enable_thinking": false}'))
+        quote_ok = quote_ok and not any("-replace" in l for l in bsh)
+        print("  TMPL  PowerShell escapes the kwargs quotes, bash does not  %s"
+              % ("OK" if quote_ok else "FAIL"))
+        tmpl_ok = tmpl_ok and quote_ok
+
+        # 11d) A script built from an old speed row names a model this machine may
+        # no longer have. It must still emit every flag - those are the valuable
+        # part - and must SAY the path did not resolve rather than looking fine.
+        miss = launch_script("Deleted.gguf", base, shell="bash", path_resolved=False)
+        lost_ok = ("NOT found on disk" in miss
+                   and "--load-mode" in "\n".join(command_lines(miss)))
+        print("  TMPL  unresolved model still generates, and says so  %s"
+              % ("OK" if lost_ok else "FAIL"))
+        script_ok = probe_ok and gen_ok and tmpl_ok and lost_ok
+    except Exception as e:
+        script_ok = False
+        print("  SCRIPT raised %s: %s  FAIL" % (type(e).__name__, e))
+    ok = ok and script_ok
+
+    # 12) the job runner: one at a time, and a cancel that is actually observed
+    try:
+        import threading, time as _time
+        from .job import Job
+        j = Job()
+        gate, seen = threading.Event(), {}
+
+        def work(job):
+            job.set_total(2)
+            job._append("started")
+            gate.wait(5)
+            seen["cancelled"] = job.cancelled()
+            job._add_row({"status": "ok", "tok_s": 1.0})
+            return {"rows": 1}
+
+        started, _ = j.start("test", work)
+        second, _ = j.start("test", work)      # must be refused, not queued
+        j.cancel()
+        gate.set()
+        for _ in range(50):
+            if not j.running: break
+            _time.sleep(0.05)
+        snap = j.snapshot()
+        job_ok = (started and not second and seen.get("cancelled") is True
+                  and snap["status"] == "cancelled" and snap["done"] == 1
+                  and snap["total"] == 2)
+        print("  JOB   second start refused=%s | cancel seen=%s | status=%s  %s"
+              % (not second, seen.get("cancelled"), snap["status"],
+                 "OK" if job_ok else "FAIL"))
+    except Exception as e:
+        job_ok = False
+        print("  JOB   raised %s: %s  FAIL" % (type(e).__name__, e))
+    ok = ok and job_ok
+
+    # 13) chaining, and the findings drawn out of recorded rows. Both are places
+    # where being wrong is worse than being absent: a bad chained baseline bends
+    # every stage after it in one direction, and an insight that compares across
+    # experiments manufactures an effect out of the difference between the runs.
+    try:
+        from .bench import (axis_effects, best_config, comparable, pareto,
+                            depth_curve)
+        from .sweep import _key as _skey
+
+        B = {"ctx": 32768, "kv": "q8_0", "fa": True, "seq": 1, "ub": 512,
+             "ngl": 28, "fill": 2048}
+
+        def row(tok, cfg=None, **kw):
+            c = dict(B); c.update(cfg or {})
+            r = {"model": "M.gguf", "gpu": "G", "_file": "f.jsonl", "status": "ok",
+                 "tok_s": tok, "n_predict": 128, "repeat": 3, "config": c,
+                 "proc_vram_mib": kw.pop("vram", 8000)}
+            r.update(kw); return r
+
+        INC = 8.0
+        refuse = [
+            ("spilled",      [row(20.0, {"ngl": 31}, spilled=True)]),
+            ("looping",      [row(20.0, {"ngl": 31}, distinct_ratio=0.3)]),
+            ("other fill",   [row(20.0, {"ngl": 31, "fill": 64000})]),
+            ("other kv",     [row(20.0, {"ngl": 31, "kv": "f16"})]),
+            ("other npred",  [dict(row(20.0, {"ngl": 31}), n_predict=32)]),
+            ("inside 2%",    [row(INC * 1.01, {"ngl": 31})]),
+        ]
+        chain_ok, cwhy = True, []
+        for label, rows_ in refuse:
+            c, _w = best_config(rows_, "M.gguf", B, 128, 3, incumbent_tok_s=INC)
+            if c is not None:
+                chain_ok = False; cwhy.append("took a %s row" % label)
+        c, w = best_config([row(INC * 1.05, {"ngl": 31})], "M.gguf", B, 128, 3,
+                           incumbent_tok_s=INC)
+        if not c or c["ngl"] != 31:
+            chain_ok = False; cwhy.append("refused a legitimate +5% challenger")
+        # only the six knobs carry; the campaign's own definition never does
+        c, _ = best_config([row(9.9, {"ngl": 31, "ub": 2048, "spec": "draft-mtp",
+                                      "spec_n_max": 2, "stage": "D"})],
+                           "M.gguf", B, 128, 3, incumbent_tok_s=INC)
+        if not c or c["ub"] != 2048 or c["spec"] != "draft-mtp" or "stage" in c \
+                or c["ctx"] != B["ctx"] or c["fill"] != B["fill"]:
+            chain_ok = False; cwhy.append("carried the wrong keys")
+        # Samplers are a condition of the measurement, not a config knob: greedy
+        # is speculation's best case, so a greedy row and a sampled one are two
+        # experiments. They must not meet in a baseline OR in an effect size.
+        samp_ok = (not comparable(row(9.0), "M.gguf", dict(B, temp=0.7), 128, 3)
+                   and comparable(row(9.0, {"temp": 0.7}), "M.gguf",
+                                  dict(B, temp=0.7), 128, 3)
+                   # and a config that omits a sampler groups with one that sets
+                   # it to its neutral value - they are the same measurement
+                   and comparable(row(9.0, {"rep_pen": 1.0, "pres_pen": 0.0}),
+                                  "M.gguf", B, 128, 3))
+        mixed_s = [row(5.0, {"ub": 512}), row(6.0, {"ub": 1024}),
+                   row(99.0, {"ub": 2048, "temp": 0.7})]
+        ub_s = [e for e in axis_effects(mixed_s)["effects"] if e["axis"] == "ub"][0]
+        samp_ok = samp_ok and sorted(v["value"] for v in ub_s["values"]) == [512, 1024]
+        print("  CHAIN samplers are a condition, not a knob: greedy never meets "
+              "sampled  %s" % ("OK" if samp_ok else "FAIL"))
+
+        # rep_pen/pres_pen are real --speed-axes names, so a ladder over either
+        # has to produce distinct resume keys - and a config that omits them must
+        # still key identically to every row already on disk.
+        kb = {"ctx": 32768, "ngl": 28, "ub": 512, "seq": 1, "fa": True, "kv": "q8_0"}
+        key_ok = (_skey("M", kb) == _skey("M", dict(kb, rep_pen=1.0, pres_pen=0.0))
+                  and len({_skey("M", dict(kb, rep_pen=v))
+                           for v in (1.0, 1.05, 1.1)}) == 3
+                  and len({_skey("M", dict(kb, pres_pen=v))
+                           for v in (0.0, 0.5, 1.0)}) == 3)
+        print("  CHAIN sampler ladders resume distinctly, old rows key unchanged  %s"
+              % ("OK" if key_ok else "FAIL"))
+        chain_ok = chain_ok and samp_ok and key_ok
+        print("  CHAIN untrustworthy/incomparable rows refused, 2%% margin held%s  %s"
+              % ("" if chain_ok else "  " + "; ".join(cwhy[:3]), "OK" if chain_ok else "FAIL"))
+
+        # An effect may only ever be computed inside one experiment.
+        mixed = [row(5.0, {"ub": 512}), row(6.0, {"ub": 1024}),
+                 dict(row(99.0, {"ub": 2048}), gpu="OTHER GPU"),
+                 dict(row(98.0, {"ub": 2048}), _file="other.jsonl"),
+                 dict(row(97.0, {"ub": 2048}), n_predict=32),
+                 row(96.0, {"ub": 2048, "fill": 64000})]
+        eff = {e["axis"]: e for e in axis_effects(mixed)["effects"]}
+        ub = eff.get("ub") or {}
+        vals = sorted(v["value"] for v in ub.get("values", []))
+        split_ok = (vals == [512, 1024] and not ub.get("single")
+                    and abs((ub.get("gain_pct") or 0) - 20.0) < 0.1)
+        # a row that stands alone is REPORTED as that, not quietly dropped
+        alone = {e["axis"]: e for e in axis_effects([row(5.0)])["effects"]}
+        alone_ok = alone.get("ub", {}).get("single") is True
+        # and untrustworthy rows never reach a conclusion, though rank_rows lists them
+        dirty = [row(5.0, {"ub": 512}), row(6.0, {"ub": 1024}),
+                 row(50.0, {"ub": 2048}, spilled=True)]
+        dax = {e["axis"]: e for e in axis_effects(dirty)["effects"]}
+        clean_ok = (2048 not in [v["value"] for v in dax["ub"]["values"]]
+                    and axis_effects(dirty)["n_excluded"] == 1)
+        print("  FIND  comparisons never cross experiments (%s), lone value kept, "
+              "spilled excluded  %s"
+              % (vals, "OK" if (split_ok and alone_ok and clean_ok) else "FAIL"))
+
+        # Pareto: exactly the non-dominated set.
+        pts = [row(10.0, {"ngl": 1}, vram=5000),   # fastest, biggest    -> in
+               row(9.0, {"ngl": 2}, vram=4000),    # slower, smaller     -> in
+               row(8.0, {"ngl": 3}, vram=4500),    # dominated by ngl 2  -> out
+               row(7.0, {"ngl": 4}, vram=3000)]    # slowest, smallest   -> in
+        got = sorted((r["config"]["ngl"]) for r in pareto(pts))
+        par_ok = got == [1, 2, 4]
+        # depth: only configs actually measured at more than one fill
+        dep = depth_curve([row(10.0, {"fill": 2048}), row(5.0, {"fill": 32768}),
+                           row(9.0, {"fill": 2048, "ngl": 99})])
+        dep_ok = (len(dep) == 1 and len(dep[0]["points"]) == 2
+                  and abs(dep[0]["drop_pct"] - 50.0) < 0.1)
+        print("  FIND  pareto frontier %s, depth curve needs two depths  %s"
+              % (got, "OK" if (par_ok and dep_ok) else "FAIL"))
+        find_ok = (chain_ok and split_ok and alone_ok and clean_ok and par_ok
+                   and dep_ok)
+    except Exception as e:
+        find_ok = False
+        print("  CHAIN/FIND raised %s: %s  FAIL" % (type(e).__name__, e))
+    ok = ok and find_ok
+
     if skipped_real:
         print("\n  %d real-measurement section(s) did not run: %s"
               % (len(skipped_real), ", ".join(skipped_real)))

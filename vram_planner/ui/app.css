@@ -273,7 +273,91 @@ tr.cur td{color:var(--kv)}
 @media (prefers-reduced-motion: reduce){.spin{animation-duration:2s}}
 
 .actions{margin-top:var(--s4);display:flex;gap:var(--s2);align-items:center;flex-wrap:wrap}
+
+/* -- speed sweep ---------------------------------------------------------- */
+/* A chip holding a checkbox is still a label, so it has to stay clickable and
+   show the tick; the plain .chip above is a button. */
+.chip > input{margin-right:6px;vertical-align:-1px}
+.chip:has(> input:checked){border-color:var(--kv);color:var(--kv)}
+
+.prog{
+  height:6px;border-radius:4px;background:var(--sunk);border:1px solid var(--line);
+  overflow:hidden;margin:var(--s2) 0;
+}
+.prog > i{display:block;height:100%;background:linear-gradient(90deg,var(--wt),var(--kv));
+  transition:width .4s ease}
+@media (prefers-reduced-motion: reduce){.prog > i{transition:none}}
+
+.logbox{
+  background:var(--sunk);border:1px solid var(--line);border-radius:8px;
+  padding:var(--s2) var(--s3);font-family:var(--mono);font-size:11.5px;
+  color:var(--muted);max-height:15em;overflow:auto;white-space:pre-wrap;
+  word-break:break-word;margin:var(--s3) 0 0;
+}
+
+/* The fastest row is the one people copy, so it is marked - but the caveat flags
+   beside it are the point, not decoration. */
+.rowtable tr.best td{color:var(--kv)}
+.rowtable td:first-child,.rowtable th:first-child{width:1.6em}
+/* A full launcher is ~150 lines. Shown whole it buries everything below it, and
+   nobody reads a generated script in the page anyway - they copy or save it. */
+#swscript{max-height:26em;overflow:auto;white-space:pre}
+
+.flag{
+  display:inline-block;padding:1px 6px;border-radius:999px;margin-right:4px;
+  border:1px solid var(--warn);color:var(--warn);
+  font-size:var(--t-micro);font-family:var(--sans);cursor:help;
+}
 .sr-only{
   position:absolute;width:1px;height:1px;padding:0;margin:-1px;
   overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap;border:0;
 }
+
+/* -- tier divider ---------------------------------------------------------
+   The results column now runs measured-first, predicted-second, and without a
+   marker the switch from "what your card did" to "what the model estimates"
+   is invisible - which is the one distinction on this page worth never losing. */
+.tier{
+  display:flex;align-items:baseline;gap:var(--s3);
+  margin:var(--s5) 0 var(--s3);padding-top:var(--s4);
+  border-top:1px solid var(--line);
+}
+.tier > span{
+  font-family:var(--mono);font-size:var(--t-micro);letter-spacing:.12em;
+  color:var(--muted);
+}
+.tier > i{font-style:normal;font-size:var(--t-small);color:var(--dim)}
+
+/* -- past sweeps ---------------------------------------------------------- */
+.camps{display:flex;flex-direction:column;gap:6px;margin-bottom:var(--s4)}
+.camp{border:1px solid var(--line);border-radius:8px;background:var(--panel2)}
+.camp.open{border-color:var(--line2)}
+.camprow{
+  display:flex;align-items:baseline;gap:var(--s3);flex-wrap:wrap;
+  width:100%;padding:9px 11px;text-align:left;cursor:pointer;
+  background:none;border:0;color:var(--ink);font:inherit;
+}
+.camprow:hover{background:var(--sunk)}
+.camprow > .mono{flex:1 1 16em;min-width:0;overflow-wrap:anywhere}
+.campnum{font-size:var(--t-small);color:var(--muted);white-space:nowrap}
+.campbest{font-family:var(--mono);color:var(--kv);white-space:nowrap}
+.campcaret{color:var(--dim);width:1em;text-align:center}
+.campopen{padding:2px 11px 12px;border-top:1px solid var(--line)}
+
+/* -- findings ------------------------------------------------------------- */
+.axtable td{vertical-align:top}
+.axtable tr.dim td{color:var(--dim)}
+/* The effect size is the number people act on, so it gets the weight. */
+.gain{font-family:var(--mono);white-space:nowrap;color:var(--muted)}
+.gain.up{color:var(--kv)}
+.gain.down{color:var(--warn)}
+/* One measured value and what it did, kept together: a bare list of values
+   invites reading the order as the ranking and the ranking as the effect. */
+.vchip{
+  display:inline-block;padding:1px 7px;margin:2px 3px 2px 0;border-radius:999px;
+  border:1px solid var(--line2);color:var(--muted);
+  font-family:var(--mono);font-size:var(--t-micro);white-space:nowrap;
+}
+.vchip > i{font-style:normal;color:var(--ink);margin-left:5px}
+.vchip.win{border-color:var(--kv);color:var(--kv)}
+.vchip.win > i{color:var(--kv)}

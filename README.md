@@ -74,6 +74,8 @@ python -m vram_planner --self-test --require-refs
                                           # ...and fail if a real-load check is skipped
 python -m vram_planner --version
 python -m vram_planner --sweep --dry-run  # what --sweep would run (see Measuring it yourself)
+python -m vram_planner --speed-sweep      # measure tok/s across configs (see Measuring speed)
+python -m vram_planner --speed-report     # every measured config, fastest first
 ```
 
 Calibration and benchmark history live in `%LOCALAPPDATA%\vram-planner\`
@@ -97,14 +99,18 @@ every number has one home:
 | `calib` | fitting `compute` to this machine's measurements |
 | `plan` | `analyze()` and the layer-split planners |
 | `sweep` | driving `llama-server` across a config grid, recording what it allocates |
+| `bench` | driving it across a grid and recording how fast it **generates** |
 | `fit` | scoring `compute` against sweep data, held out |
+| `launch` | turning a config into a runnable `llama-server` launch script |
+| `job` | the one background campaign the web UI can start and watch |
 | `web` | JSON endpoints and static file serving |
 | `ui/` | `index.html`, `app.css`, `app.js` — the front end, as real files |
 | `selftest` | synthetic GGUFs and the test suite |
 | `cli` | entry point |
 
-`sweep` and `fit` are the evidence base, not part of a plan — nothing above imports
-them and the tool works without ever running either. See **Measuring it yourself**.
+`sweep`, `bench` and `fit` are the evidence base, not part of a plan — nothing above
+imports them and the tool works without ever running any of them. See **Measuring it
+yourself** and **Measuring speed**.
 
 Three edges run backwards and are imported inside the function that needs them:
 `compute.compute_buffer_terms` reads `calib.calib_coeffs`, `calib.record_calibration`
@@ -437,6 +443,157 @@ rather than dropped; a load taken with the card at the wall, where Windows spill
 shared memory and the counter reports the cap instead of the need, is detected and
 excluded from fitting. `--probe MODEL ctx=A,B,C` runs an explicit ladder when something
 in the grid does not interpolate.
+
+## Measuring speed
+
+The roofline above predicts decode from bytes and bandwidth. Two settings move real
+tok/s a long way and are invisible to it, so there is a second harness for them:
+
+- **Speculative decoding.** `speed.py` has no acceptance-rate term, and
+  `per_token_bytes()` skips MTP blocks because they do not run during ordinary decode.
+  The planner can price what speculation *costs* — an f16 draft cache, whatever
+  `--cache-type-k` says — and nothing of what it saves.
+- **Prompt processing**, which is not modelled anywhere here on purpose.
+
+Run it **from the web UI** — the *Measure real speed* card under the plan — or from the
+command line:
+
+```
+python -m vram_planner --speed-sweep --dry-run     # the grid and the estimate
+python -m vram_planner --speed-sweep               # hours; resumable
+python -m vram_planner --speed-sweep --speed-chain # each stage built from what won
+python -m vram_planner --speed-report              # every row, fastest first
+python -m vram_planner --speed-report --insights   # what the campaigns FOUND
+python -m vram_planner --speed-sweep --speed-axes "ngl=28,30 spec=draft-mtp spec_n_max=1,2,3"
+```
+
+In the browser it is the same harness: it takes context and KV quant from the form and
+freezes them, previews the grid before committing hours to it, shows rows as they land,
+and stops between configs rather than mid-measurement — nothing is lost either way,
+because every row is already on disk and keyed, so starting again resumes. It refuses to
+start while anything else holds the GPU, and names what: a resident model does not make
+the sweep *fail*, it makes every row wrong in the same direction, which is worse.
+
+### Chaining the stages
+
+By default the grid is staged one knob at a time from **one fixed baseline**, so ubatch
+and speculation are measured at a layer split that stage A has not confirmed. `--speed-chain`
+(ticked by default in the browser) builds each stage *after* the previous one finishes,
+from the fastest trustworthy row so far. **Same number of loads, so the same hours** — it
+is not a wider search, it is the same search with the baseline kept honest.
+
+Two rules keep it from being worse than the fixed version. A row that **spilled** into
+shared memory or that caught the model **looping** is never carried forward: it would bend
+every later stage in the same direction, silently. And a challenger has to win by more
+than **2%**, because `tok_s` is a median of a few passes — rebasing on jitter would make
+the campaign's path depend on noise rather than on anything it measured.
+
+`--speed-rounds N` re-runs the stages from the winner. It is cheap by construction: the
+resume key does not include the stage letter, so a config a later round revisits unchanged
+is already recorded and is skipped, and only genuinely new combinations cost time.
+
+### Reading a campaign back
+
+A ranking says which config won. It does not say what the campaign *learned*, and those
+are different — "1024 is the fastest ubatch" is worth much less than "ubatch is worth 6%
+and speculation is worth 41%", because only the second tells you where the next two hours
+should go. `--speed-report --insights`, and the **Past sweeps** card in the browser, give:
+
+| | |
+|---|---|
+| what each knob was worth | best value vs its natural reference, with the effect size |
+| speed vs context depth | the same config at more than one fill — the slope, not an assertion |
+| speed vs VRAM | the rows nothing beats on *both*, since "fastest" and "fastest that leaves the desktop a card" are different questions |
+
+Every effect comes from a **controlled comparison**: rows are bucketed by everything
+*except* the axis in question, and rows differing in GPU, llama.cpp build, context, KV
+quant, fill depth or pass count are different experiments that never meet. Averaging
+across them would manufacture an effect out of the difference between the runs. An axis
+measured at only one value is reported as such rather than dropped — "we never varied
+this" is itself usually the actionable finding.
+
+Past sweeps needs **no model analyzed and touches no GPU**: it is what the page shows
+before you have pressed Analyze, and you can pick any historical row and generate a launch
+script straight from it. Rows record a model's *basename*, so if the file has moved or was
+measured on another machine the script is still written in full, with a header line saying
+the path did not resolve — the flags are the valuable part and the path is one edit.
+
+**[docs/speed-sweep.md](docs/speed-sweep.md) is the full guide** — the staged design,
+freezing context/KV, why the primary knob inverts on MoE, the axis reference, and the
+measurement discipline (bracketing controls, why greedy overstates speculation, and the
+repetition check that catches a fake acceptance rate).
+
+It launches `llama-server` per config, sizes the prompt with the server's own
+`/tokenize` so "32k of context" means 32k, runs **one cold pass** (that is the prefill
+measurement) and then **three cache-warm passes** (pure decode, median reported), and
+stores the whole `timings` block — including `draft_n` / `draft_n_accepted`, so a
+speculative result arrives with the acceptance rate that explains it.
+
+Rows go to `speed/`, **not** `sweeps/`. That separation is load-bearing: `fit.py` globs
+every `.jsonl` under `sweeps/` and fits anything `suspect_reason()` accepts, and
+`compute.py` has no term for a draft cache — those megabytes would be absorbed into
+`floor` and `ctx` and quietly corrupt every future plan.
+
+Two traps it is built around. The filler prompt is this repository's own README and
+sources, snapshotted once per process: real prose and code, because a prompt built by
+repeating one paragraph hands n-gram speculation a result it could never reproduce on
+real work, and re-reading a live working tree mid-campaign makes early and late rows
+incomparable. And each row records a sample of what was generated plus a
+`distinct_ratio` over its 8-word windows, because `temperature 0` with `ignore_eos` can
+put a model in a repetition loop, which is exactly what n-gram speculation predicts
+perfectly — the ratio is how you tell a real speculative win from an artefact of the
+harness.
+
+## The launch script
+
+The payoff of a tuning campaign is a command line, and a command line is the part that
+gets lost. The *Launch script* block writes the whole launcher instead — for the row you
+pick, or for the planner's predicted split if you have not measured yet, in which case
+the script says so in its own header. PowerShell or bash.
+
+It exists because a bare command line walks into seven traps that this repository already
+knows about:
+
+- `llama-server` is **not on PATH** — it ships inside LM Studio's backends folder.
+- It will not run from that folder alone: the CUDA runtime lives in a separate shared
+  *vendor* package, and without it the process dies with `STATUS_DLL_NOT_FOUND`
+  (exit `-1073741515`) and **no error message at all**.
+- A pinned backend path silently stops existing when LM Studio updates, so the generated
+  script resolves the newest build of the same family at every launch — version-aware,
+  because by name `2.9.0` sorts above `2.10.0`.
+- `--draft-max` was **removed** (it is `--spec-draft-n-max`), and `--no-mmap` / `--mlock`
+  are **deprecated** in favour of `--load-mode`. The old spellings are accepted and then
+  ignored, which looks exactly like a setting that did nothing.
+- `--jinja` has to be passed **before** `--chat-template-file`, or the build accepts only
+  its built-in template *names* and rejects a path. It is default-on in current builds and
+  was not in older ones — and the backend is resolved fresh at every launch, so that
+  default can move underneath you.
+- A `--chat-template-file` that does not exist is **not an error**: `llama-server` falls
+  back to the template baked into the GGUF without saying so. The generated script checks
+  the path and refuses to start.
+- Launched directly, `llama-server` logs to the console and nothing is kept.
+
+Flag spelling is not reimplemented: `launch.py` calls `sweep.build_argv(..., probe=False)`,
+the same function the sweep uses, minus the three flags that make a run measurable
+(`-v`, `--cache-ram 0`, `--no-warmup`) and would be wrong in something you use daily. A
+second copy would drift, and the flags most worth getting right are the ones that changed
+names. The self-test asserts no generated script ever *executes* a dead flag — reading
+what runs, not what the file contains, since naming them in the comments is the useful part.
+
+Sampler fields start blank and emit nothing when left blank. llama.cpp's own defaults
+(temp 0.80, top-k 40, min-p 0.05) are not what every model card asks for, so a value
+printed there has to be one you chose — and they are *server* defaults, which any client
+sending its own overrides per request.
+
+**Chat template.** A template file and `--chat-template-kwargs` can be set alongside the
+samplers — a patched tool-call template, or `{"enable_thinking": false}` on a Qwen3. The
+kwargs are validated as a JSON *object* when the script is generated, because that is the
+difference between a message in the browser and a service that will not come back after a
+reboot. Both are emitted as script parameters and assembled **at runtime**, so an empty
+value produces *no flag* rather than an empty one — `--chat-template-file ''` is an error,
+not a no-op. Note the key names belong to the template, not to llama.cpp: `enable_thinking`
+is Qwen3's spelling and is *ignored, not rejected*, by a model that does not use it, so a
+typo is silent.
 
 ## Known issues
 

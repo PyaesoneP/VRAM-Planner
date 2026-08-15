@@ -79,6 +79,35 @@ async function boot(){
   }
   buildCtxChips();
   loadBandwidth();
+  showPastSweeps();
+}
+
+/** The empty state, before anything has been analyzed.
+ *
+ *  A tool holding two hours of measurements should not open looking empty. The
+ *  whole Past sweeps path - browse a campaign, read what it found, build a script
+ *  from one of its rows - needs no model analyzed and touches no GPU, so there is
+ *  no reason to hide it behind Analyze. */
+async function showPastSweeps(){
+  if(LAST) return;                       // a plan arrived first; render() owns the page
+  SWEEP = sweepDefaults();
+  await Promise.all([loadHistory(), attachRunningJob()]);
+  if(LAST) return;
+  const n = (SWEEP.campaigns || []).length;
+  // A campaign started in another tab is worth showing even with nothing else
+  // recorded yet - that is exactly when the page would otherwise look idle
+  // while the GPU is busy.
+  if(!n && !(SWEEP.status && SWEEP.status.status === "running")) return;
+  const busy = !!(SWEEP.status && SWEEP.status.status === "running");
+  $("out").innerHTML = busy
+    // A sweep is running from another tab or from before a reload. Show the
+    // whole measured column so it can be watched and stopped, not just listed.
+    ? renderSweep() + renderHistory()
+    : h`<div class="card"><p class="placeholder">Pick a model and press Analyze fit.</p></div>` +
+      renderHistory() +
+      h`<section class="card" id="sweepscriptcard">
+          <h2>Launch script</h2><div id="sweepscript"></div></section>`;
+  drawSweep({ grid: busy, results: busy, script: true, history: true });
 }
 
 function renderPlatform(p){
@@ -372,7 +401,11 @@ function renderSettings(r){
     tail = h`<p class="note">Max context fully on GPU at this quant: ~<b>${num(p.max_ctx_gpu)}</b> tokens.</p>`;
 
   return h`<section class="card">
-    <h2>Settings to use</h2>
+    <h2>Predicted settings</h2>
+    <p class="note">Where the planner thinks the split falls, from the model&rsquo;s exact
+      weights and KV size. Good enough to load with &mdash; but it cannot know what
+      speculative decoding will accept or how fast prefill runs, so once
+      <b>Measured results</b> above has a row, that row is the better answer.</p>
     <div style="margin-bottom:12px">
       <p class="sublabel">LM STUDIO &middot; advanced load settings</p>
       ${raw((p.lmstudio || []).map(x => h`<div class="setrow">${x}</div>`).join(""))}
@@ -532,8 +565,13 @@ function renderBreakdown(r){
     </tbody></table></div></section>`;
 }
 
-/** Results are ordered by what the user came for: the answer, anything alarming
- *  about it, the settings that produce it, then the evidence behind it. */
+/** Two tiers, in the order the questions actually get asked.
+ *
+ *  MEASURED comes first because it is the point: the verdict gates everything
+ *  (there is no sense measuring a config that will not load), and then the sweep,
+ *  its results and the script it produces. PREDICTED follows - the planner's
+ *  estimate is what you use before you have spent the two hours, and what the
+ *  measurements supersede once you have. */
 function render(r){
   LAST = r;
   const c = r.config;
@@ -548,9 +586,16 @@ function render(r){
   // an audio-only mmproj has no patch grid to size.
   $("visionrow").hidden = !(r.vision && r.vision.config);
   $("visioninputs").hidden = !$("visionplan").checked;
-  $("out").innerHTML = renderVerdict(r) + renderWarnings(r) + renderSettings(r) +
-                       renderSpeed(r) + renderSummary(r) + renderKvTable(r) + renderBreakdown(r);
+  $("out").innerHTML =
+    renderVerdict(r) + renderWarnings(r) +
+    renderSweep() + renderHistory() +
+    tier("PREDICTED", "calculated, not measured — the cards above supersede these once you have rows") +
+    renderSettings(r) + renderSpeed(r) + renderSummary(r) +
+    renderKvTable(r) + renderBreakdown(r);
   if(r.speed && !r.speed.error) loadSpeedHistory(r);
+  // Filled in asynchronously: it needs a live GPU reading and the recorded rows,
+  // and neither should hold up the plan the user actually pressed the button for.
+  initSweep(r);
 }
 
 /* ------------------------------------------------------------- benchmark */
@@ -774,6 +819,804 @@ function copyCmd(btn){
   });
 }
 
+/* ------------------------------------------------------------ speed sweep */
+/* The planner models memory. It cannot model speculative decoding (no
+ * acceptance-rate term) or prompt processing (compute bound, not modelled at
+ * all), so those can only be measured. This card drives that measurement and
+ * turns whatever wins into a launcher. */
+
+let SWEEP = null;
+
+function sweepDefaults(){
+  return { path: "", model: "", preflight: null, rows: [], plan: null,
+           status: null, since: 0, timer: null, script: null, pickKey: null,
+           shell: (SYS && SYS.shell) || "bash", busy: "",
+           campaigns: null, insights: null, openCampaign: null,
+           templates: [], speeddir: "" };
+}
+
+/* Four cards, not one. They are rewritten on different clocks: the grid and the
+ * results follow the 1.5s poll, the launch script must NOT - it holds a dozen
+ * text inputs, and rebuilding it under the poll destroyed whatever was being
+ * typed into them once every second and a half. */
+function renderSweep(){
+  return h`<section class="card" id="sweepcard">
+    <h2>Measure real speed</h2>
+    <p class="note">Everything above is calculated. Two of the settings that matter most to
+      tokens/second are <b>not calculable</b>: speculative decoding has no acceptance rate
+      until you run it, and prompt processing is compute bound and is not modelled here at
+      all. This drives <span class="mono">llama-server</span> across a grid and records what
+      it actually does &mdash; then writes the launch script for whatever wins.</p>
+    <div id="sweepbody"><p class="muted small">checking the GPU&hellip;</p></div>
+  </section>
+  <section class="card" id="sweepresultcard">
+    <h2>Measured results</h2>
+    <div id="sweepresults"><p class="muted small">looking for recorded rows&hellip;</p></div>
+  </section>
+  <section class="card" id="sweepscriptcard">
+    <h2>Launch script</h2>
+    <div id="sweepscript"></div>
+  </section>`;
+}
+
+function renderHistory(){
+  return h`<section class="card" id="sweephistcard">
+    <h2>Past sweeps</h2>
+    <p class="note">Every campaign ever run on this machine, and what it found. Rows live in
+      <span class="mono">speed/</span> keyed by GPU and llama.cpp build, so a run from last
+      month is as usable as one from this hour &mdash; including for building a script.</p>
+    <div id="sweephistory"><p class="muted small">reading recorded campaigns&hellip;</p></div>
+  </section>`;
+}
+
+function tier(label, note){
+  return h`<div class="tier"><span>${label}</span><i>${note}</i></div>`;
+}
+
+async function initSweep(r){
+  if(SWEEP && SWEEP.timer) clearInterval(SWEEP.timer);
+  SWEEP = sweepDefaults();
+  SWEEP.path = currentPath();
+  // Speed rows are keyed by FILE name. r.model_name is the display name out of
+  // the GGUF metadata ("Qwen3.8-27B"), which is not the same string and silently
+  // matches nothing.
+  SWEEP.model = SWEEP.path.split(/[\\/]/).pop();
+  SWEEP.mmproj = !!(r && r.mmproj);
+  // The planner's own answer is the fallback config: a script is useful before
+  // anyone has spent two hours measuring, it just has to say that it is a guess.
+  if(r && r.plan) SWEEP.predicted = {
+    ctx: r.inputs ? r.inputs.context : parseInt($("ctx").value),
+    kv: $("kv").value, fa: $("fa").checked || $("kv").value !== "f16",
+    seq: parseInt($("nseq").value) || 1, ub: parseInt($("ubatch").value) || 512,
+    ngl: r.plan.n_gpu_layers, ncmoe: r.plan.n_cpu_moe || 0
+  };
+  PICKABLE = {};
+  await Promise.all([loadPreflight(), loadSweepRows(), loadHistory(), loadTemplates(),
+                     attachRunningJob()]);
+  // Pre-select this model's campaign, so Past sweeps opens on what was just
+  // analyzed instead of on whatever ran most recently.
+  const mine = (SWEEP.campaigns || []).filter(g => g.model === SWEEP.model);
+  if(mine.length === 1) openCampaign(campaignId(mine[0]));
+  drawSweepAll();
+}
+
+/** Pick a campaign that is already running back up.
+ *
+ *  The job lives in the server, not the page, so a reload - or opening a second
+ *  tab - used to leave a two-hour sweep running with nothing watching it: no
+ *  progress, no log, no Stop, and a new Start refused as "already running" with
+ *  no visible reason. Ask once on load, and resume polling if there is one. */
+async function attachRunningJob(){
+  let st;
+  try{ st = await (await fetch("/api/speed/status?since=0")).json(); }
+  catch(e){ return; }
+  if(!st || st.status !== "running") return;
+  SWEEP.status = st;
+  SWEEP.since = st.log_next || 0;
+  if(SWEEP.timer) clearInterval(SWEEP.timer);
+  SWEEP.timer = setInterval(pollSweep, 1500);
+}
+
+async function loadPreflight(){
+  try{ SWEEP.preflight = await (await fetch("/api/speed/preflight")).json(); }
+  catch(e){ SWEEP.preflight = null; }
+}
+
+async function loadTemplates(){
+  if(!SWEEP.path){ SWEEP.templates = []; return; }
+  try{
+    const d = await (await fetch("/api/templates?path=" +
+                                encodeURIComponent(SWEEP.path))).json();
+    SWEEP.templates = d.templates || [];
+  }catch(e){ SWEEP.templates = []; }
+}
+
+async function loadSweepRows(){
+  try{
+    const d = await (await fetch("/api/speed/rows?model=" +
+                                encodeURIComponent(SWEEP.model))).json();
+    SWEEP.rows = d.rows || [];
+  }catch(e){ SWEEP.rows = []; }
+}
+
+/** Redraw the sweep panes.
+ *
+ *  `what` names which ones. The launch-script pane is excluded by default and is
+ *  the reason this function takes an argument at all: it is rebuilt from state on
+ *  every call, so redrawing it under the 1.5s poll wiped the port, bind host, load
+ *  mode, chat-template path and all six sampler fields while a two-hour campaign
+ *  ran. Nothing in it depends on the poll, so nothing in it should follow it. */
+function drawSweep(what){
+  what = what || {};
+  // Each pane is guarded on its own. Before anything is analyzed the page shows
+  // only Past sweeps and the launch script, so a single early return on a missing
+  // grid would leave both of those unfilled.
+  const b = $("sweepbody");
+  if(what.grid !== false && b){
+    const st = SWEEP.status;
+    b.innerHTML = (st && st.status === "running")
+      ? sweepRunning(st)
+      : sweepIdle() + (st && st.status === "failed"
+          ? h`<p class="note" style="color:var(--warn)">Sweep failed: ${st.error}</p>` : "");
+  }
+  if(what.results !== false){
+    const rr = $("sweepresults");
+    if(rr) rr.innerHTML = sweepResults();
+  }
+  if(what.script){
+    // The pane is rebuilt from state, so anything living only in the DOM is
+    // about to be thrown away. Pressing Generate is not a request to lose the
+    // template path you just typed, or to have the section you opened fold shut.
+    captureScriptForm();
+    const sc = $("sweepscript");
+    if(sc) sc.innerHTML = sweepScript();
+  }
+  if(what.history){
+    const hh = $("sweephistory");
+    if(hh) hh.innerHTML = sweepHistory();
+  }
+}
+
+/** Everything, including the panes that hold live inputs. Only safe when the
+ *  user just acted on one of them, or when the card is being built fresh. */
+function drawSweepAll(){
+  drawSweep({ grid: true, results: true, script: true, history: true });
+}
+
+/* -- 1. blocked, or ready ------------------------------------------------- */
+function sweepIdle(){
+  const pf = SWEEP.preflight;
+  if(pf && !pf.ok){
+    const who = (pf.holders || []).map(x =>
+      h`<li><b>${x.name}</b> &middot; pid ${x.pid} &middot; ${fmt(x.mib)}${
+        x.is_engine ? " (an inference engine)" : ""}</li>`).join("");
+    return h`<div class="warns" style="margin-bottom:14px">
+      <div>&#9888; <b>The GPU is not free, so measuring is blocked.</b></div>
+      <p class="note" style="margin:8px 0 6px">${pf.reason}</p>
+      ${raw(who ? "<ul class='muted small' style='margin:6px 0 6px 18px'>" + who + "</ul>" : "")}
+      <p class="note" style="margin:6px 0 0">A model held resident does not make the sweep
+        <i>fail</i> &mdash; it makes every row wrong in the same direction, which is worse,
+        because the numbers still look like numbers. Close it, then
+        <button class="ghost" type="button" data-action="sweep-recheck">re-check</button></p>
+    </div>` + sweepFormDisabled();
+  }
+  return sweepForm(pf);
+}
+
+function sweepFormDisabled(){
+  return h`<p class="muted small">The grid controls appear once the card is free.</p>`;
+}
+
+function sweepForm(pf){
+  const free = pf && pf.total_mib
+    ? h`<span class="muted small">${fmt(pf.free_mib)} of ${fmt(pf.total_mib)} free</span>` : "";
+  return h`<div class="sweepform">
+    <p class="sublabel">GRID &middot; context and KV quant are taken from the form above and
+      frozen, not swept ${raw(free)}</p>
+    <div class="chips" role="group" aria-label="Stages">
+      ${raw(sweepStage("a", "A &middot; layer wall", "How many blocks fit before it spills"))}
+      ${raw(sweepStage("b", "B &middot; projector", "Vision tower in VRAM or in system RAM"))}
+      ${raw(sweepStage("c", "C &middot; ubatch", "Physical batch size"))}
+      ${raw(sweepStage("d", "D &middot; speculation", "MTP draft depths and the n-gram types"))}
+    </div>
+    <div class="row" style="margin-top:10px">
+      <div class="field"><label for="swfill">Context filled (tokens)</label>
+        <input type="number" id="swfill" value="2048" step="1024" min="0"></div>
+      <div class="field"><label for="swpred">Tokens per pass</label>
+        <input type="number" id="swpred" value="128" step="32" min="16"></div>
+      <div class="field"><label for="swrep">Passes (median)</label>
+        <input type="number" id="swrep" value="3" step="1" min="1"></div>
+      <div class="field"><label for="swlimit">Stop after (blank = all)</label>
+        <input type="number" id="swlimit" step="1" min="1" placeholder="all"></div>
+    </div>
+    <p class="hint" style="margin-top:-4px">Measure where you actually work: decode slows as
+      the context fills, so a number taken at 2k is not the speed you feel at 40k. A deeper
+      fill costs real time though &mdash; the prompt has to be processed once per config.</p>
+    <div class="field">
+      <label class="check"><input type="checkbox" id="swchain" checked> Chain the stages
+        &mdash; measure each knob at the split that won, not at the planner&rsquo;s guess</label>
+      <p class="hint">Off, every stage runs from one fixed baseline, so ubatch and speculation
+        are measured at a layer count <i>stage A has not confirmed</i>. On, each stage is built
+        after the last one finishes, from the fastest trustworthy row so far. <b>Same number of
+        loads, so the same hours.</b> A row that spilled into shared memory or that caught the
+        model looping is never carried forward &mdash; it would bend every later stage the same
+        way, silently. A new baseline also has to win by more than 2%, because tok/s is a median
+        of a few passes and rebasing on jitter would make the campaign&rsquo;s path depend on noise.</p>
+      <div class="field" id="swroundsfield" style="max-width:16em">
+        <label for="swrounds">Rounds</label>
+        <input type="number" id="swrounds" value="1" min="1" max="4" step="1">
+        <p class="hint">Re-run the stages from the winner. Cheap: a config a later round
+          revisits unchanged is already recorded and is skipped, so only genuinely new
+          combinations cost time.</p>
+      </div>
+    </div>
+    <div class="actions">
+      <button class="ghost" type="button" data-action="sweep-plan">Preview grid</button>
+      <button class="go" type="button" style="width:auto" data-action="sweep-start">&#9654; Start measuring</button>
+    </div>
+    <div id="sweepplan"></div>
+  </div>`;
+}
+
+function sweepStage(letter, label, hint){
+  return h`<label class="chip" title="${hint}"><input type="checkbox" class="swstage"
+    value="${letter}" checked> ${raw(label)}</label>`;
+}
+
+function sweepStages(){
+  return Array.from(document.querySelectorAll(".swstage"))
+    .filter(x => x.checked).map(x => x.value).join("") || "a";
+}
+
+function sweepBody(){
+  const v = id => { const el = $(id); return el && el.value !== "" ? parseInt(el.value) : null; };
+  const chain = $("swchain") ? $("swchain").checked : true;
+  return { path: SWEEP.path, stages: sweepStages(), context: parseInt($("ctx").value),
+           kv_type: $("kv").value, fill: v("swfill"), n_predict: v("swpred"),
+           repeat: v("swrep"), limit: v("swlimit"),
+           chain: chain, rounds: chain ? (v("swrounds") || 1) : 1 };
+}
+
+async function sweepPlan(){
+  const box = $("sweepplan");
+  box.innerHTML = '<p class="muted small">building the grid…</p>';
+  let d;
+  try{
+    d = await (await fetch("/api/speed/plan", { method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(sweepBody()) })).json();
+  }catch(e){ box.innerHTML = h`<p class="note">preview failed: ${e}</p>`; return; }
+  if(!d.ok){ box.innerHTML = h`<p class="note" style="color:var(--warn)">${d.error}</p>`; return; }
+  const rows = (d.configs || []).map(c => h`<tr>
+    <td>${c.stage || "-"}</td><td>${c.ngl}</td><td>${c.ncmoe || 0}</td><td>${c.ub}</td>
+    <td>${num(c.fill || 0)}</td><td class="mono">${c.spec || "none"}</td>
+    <td>${c.spec_n_max || 0}</td>
+    <td>${c.mmproj_offload === false ? "RAM" : "VRAM"}</td></tr>`).join("");
+  const sizes = d.stage_sizes || {};
+  const later = Object.keys(sizes).sort().filter(k => k !== "-")
+    .map(k => k.toUpperCase() + " " + sizes[k]).join(" &middot; ");
+  box.innerHTML = h`<p class="note"><b>${d.planned}</b> config${d.planned == 1 ? "" : "s"}
+      to run, ~<b>${d.estimate_h}</b> h${raw(d.skipped
+        ? h`. ${d.skipped} already measured and will be skipped &mdash; rows are keyed by
+            config <i>and</i> by how they were measured, so this resumes rather than repeats.`
+        : ".")}</p>` +
+    (d.provisional ? h`<p class="note">Chained, so only the <b>first stage</b> can be listed:
+        the ones after it are built from a baseline that does not exist yet, and printing
+        values for them would be a guess dressed up as a plan. The <i>counts</i> are exact
+        &mdash; a ladder&rsquo;s length does not depend on where it is centred &mdash; so the
+        estimate above is not a guess. Stages: ${raw(later)}.</p>` : "") +
+    (d.planned ? h`<div class="tablewrap"><table>
+      <thead><tr><th>stage</th><th>ngl</th><th>ncmoe</th><th>ub</th><th>fill</th>
+        <th>spec</th><th>n-max</th><th>projector</th></tr></thead>
+      <tbody>${raw(rows)}</tbody></table></div>` : "");
+}
+
+async function sweepStart(){
+  let d;
+  try{
+    d = await (await fetch("/api/speed/start", { method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(sweepBody()) })).json();
+  }catch(e){ alert("could not start: " + e); return; }
+  if(d.preflight) SWEEP.preflight = d.preflight;
+  if(!d.ok){ drawSweep({ results: false }); alert(d.error || "could not start"); return; }
+  SWEEP.since = 0;
+  pollSweep();
+  if(SWEEP.timer) clearInterval(SWEEP.timer);
+  SWEEP.timer = setInterval(pollSweep, 1500);
+}
+
+async function sweepStop(){
+  try{ await fetch("/api/speed/stop", { method: "POST" }); }catch(e){}
+  pollSweep();
+}
+
+async function pollSweep(){
+  let st;
+  try{ st = await (await fetch("/api/speed/status?since=" + SWEEP.since)).json(); }
+  catch(e){ return; }
+  const prev = SWEEP.status;
+  // The log ships incrementally, so keep what we already have and append.
+  const kept = (prev && prev.status === st.status) ? (prev.log || []) : [];
+  st.log = kept.concat(st.log || []);
+  SWEEP.since = st.log_next;
+  SWEEP.status = st;
+  if(st.status !== "running"){
+    if(SWEEP.timer){ clearInterval(SWEEP.timer); SWEEP.timer = null; }
+    if(prev && prev.status === "running"){
+      loadPreflight();
+      // A finished campaign changes the history too, so refresh it once here -
+      // once, not per poll.
+      loadHistory();
+      loadSweepRows().then(() => drawSweep({ history: true }));
+    }
+  }
+  // Grid and results only. See drawSweep(): the script pane holds live inputs.
+  drawSweep();
+}
+
+/* -- 2. running ----------------------------------------------------------- */
+function sweepRunning(st){
+  const pct = st.total ? clampPct(100 * st.done / st.total) : 0;
+  const mins = st.elapsed_s != null ? (st.elapsed_s / 60).toFixed(1) : "?";
+  const tail = (st.log || []).slice(-14).join("\n");
+  return h`<div class="running">
+    <p><b>Measuring</b> &mdash; ${st.done} of ${st.total || "?"} configs, ${mins} min elapsed
+      ${raw(st.cancelling ? '<span style="color:var(--warn)">&middot; stopping</span>' : "")}</p>
+    <div class="prog"><i style="width:${pct}%"></i></div>
+    <div class="actions">
+      <button class="ghost" type="button" data-action="sweep-stop" ${
+        st.cancelling ? "disabled" : ""}>&#9632; Stop</button>
+      <span class="muted small">Stopping finishes the config in flight first, so its row is
+        complete rather than half-written. Nothing is lost either way &mdash; every row is
+        already on disk and keyed, so starting again resumes from here.</span>
+    </div>
+    ${raw(st.log_dropped ? h`<p class="muted small">${st.log_dropped} earlier log line${
+      st.log_dropped == 1 ? "" : "s"} dropped</p>` : "")}
+    <pre class="logbox">${tail}</pre>
+  </div>`;
+}
+
+/* -- 3. results ----------------------------------------------------------- */
+/** Rows measured in this job, merged over the recorded history. */
+function sweepAllRows(){
+  const live = (SWEEP.status && SWEEP.status.rows) || [];
+  const ok = live.filter(r => r.status === "ok" && r.tok_s);
+  const seen = new Set(ok.map(r => JSON.stringify(r.config)));
+  const rest = SWEEP.rows.filter(r => !seen.has(JSON.stringify(r.config)));
+  return ok.concat(rest).sort((a, b) => (b.tok_s || 0) - (a.tok_s || 0));
+}
+
+/** The caveats that make a headline number a lie. Every one of these was a wrong
+ *  conclusion at some point before it was a badge. */
+function rowFlags(r){
+  const f = [];
+  if(r.spilled) f.push(["spilled", "Loaded, but over-committed: WDDM spilled into shared " +
+    "system memory instead of failing. The row says ok and the speed is off a cliff."]);
+  if(r.corpus_repeated && r.config && r.config.spec && r.config.spec !== "none")
+    f.push(["filler repeats", "The prompt had to repeat to reach this depth, which inflates " +
+      "any speculative acceptance rate. Compare only against other rows at this depth."]);
+  if(r.distinct_ratio != null && r.distinct_ratio < 0.5)
+    f.push(["looping", "Only " + Math.round(100 * r.distinct_ratio) + "% of 8-word windows " +
+      "were distinct - the model was repeating itself, so this speed is not real work."]);
+  return f;
+}
+
+const ROW_HEAD = h`<thead><tr><th></th><th>tok/s</th><th>prefill</th><th>ngl</th><th>ncmoe</th>
+  <th>ub</th><th>fill</th><th>spec</th><th>proj</th><th>accepted</th><th>VRAM</th><th></th>
+  </tr></thead>`;
+
+/** Identity of a measured row, for "which one did you pick".
+ *  Not a list index: rows are now offered from two different tables over two
+ *  different row sets, and an index into one of them means nothing in the other. */
+function rowKey(r){
+  return (r.model || "") + "|" + JSON.stringify(r.config || {});
+}
+
+/* key -> row, refilled as pickable rows render, so a click can find its row
+ * whichever table it came from. */
+let PICKABLE = {};
+
+function sweepRow(r, i, pickable){
+  const c = r.config || {}, flags = rowFlags(r);
+  const failed = r.status && r.status !== "ok";
+  const key = rowKey(r);
+  if(pickable) PICKABLE[key] = r;
+  const on = SWEEP.pickKey == null ? (pickable && i === 0) : SWEEP.pickKey === key;
+  return h`<tr class="${on && pickable ? "best" : ""}">
+    <td>${raw(pickable ? h`<input type="radio" name="swpick" data-action="sweep-pick"
+      data-key="${key}" ${on ? "checked" : ""}>` : "")}</td>
+    <td>${raw(failed ? h`<span style="color:var(--warn)">${r.status}</span>`
+                     : h`<b>${(r.tok_s || 0).toFixed(2)}</b>`)}</td>
+    <td>${(r.prefill_tok_s || 0).toFixed(0)}</td>
+    <td>${c.ngl}</td><td>${c.ncmoe || 0}</td><td>${c.ub}</td>
+    <td>${num(c.fill || 0)}</td>
+    <td class="mono">${c.spec || "none"}${c.spec_n_max ? "/" + c.spec_n_max : ""}</td>
+    <td>${c.mmproj_offload === false ? "RAM" : "VRAM"}</td>
+    <td>${raw(r.accept_rate != null
+      ? h`${Math.round(100 * r.accept_rate)}% <span class="muted small">of ${
+          num(r.draft_n)}</span>` : "-")}</td>
+    <td>${fmt(r.proc_vram_mib)}</td>
+    <td>${raw(flags.map(f => h`<span class="flag" title="${f[1]}">${f[0]}</span>`).join(" "))}</td>
+  </tr>`;
+}
+
+function sweepResults(){
+  // Two tables, because they answer different questions. The run in progress is
+  // read as a LADDER, in the order measured - that is how you see where the wall
+  // is - and a slow row is the most informative one there. Ranking it against
+  // every historical row would bury exactly that.
+  // PICKABLE is deliberately NOT cleared here. This pane redraws on every poll
+  // while the history pane does not, so clearing would drop a row picked out of
+  // Past sweeps 1.5 seconds later. Entries are keyed by content, so a stale one
+  // still maps to the row it named.
+  const live = (SWEEP.status && SWEEP.status.rows) || [];
+  const ranked = sweepAllRows();
+  let out = "";
+  if(live.length){
+    out += h`<div style="margin-top:18px">
+      <p class="sublabel">THIS RUN &middot; in the order measured</p>
+      <div class="tablewrap"><table class="rowtable">${raw(ROW_HEAD)}
+        <tbody>${raw(live.map((r, i) => sweepRow(r, i, false)).join(""))}</tbody></table></div>
+    </div>`;
+  }
+  if(!ranked.length){
+    return out || h`<p class="muted small" style="margin-top:14px">No speed rows recorded for
+      this model yet.</p>`;
+  }
+  const best = ranked[0], shown = ranked.slice(0, 24);
+  const fill = (best.config || {}).fill || 0;
+  return out + h`<div style="margin-top:18px">
+    <p class="sublabel">ALL RECORDED &middot; fastest first &middot; pick the one to build a
+      script from ${ranked.length > 24 ? h`(showing 24 of ${ranked.length})` : ""}</p>
+    <div class="tablewrap"><table class="rowtable">${raw(ROW_HEAD)}
+      <tbody>${raw(shown.map((r, i) => sweepRow(r, i, true)).join(""))}</tbody></table></div>
+    <p class="note">Read <b>accepted</b> together with the count beside it: 100% of 15 drafted
+      tokens out of 128 generated is a 7% gain, not a miracle. And every figure here is
+      conditional on the <b>fill</b> column &mdash; ${(best.tok_s || 0).toFixed(2)} tok/s at
+      ${num(fill)} filled tokens says nothing about what you get at ${num(fill * 8)}.
+      Hover any flag for what makes that row untrustworthy.</p>
+  </div>`;
+}
+
+/* -- 4. the launcher ------------------------------------------------------ */
+const SAMPLERS = ["temp", "top_k", "top_p", "min_p", "repeat_penalty",
+                  "presence_penalty"];
+const SCRIPT_FIELDS = ["swport", "swhost", "swload", "sm_tmplfile", "sm_tmplkw"]
+  .concat(SAMPLERS.map(k => "sm_" + k));
+
+/** Read the launch-script pane's inputs into SWEEP.form.
+ *
+ *  This pane is rendered from state, so state has to be where the values live.
+ *  Without this, every redraw of it - pressing Generate, picking another row,
+ *  switching shell - silently emptied every field the user had filled in. */
+function captureScriptForm(){
+  if(!$("sweepscript")) return;
+  const f = SWEEP.form || (SWEEP.form = {});
+  SCRIPT_FIELDS.forEach(id => { const el = $(id); if(el) f[id] = el.value; });
+  f.open = Array.from(document.querySelectorAll("#sweepscript details"))
+                .map(d => d.open);
+}
+
+/** A remembered field value, or the default the pane opens with. */
+function fv(id, dflt){
+  const f = SWEEP.form || {};
+  return (f[id] === undefined || f[id] === null) ? (dflt == null ? "" : dflt) : f[id];
+}
+function fopen(i){ return ((SWEEP.form || {}).open || [])[i] ? "open" : ""; }
+
+function sweepPickedRow(){
+  if(SWEEP.pickKey && PICKABLE[SWEEP.pickKey]) return PICKABLE[SWEEP.pickKey];
+  const rows = sweepAllRows();
+  return rows.length ? rows[0] : null;
+}
+
+function sweepScript(){
+  const row = sweepPickedRow();
+  const shells = ((SYS && SYS.shells) || ["powershell", "bash"]).map(s =>
+    h`<label class="chip"><input type="radio" name="swshell" value="${s}" ${
+      SWEEP.shell === s ? "checked" : ""} data-action="sweep-shell"> ${
+      s === "powershell" ? "PowerShell (.ps1)" : "bash (.sh)"}</label>`).join("");
+  const modes = ((SYS && SYS.load_modes) || ["none", "mmap", "mlock", "mmap+mlock", "dio"])
+    .map(m => h`<option value="${m}" ${m === fv("swload", "none") ? "selected" : ""}>${m}</option>`).join("");
+  const src = row
+    ? h`the <b>measured</b> row selected above (${(row.tok_s || 0).toFixed(2)} tok/s)`
+    : h`the planner's <b>predicted</b> split &mdash; nothing has been measured for this model yet,
+        and the script will say so`;
+  return h`<div style="margin-top:20px">
+    <p class="sublabel">LAUNCH SCRIPT</p>
+    <p class="note">Built from ${raw(src)}. It resolves the llama.cpp backend fresh at every
+      launch, puts the vendor CUDA libraries on the path (without them the process dies with
+      <span class="mono">STATUS_DLL_NOT_FOUND</span> and no message), writes a dated log file,
+      and uses <span class="mono">--load-mode</span> and
+      <span class="mono">--spec-draft-n-max</span> rather than the deprecated and removed
+      spellings that are accepted and then silently ignored.</p>
+    <div class="chips">${raw(shells)}</div>
+    <div class="row" style="margin-top:10px">
+      <div class="field"><label for="swport">Port</label>
+        <input type="number" id="swport" value="${fv("swport", 8080)}" step="1"></div>
+      <div class="field"><label for="swhost">Listen on</label>
+        <select id="swhost">
+          <option value="127.0.0.1" ${fv("swhost", "127.0.0.1") === "127.0.0.1" ? "selected" : ""
+            }>127.0.0.1 (this machine only)</option>
+          <option value="0.0.0.0" ${fv("swhost", "127.0.0.1") === "0.0.0.0" ? "selected" : ""
+            }>0.0.0.0 (also WSL and the LAN)</option>
+        </select>
+        <p class="hint">WSL2 is a separate VM behind NAT, so Windows&rsquo; loopback is not its
+          loopback &mdash; 127.0.0.1 is unreachable from there.</p></div>
+      <div class="field"><label for="swload">Weight loading</label>
+        <select id="swload">${raw(modes)}</select>
+        <p class="hint"><span class="mono">none</span> reads each tensor straight to its final
+          home. Avoid <span class="mono">mmap+mlock</span> under heavy GPU offload: mlock pins
+          the whole mapped file, including the blocks already resident in VRAM.</p></div>
+    </div>
+    <details class="adv" ${raw(fopen(0))}><summary>Chat template (optional)</summary>
+      <p class="hint">Overrides the template baked into the GGUF. Useful when the conversion
+        predates a fixed template, or when the model card ships a patched one for tool calls.
+        A path that does not exist is <b>not</b> an error to llama-server &mdash; it falls back
+        to the built-in template without saying so &mdash; so the generated script checks it and
+        refuses to start. It also passes <span class="mono">--jinja</span> <i>before</i> the
+        template flags, because without it a build accepts only its built-in template
+        <i>names</i> and rejects a path outright.</p>
+      <div class="field">
+        <label for="sm_tmplfile">Template file</label>
+        <input type="text" id="sm_tmplfile" list="tmpllist" value="${fv("sm_tmplfile")}"
+               placeholder="&mdash; use the model&rsquo;s own &mdash;">
+        <datalist id="tmpllist">${raw(((SWEEP && SWEEP.templates) || [])
+          .map(t => h`<option value="${t}"></option>`).join(""))}</datalist>
+        <p class="hint" id="tmplhint">${(SWEEP && SWEEP.templates && SWEEP.templates.length)
+          ? SWEEP.templates.length + " .jinja file(s) found next to the model — pick one or paste a path"
+          : "No .jinja files next to the model; paste a full path."}</p>
+      </div>
+      <div class="field">
+        <label for="sm_tmplkw">Template keyword arguments (JSON object)</label>
+        <input type="text" id="sm_tmplkw" value="${fv('sm_tmplkw')}"
+               placeholder='{"enable_thinking": false}'>
+        <p class="hint">The key names belong to <b>the template</b>, not to llama.cpp:
+          <span class="mono">enable_thinking</span> is Qwen3&rsquo;s spelling and is
+          <i>ignored, not rejected</i>, by a model that does not use that variable &mdash; so a
+          typo here is silent. Checked for valid JSON before the script is written. These are
+          <b>server defaults</b>: a client that sends its own
+          <span class="mono">chat_template_kwargs</span> wins for that request.</p>
+      </div>
+    </details>
+    <details class="adv" ${raw(fopen(1))}><summary>Sampling (optional)</summary>
+      <p class="hint">Left blank, no sampler flags are written at all &mdash; a made-up default
+        is worse than none. llama.cpp&rsquo;s own defaults are temp 0.80, top-k 40, min-p 0.05,
+        which several model cards do <i>not</i> want, so fill these in from yours. These become
+        <b>server defaults</b>: any client that sends its own values overrides them per request.</p>
+      <div class="row">
+        ${raw(SAMPLERS
+          .map(k => h`<div class="field"><label for="sm_${k}">${k.replace(/_/g, " ")}</label>
+            <input type="number" id="sm_${k}" step="0.01" value="${fv("sm_" + k)}"
+                   placeholder="&mdash;"></div>`).join(""))}
+      </div>
+    </details>
+    <div class="actions">
+      <button class="ghost" type="button" data-action="sweep-gen">Generate script</button>
+      ${raw(SWEEP.script ? h`
+        <button class="ghost" type="button" data-action="sweep-copy">copy</button>
+        <button class="ghost" type="button" data-action="sweep-save">save next to the model</button>
+        <button class="ghost" type="button" data-action="sweep-dl">download</button>` : "")}
+      <span class="muted small" id="swscripthint">${SWEEP.busy}</span>
+    </div>
+    ${raw(SWEEP.script ? h`<pre class="cmd" id="swscript">${SWEEP.script.text}</pre>` : "")}
+  </div>`;
+}
+
+function sweepScriptBody(){
+  const row = sweepPickedRow();
+  const sampling = {};
+  SAMPLERS.forEach(k => {
+    const el = $("sm_" + k);
+    if(el && el.value !== "") sampling[k] = parseFloat(el.value);
+  });
+  const cfg = row ? row.config : SWEEP.predicted;
+  const val = id => { const el = $(id); return (el && el.value.trim()) || null; };
+  return { path: SWEEP.path,
+           // A row picked out of Past sweeps may belong to a model this page has
+           // never analyzed, and rows record a basename rather than a path. The
+           // server resolves it, and says so when it cannot.
+           model_name: (row && row.model) || SWEEP.model || null,
+           config: cfg, shell: SWEEP.shell,
+           mmproj: (cfg && cfg.mmproj) ? cfg.mmproj : (SWEEP.mmproj || false),
+           sampling: sampling,
+           chat_template_file: val("sm_tmplfile"),
+           chat_template_kwargs: val("sm_tmplkw"),
+           port: parseInt(($("swport") || {}).value || 8080),
+           bind_host: ($("swhost") || {}).value || "127.0.0.1",
+           load_mode: ($("swload") || {}).value || "none",
+           measured: row || null };
+}
+
+async function sweepGen(save){
+  const body = sweepScriptBody();
+  if(!body.config){ alert("Analyze a model first."); return; }
+  SWEEP.busy = save ? "saving…" : "generating…";
+  drawSweep({ grid: false, results: false, script: true });
+  let d;
+  try{
+    d = await (await fetch(save ? "/api/script/save" : "/api/script", { method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body) })).json();
+  }catch(e){ SWEEP.busy = "failed: " + e; drawSweep({ grid: false, results: false, script: true }); return; }
+  if(!d.ok){ SWEEP.busy = d.error || "failed"; drawSweep({ grid: false, results: false, script: true }); return; }
+  SWEEP.script = d;
+  SWEEP.busy = d.saved ? "saved to " + d.saved : "";
+  drawSweep({ grid: false, results: false, script: true });
+}
+
+/* -- 5. past sweeps -------------------------------------------------------- */
+async function loadHistory(){
+  try{
+    const d = await (await fetch("/api/speed/history")).json();
+    SWEEP.campaigns = d.campaigns || [];
+    SWEEP.speeddir = d.dir || "";
+  }catch(e){ SWEEP.campaigns = []; }
+}
+
+function campaignId(g){ return g.model + " " + g.gpu + " " + g.file; }
+
+async function openCampaign(id){
+  if(SWEEP.openCampaign === id){         // second click closes it
+    SWEEP.openCampaign = null;
+    drawSweep({ grid: false, results: false, history: true });
+    return;
+  }
+  SWEEP.openCampaign = id;
+  SWEEP.insights = null;
+  drawSweep({ grid: false, results: false, history: true });
+  const g = (SWEEP.campaigns || []).find(x => campaignId(x) === id);
+  if(!g) return;
+  const q = "model=" + encodeURIComponent(g.model) + "&gpu=" + encodeURIComponent(g.gpu) +
+            "&file=" + encodeURIComponent(g.file);
+  try{ SWEEP.insights = await (await fetch("/api/speed/insights?" + q)).json(); }
+  catch(e){ SWEEP.insights = { ok: false, error: String(e) }; }
+  drawSweep({ grid: false, results: false, history: true });
+}
+
+function when(ts){
+  return ts ? new Date(ts * 1000).toISOString().slice(0, 10) : "?";
+}
+
+function campaignRow(g){
+  const id = campaignId(g), open = SWEEP.openCampaign === id;
+  const span = (g.first && g.last && when(g.first) !== when(g.last))
+    ? when(g.first) + " → " + when(g.last) : when(g.last);
+  return h`<div class="camp ${open ? "open" : ""}">
+    <button class="camprow" type="button" data-action="sweep-open" data-id="${id}">
+      <span class="mono">${g.model}</span>
+      <span class="muted small">${g.gpu || "?"} &middot; ${g.backend} &middot; ${span}</span>
+      <span class="campnum">${g.n_ok}/${g.n_rows} ok${raw(
+        g.n_untrusted ? " &middot; " + g.n_untrusted + " flagged" : "")}</span>
+      <span class="campbest">${g.best_tok_s ? g.best_tok_s.toFixed(2) + " tok/s" : "—"}</span>
+      <span class="campcaret">${open ? "▾" : "▸"}</span>
+    </button>
+    ${raw(open ? campaignBody() : "")}</div>`;
+}
+
+function campaignBody(){
+  const ins = SWEEP.insights;
+  if(!ins) return '<div class="campopen"><p class="muted small">reading rows…</p></div>';
+  if(!ins.ok) return h`<div class="campopen"><p class="note" style="color:var(--warn)">${
+    ins.error || "could not read this campaign"}</p></div>`;
+  return '<div class="campopen">' + axisPanel(ins.axes) + depthPanel(ins.depth) +
+         paretoPanel(ins.pareto) + campaignRows(ins.ranked) + '</div>';
+}
+
+/** What each knob was worth. The headline of the whole feature: a ranking says
+ *  which config won, this says where the next two hours should go. */
+function axisPanel(ax){
+  if(!ax || !ax.effects || !ax.effects.length) return "";
+  const body = ax.effects.map(e => {
+    if(e.single){
+      return h`<tr class="dim"><td>${e.label}</td><td colspan="3" class="muted small">only
+        one value ever tried (${String(e.values[0].value)}) &mdash; nothing to compare</td></tr>`;
+    }
+    const vals = e.values.map(v => h`<span class="vchip ${
+      String(v.value) === String(e.best) ? "win" : ""}">${String(v.value)}
+      <i>${v.tok_s.toFixed(2)}</i></span>`).join("");
+    return h`<tr>
+      <td><b>${e.label}</b></td>
+      <td class="gain ${e.gain_pct > 1 ? "up" : ""}">${e.gain_pct == null ? "—"
+        : (e.gain_pct >= 0 ? "+" : "") + e.gain_pct.toFixed(1) + "%"}</td>
+      <td>${raw(vals)}</td>
+      <td class="muted small">vs ${String(e.reference)}${
+        e.reference_is_natural ? "" : " (slowest)"} &middot; ${e.n_rows} rows${
+        raw(e.n_other_groups ? " &middot; " + e.n_other_groups + " other comparison(s) not merged" : "")}
+        ${raw(e.inflated ? h`<br><span style="color:var(--warn)">${e.n_corpus_repeated} of these
+          needed the filler to repeat &mdash; speculation drafts from what it has already seen,
+          so this is an upper bound, not a conversation.</span>` : "")}</td>
+    </tr>`;
+  }).join("");
+  return h`<p class="sublabel">WHAT EACH KNOB WAS WORTH</p>
+    <p class="note">Controlled comparisons only. Rows that differ in GPU, llama.cpp build,
+      context, KV quant, fill depth or pass count are different experiments and never meet in
+      one comparison &mdash; putting them together would manufacture an effect out of the
+      difference between the runs.${raw(ax.n_excluded ? h` ${ax.n_excluded} row(s) are excluded
+      from every number here: they spilled into shared memory, or caught the model looping.` : "")}</p>
+    <div class="tablewrap"><table class="axtable"><tbody>${raw(body)}</tbody></table></div>`;
+}
+
+function depthPanel(depth){
+  if(!depth || !depth.length) return "";
+  const body = depth.map(d => {
+    const c = d.config || {};
+    const pts = d.points.map(p => h`<span class="vchip">${num(p.fill)}
+      <i>${p.tok_s.toFixed(2)}</i></span>`).join(" → ");
+    return h`<tr><td class="mono small">ngl ${c.ngl} ub ${c.ub} ${c.spec || "none"}</td>
+      <td>${raw(pts)}</td>
+      <td class="gain ${d.drop_pct > 20 ? "down" : ""}">&minus;${(d.drop_pct || 0).toFixed(0)}%</td>
+      </tr>`;
+  }).join("");
+  return h`<p class="sublabel" style="margin-top:16px">SPEED VS CONTEXT DEPTH</p>
+    <p class="note">The same config measured at more than one fill. Decode re-reads the KV
+      cache every token, so this is the only thing here that <i>shows</i> the slope rather
+      than asserting it &mdash; and it is why a headline taken at 2k says so little about the
+      long conversation you will actually have.</p>
+    <div class="tablewrap"><table class="axtable"><tbody>${raw(body)}</tbody></table></div>`;
+}
+
+function paretoPanel(pf){
+  if(!pf || pf.length < 2) return "";
+  const body = pf.map(r => { const c = r.config || {};
+    return h`<tr><td><b>${(r.tok_s || 0).toFixed(2)}</b></td><td>${fmt(r.proc_vram_mib)}</td>
+      <td class="mono small">ngl ${c.ngl} ncmoe ${c.ncmoe || 0} ub ${c.ub} ${
+        c.spec || "none"}</td></tr>`; }).join("");
+  return h`<p class="sublabel" style="margin-top:16px">SPEED VS VRAM</p>
+    <p class="note">Nothing measured is both faster <i>and</i> smaller than these. &ldquo;The
+      fastest&rdquo; and &ldquo;the fastest that still leaves the desktop a card to draw on&rdquo;
+      are different questions, and a ranking by tok/s can only answer the first &mdash; a row 2%
+      slower for 3 GiB less is often the one worth running.</p>
+    <div class="tablewrap"><table class="axtable">
+      <thead><tr><th>tok/s</th><th>VRAM</th><th>config</th></tr></thead>
+      <tbody>${raw(body)}</tbody></table></div>`;
+}
+
+function campaignRows(ranked){
+  if(!ranked || !ranked.length) return "";
+  const shown = ranked.slice(0, 24);
+  return h`<p class="sublabel" style="margin-top:16px">EVERY ROW &middot; fastest first &middot;
+      pick one to build a script from${ranked.length > 24
+        ? h` (showing 24 of ${ranked.length})` : ""}</p>
+    <div class="tablewrap"><table class="rowtable">${raw(ROW_HEAD)}
+      <tbody>${raw(shown.map((r, i) => sweepRow(r, i, true)).join(""))}</tbody></table></div>`;
+}
+
+function sweepHistory(){
+  const cs = SWEEP.campaigns;
+  if(cs == null) return '<p class="muted small">reading recorded campaigns…</p>';
+  if(!cs.length){
+    return h`<p class="note">No campaigns recorded yet. Analyze a model and press
+      <b>Start measuring</b> above, or run
+      <span class="mono">python -m vram_planner --speed-sweep</span>.</p>`;
+  }
+  return h`<div class="camps">${raw(cs.map(campaignRow).join(""))}</div>
+    <p class="note">Rows in <span class="mono">${SWEEP.speeddir || "speed/"}</span>, one file
+      per GPU and llama.cpp build. They are split that way on purpose: a version bump moves
+      these numbers, and merging two builds into one campaign would hide it.</p>`;
+}
+
+function sweepDownload(){
+  if(!SWEEP.script) return;
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(new Blob([SWEEP.script.text], { type: "text/plain" }));
+  a.download = SWEEP.script.filename;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(a.href);
+}
+
+function sweepCopy(btn){
+  if(!SWEEP.script) return;
+  navigator.clipboard.writeText(SWEEP.script.text).then(() => {
+    const old = btn.textContent;
+    btn.textContent = "copied";
+    setTimeout(() => { btn.textContent = old; }, 1200);
+  });
+}
+
 /* -------------------------------------------------------------- wiring */
 const ACTIONS = {
   "theme":       () => toggleTheme(),
@@ -784,7 +1627,20 @@ const ACTIONS = {
   "bench":       () => benchNow(),
   "copy-cmd":    el => copyCmd(el),
   "use-measured": el => useMeasured(parseFloat(el.dataset.toks), parseFloat(el.dataset.fill)),
-  "match-runtime": el => matchRuntime(parseInt(el.dataset.ngl), parseInt(el.dataset.ctx))
+  "match-runtime": el => matchRuntime(parseInt(el.dataset.ngl), parseInt(el.dataset.ctx)),
+  "sweep-recheck": () => loadPreflight().then(() => drawSweep({ results: false })),
+  "sweep-plan":  () => sweepPlan(),
+  "sweep-start": () => sweepStart(),
+  "sweep-stop":  () => sweepStop(),
+  "sweep-pick":  el => { SWEEP.pickKey = el.dataset.key; SWEEP.script = null;
+                         drawSweep({ grid: false, script: true, history: true }); },
+  "sweep-open":  el => openCampaign(el.dataset.id),
+  "sweep-shell": el => { SWEEP.shell = el.value; SWEEP.script = null;
+                         drawSweep({ grid: false, results: false, script: true }); },
+  "sweep-gen":   () => sweepGen(false),
+  "sweep-save":  () => sweepGen(true),
+  "sweep-copy":  el => sweepCopy(el),
+  "sweep-dl":    () => sweepDownload()
 };
 
 document.addEventListener("click", ev => {

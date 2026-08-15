@@ -1170,7 +1170,8 @@ def speed_sweep(models=None, backend=None, dry_run=False, timeout=420.0,
                 should_abort=None, on_server=None,
                 chain=False, rounds=1, verify=False, verify_overrides=None,
                 chat_template_file=None, chat_template_kwargs=None,
-                reasoning=None, reasoning_preserve=None, sampling=None):
+                reasoning=None, reasoning_preserve=None, sampling=None,
+                mmproj_offload=None):
     """Run the speed grid and append one row per config. Resumable like --sweep.
 
     `on_row` is called with each finished row, `on_total` when the number of
@@ -1246,12 +1247,26 @@ def speed_sweep(models=None, backend=None, dry_run=False, timeout=420.0,
     for k, v in (sampling or {}).items():
         if k in _SWEEP_SAMPLER_KEYS and v is not None and v != "":
             base[k] = float(v) if k != "top_k" else int(v)
+    # Pinned for the campaign rather than swept. None keeps stage B's job as it
+    # was; True/False fix the placement and make stage B a no-op, which is said
+    # out loud below rather than left as four configs that measure one thing.
+    if mmproj_offload is not None:
+        base["mmproj_offload"] = bool(mmproj_offload)
     if fill is not None:
         base["fill"] = fill
     if ctx is not None:
         base["ctx"] = ctx
     if kv is not None:
         base["kv"] = kv
+    # Stage B IS the projector sweep. Pinning the placement and then running it
+    # anyway would re-measure the axis that was just fixed - the configs would
+    # all carry the pinned value, so the stage would spend loads proving one
+    # thing four times. Dropped, and said, rather than silently wasting them.
+    if mmproj_offload is not None and "b" in (stages or ""):
+        stages = (stages or "").replace("b", "")
+        log("note    : projector pinned to %s, so stage B is dropped - that stage "
+            "IS the projector sweep"
+            % ("VRAM" if mmproj_offload else "system RAM"))
     cfgs = build_speed_grid(facts, mmproj=mmproj, base=base, stages=stages,
                             model_path=mp)
     if axes:
@@ -1300,14 +1315,21 @@ def speed_sweep(models=None, backend=None, dry_run=False, timeout=420.0,
     # the same measurement as one taken at 128 / 3, and silently accepting it as
     # already-done would put a noisier number into the comparison than every
     # other row and give no sign it had happened.
-    done = {_key(r["model"], r["config"]) for r in load_rows(path)
-            if r.get("config") and r.get("status") in ("ok", "oom")
-            and r.get("n_predict") == n_predict and r.get("repeat") == repeat
-            and r.get("prompt_id") == pid
-            # ...and under the same chat template. A thinking template answers
-            # at a different length than a terse one, so a row measured without
-            # one is not this campaign's row already done.
-            and r.get("template_id") == tmpl_id}
+    # Keep the ROW, not just the key. A resumed config is not a gap in the
+    # ladder, it is a rung that was already climbed - and printing only a count
+    # of them turned a complete six-rung ladder into three rows with the OOM
+    # boundary missing, which reads as the tool ignoring what was asked for.
+    recorded = {}
+    for r in load_rows(path):
+        if (r.get("config") and r.get("status") in ("ok", "oom")
+                and r.get("n_predict") == n_predict and r.get("repeat") == repeat
+                and r.get("prompt_id") == pid
+                # ...and under the same chat template. A thinking template
+                # answers at a different length than a terse one, so a row
+                # measured without one is not this campaign's row already done.
+                and r.get("template_id") == tmpl_id):
+            recorded[_key(r["model"], r["config"])] = r
+    done = set(recorded)
     plan = [c for c in cfgs if _key(os.path.basename(mp), c) not in done]
     skipped = len(cfgs) - len(plan)
     if limit:
@@ -1402,6 +1424,16 @@ def speed_sweep(models=None, backend=None, dry_run=False, timeout=420.0,
     log("%-2s %-4s %-5s %-5s %-8s %-13s %-4s %-6s | %8s %9s %7s %6s %6s"
         % ("st", "ngl", "ncmoe", "ub", "fill", "spec", "nmax", "mmproj",
            "tok/s", "prefill", "VRAM", "accept", "distin"))
+    # The rungs already climbed, printed in place before the new ones. Resume
+    # exists so a stopped campaign is not re-paid for, but a ladder is read as a
+    # ladder: where it OOMs and where it starts working is the whole finding,
+    # and half of it missing looks like the request was ignored rather than
+    # already answered. Marked "was" so nothing here reads as measured just now.
+    name = os.path.basename(mp)
+    for c in cfgs:
+        r = recorded.get(_key(name, c))
+        if r is not None:
+            log(_fmt_row(c, r) + "   (recorded earlier)")
     out, stopped = [], False
     total = [len(plan)]                 # a list so run_group can revise it
     # The campaign's own estimate, which under a chained search is NOT the same
@@ -1412,7 +1444,6 @@ def speed_sweep(models=None, backend=None, dry_run=False, timeout=420.0,
     planned = len(plan)
     if on_total:
         on_total(total[0], stage=None, planned=planned)
-    name = os.path.basename(mp)
 
     with open(path, "a", encoding="utf-8") as fh:
 

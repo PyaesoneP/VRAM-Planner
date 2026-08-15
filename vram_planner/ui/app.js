@@ -1154,6 +1154,19 @@ function sweepForm(pf){
       <div class="field"><label for="swlimit">Stop after (blank = all)</label>
         <input type="number" id="swlimit" step="1" min="1" placeholder="all"></div>
     </div>
+    <div class="field" style="max-width:24em">
+      <label for="swmmproj">Vision projector</label>
+      <select id="swmmproj">
+        <option value="">sweep it (that is stage B)</option>
+        <option value="vram">keep in VRAM</option>
+        <option value="ram">move to system RAM</option>
+      </select>
+      <p class="hint">Where the projector lives is a real axis &mdash; it was worth ~900 MiB of
+        VRAM on one model, which bought back whole expert layers. Sweeping it is stage B. Pin it
+        instead when you already know where you want it and you are sweeping something else:
+        otherwise the only way to say so was to write
+        <span class="mono">mmproj_offload=false</span> into the axes box.</p>
+    </div>
     <p class="hint" style="margin-top:-4px">Measure where you actually work: decode slows as
       the context fills, so a number taken at 2k is not the speed you feel at 40k. A deeper
       fill costs real time though &mdash; the prompt has to be processed once per config.</p>
@@ -1298,6 +1311,10 @@ function sweepBody(){
            verify: verify,
            verify_overrides: verify ? ($("swverifyoverrides").value.trim() || null) : null,
            axes: ($("swaxes") && $("swaxes").value.trim()) || null,
+           // "" = sweep it (stage B's job). Otherwise pinned for the campaign,
+           // which is a different thing from absent and has to survive as one.
+           mmproj_offload: (($("swmmproj") && $("swmmproj").value) || "") === ""
+             ? null : $("swmmproj").value === "ram" ? false : true,
            ...sweepAskBody() };
 }
 

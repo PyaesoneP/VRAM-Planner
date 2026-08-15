@@ -133,6 +133,11 @@ class Handler(BaseHTTPRequestHandler):
             # and the campaign reads as "speculation does not work here".
             "axes": (parse_overrides(data.get("axes").split())
                      if data.get("axes") else None),
+            # None means "sweep it", which is stage B's job. True/False pin it
+            # for the campaign - so None is a real third value here and cannot
+            # be collapsed with False the way `or None` would.
+            "mmproj_offload": (None if data.get("mmproj_offload") is None
+                               else bool(data.get("mmproj_offload"))),
             # Same two fields the launch-script card already carries, so a
             # campaign can be MEASURED under the template it will be RUN under.
             # Absent means the GGUF's own metadata template, which is what every

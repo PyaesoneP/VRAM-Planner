@@ -1103,6 +1103,21 @@ def _run_suite(require_refs, tmp, skipped_real):
                            for v in (0.0, 0.5, 1.0)}) == 3)
         print("  CHAIN sampler ladders resume distinctly, old rows key unchanged  %s"
               % ("OK" if key_ok else "FAIL"))
+
+        # --speed-axes and --speed-chain are mutually exclusive: chaining rebuilds
+        # each STAGE from the previous winner and an explicit ladder has no
+        # stages. The ladder is the more specific instruction and must win, out
+        # loud - silently running the staged grid instead would burn the same
+        # hours measuring something nobody asked for.
+        from .bench import resolve_search
+        ax = {"kv": ["f16", "q8_0"]}
+        excl_ok = (resolve_search(ax, True)[0] is False       # ladder wins
+                   and resolve_search(ax, True)[1]            # and says so
+                   and resolve_search(None, True) == (True, None)   # chain alone
+                   and resolve_search(ax, False) == (False, None))  # axes alone
+        print("  CHAIN --speed-axes overrides --speed-chain, and says so  %s"
+              % ("OK" if excl_ok else "FAIL"))
+        chain_ok = chain_ok and excl_ok
         chain_ok = chain_ok and samp_ok and key_ok
         print("  CHAIN untrustworthy/incomparable rows refused, 2%% margin held%s  %s"
               % ("" if chain_ok else "  " + "; ".join(cwhy[:3]), "OK" if chain_ok else "FAIL"))
@@ -1145,8 +1160,34 @@ def _run_suite(require_refs, tmp, skipped_real):
                   and abs(dep[0]["drop_pct"] - 50.0) < 0.1)
         print("  FIND  pareto frontier %s, depth curve needs two depths  %s"
               % (got, "OK" if (par_ok and dep_ok) else "FAIL"))
+
+        # A looping row must be VISIBLE while the campaign runs, not only dropped
+        # from conclusions an hour later. The two must also use one threshold: a
+        # row warned about and then kept - or dropped having never been flagged -
+        # is worse than either rule alone.
+        from .bench import _fmt_row, trustworthy, LOOP_RATIO
+        loop = row(2.85, {"spec": "draft-mtp", "spec_n_max": 2},
+                   distinct_ratio=0.184, accept_rate=1.0)
+        quiet = row(2.85, {"spec": "draft-mtp", "spec_n_max": 2},
+                    distinct_ratio=1.0, accept_rate=1.0)
+        edge = row(2.85, distinct_ratio=LOOP_RATIO)          # exactly at the line
+        lt = _fmt_row(loop["config"], loop)
+        # the acceptance rate is the trap: 100% on looping text reads as the
+        # drafter excelling, so the line has to say which one it is
+        warn_ok = ("LOOPING" in lt and "82%" in lt and "not the drafter" in lt
+                   and "LOOPING" not in _fmt_row(quiet["config"], quiet)
+                   and "LOOPING" not in _fmt_row(edge["config"], edge))
+        # non-speculative looping still warns, but without the acceptance clause
+        plain = row(2.10, distinct_ratio=0.184)
+        pt = _fmt_row(plain["config"], plain)
+        warn_ok = warn_ok and "LOOPING" in pt and "drafter" not in pt
+        # one threshold, both directions
+        gate_ok = (not trustworthy(loop) and trustworthy(quiet)
+                   and trustworthy(edge))
+        print("  FIND  looping row warned at run time and gated by one threshold  %s"
+              % ("OK" if (warn_ok and gate_ok) else "FAIL"))
         find_ok = (chain_ok and split_ok and alone_ok and clean_ok and par_ok
-                   and dep_ok)
+                   and dep_ok and warn_ok and gate_ok)
     except Exception as e:
         find_ok = False
         print("  CHAIN/FIND raised %s: %s  FAIL" % (type(e).__name__, e))

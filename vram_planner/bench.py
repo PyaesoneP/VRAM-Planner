@@ -551,6 +551,12 @@ _CONFIG_DEFAULTS = {"ncmoe": 0, "spec_n_max": 0, "fill": 0, "seq": 1,
 # `stage`, which is a label.
 CARRY_KEYS = ("ngl", "ncmoe", "ub", "mmproj_offload", "spec", "spec_n_max")
 
+# Below this fraction of unique 8-word windows the output is repetition, not
+# work. One constant because the run-time table and the trustworthy() gate must
+# agree: a row warned about while running and then kept for a conclusion - or
+# dropped without ever having been flagged - would be worse than either alone.
+LOOP_RATIO = 0.5
+
 
 def trustworthy(r):
     """May a conclusion be drawn from this row?
@@ -569,7 +575,7 @@ def trustworthy(r):
     if r.get("spilled"):
         return False
     dr = r.get("distinct_ratio")
-    return not (dr is not None and dr < 0.5)
+    return not (dr is not None and dr < LOOP_RATIO)
 
 
 def comparable(r, model, base, n_predict=None, repeat=None):
@@ -624,6 +630,24 @@ def best_config(rows, model, base, n_predict=None, repeat=None,
             c[k] = wc[k]
     c.pop("stage", None)
     return c, win
+
+
+def resolve_search(axes, chain):
+    """(chain, note) - which search actually runs when both were asked for.
+
+    Chaining rebuilds each STAGE against the previous stage's winner, and an
+    explicit --speed-axes ladder has no stages, so the two cannot both apply.
+    The ladder is the more specific instruction and wins.
+
+    Pulled out as its own function because the failure it prevents is silent:
+    with both set, the campaign would take exactly the same hours and measure
+    the staged grid instead of the ladder that was asked for, with nothing in
+    the output to say so. A precedence rule worth stating out loud is worth
+    being able to test."""
+    if axes and chain:
+        return False, ("note    : --speed-axes given, so chaining is off - an "
+                       "explicit ladder has no stages to chain")
+    return chain, None
 
 
 def _carry_summary(c):
@@ -748,6 +772,9 @@ def speed_sweep(models=None, backend=None, dry_run=False, timeout=420.0,
         for k, vals in axes.items():
             combos = [dict(c, **{k: v}) for c in combos for v in vals]
         cfgs = combos
+    chain, note = resolve_search(axes, chain)
+    if note:
+        log(note)
 
     gpu = (gpu_list(fresh=True) or [{}])[0].get("name") or ""
     path = bench_path(gpu, b["build"])
@@ -824,9 +851,9 @@ def speed_sweep(models=None, backend=None, dry_run=False, timeout=420.0,
         return None
 
     log("")
-    log("%-2s %-4s %-5s %-5s %-8s %-13s %-4s %-6s | %8s %9s %7s %6s"
+    log("%-2s %-4s %-5s %-5s %-8s %-13s %-4s %-6s | %8s %9s %7s %6s %6s"
         % ("st", "ngl", "ncmoe", "ub", "fill", "spec", "nmax", "mmproj",
-           "tok/s", "prefill", "VRAM", "accept"))
+           "tok/s", "prefill", "VRAM", "accept", "distin"))
     out, stopped = [], False
     total = [len(plan)]                 # a list so run_group can revise it
     if on_total:
@@ -931,14 +958,43 @@ def _fmt_row(c, row, i=None, n=None):
     if row.get("status") != "ok":
         return head + "%s %s" % (row["status"].upper(),
                                  row.get("gen_error") or row.get("error") or "")
-    return head + "%8.2f %9.1f %7.0f %6s%s" % (
+    dr = row.get("distinct_ratio")
+    return head + "%8.2f %9.1f %7.0f %6s %6s%s" % (
         row.get("tok_s") or 0.0, row.get("prefill_tok_s") or 0.0,
         row.get("proc_vram_mib") or 0.0,
         ("%.0f%%" % (100 * row["accept_rate"])) if row.get("accept_rate") else "-",
+        ("%.2f" % dr) if dr is not None else "-",
         ("  SPILLED" if row.get("spilled") else "")
         + ("  [filler repeats - speculative rate inflated]"
            if row.get("corpus_repeated") and row["config"].get("spec") not in (None, "none")
-           else ""))
+           else "")
+        + _looping_note(row))
+
+
+def _looping_note(row):
+    """The warning for a row that measured a model talking to itself.
+
+    distinct_ratio is already recorded and already gates trustworthy(), so a
+    looping row is silently dropped from every conclusion later. Printing the
+    number at run time is what makes that visible while the campaign is still
+    worth stopping - a whole grid can otherwise complete, look ordinary, and
+    contribute nothing.
+
+    The speculative case gets its own sentence because the two symptoms point
+    opposite ways to a reader: an acceptance rate near 100% looks like the
+    draft model excelling, when repeated output is exactly what makes any
+    draft trivially correct. High acceptance ON looping text is evidence of
+    the degeneration, not of speculation working."""
+    dr = row.get("distinct_ratio")
+    if dr is None or dr >= LOOP_RATIO:
+        return ""
+    spec = (row.get("config") or {}).get("spec") not in (None, "none")
+    if spec and (row.get("accept_rate") or 0) >= 0.95:
+        return ("  LOOPING - output is %.0f%% repetition, so the %.0f%% acceptance "
+                "is the loop, not the drafter; excluded from conclusions"
+                % (100 * (1 - dr), 100 * row["accept_rate"]))
+    return ("  LOOPING - output is %.0f%% repetition; excluded from conclusions"
+            % (100 * (1 - dr)))
 
 
 # ---------------------------------------------------------------------------
@@ -1322,5 +1378,9 @@ def report(path=None, log=print):
                r["tok_s"], r.get("prefill_tok_s") or 0.0,
                r.get("proc_vram_mib") or 0.0,
                ("%.0f%%" % (100 * r["accept_rate"])) if r.get("accept_rate") else "-",
-               "  SPILLED" if r.get("spilled") else ""))
+               # Ranked fastest-first, and a looping row can WIN that ranking:
+               # repetition is cheap to generate. Marked here for the same reason
+               # SPILLED is - the row is real evidence, it just is not evidence
+               # about the setting in its own columns.
+               ("  SPILLED" if r.get("spilled") else "") + _looping_note(r)))
     return True

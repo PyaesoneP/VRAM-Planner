@@ -487,6 +487,34 @@ def bench_one(backend, model_path, c, port=BENCH_PORT, timeout=420.0,
                 row["templated"] = bool(templated)
                 samp = sampling_of(c)
                 row["sampling"] = samp
+                # One throwaway pass on a TINY prompt, before anything is timed.
+                #
+                # llama-server's own --warmup does not cover what this does. The
+                # measured shape says so: at ncmoe 32-35 the ready line came
+                # 21-49s after launch and the first real request then spent
+                # 106-158s on a 2,065-token prompt - while the same model at
+                # 119,099 tokens managed 573s. A rate cannot do that. Solving
+                # the two gives ~253 tok/s plus ~100s of FIXED cost, and the
+                # fixed part is anti-correlated with load time: when loading
+                # took 21s the first request took 158s, when it took 49s the
+                # request took 116s, and the sum barely moved. That is paging.
+                # --n-cpu-moe puts ~20 GB of experts in system RAM, the plan
+                # already needs more RAM than is free, and whatever the load did
+                # not fault in the first forward pass does.
+                #
+                # bench_one already knew the first pass is contaminated - it
+                # throws the cold pass's DECODE away for exactly this reason,
+                # and the numbers agree, cold decode running 0.56-0.82x the warm
+                # figure. It just kept the same pass's PREFILL. So prefill_tok_s
+                # at shallow fill was measuring page faults.
+                #
+                # This costs nothing: the fault-in is paid once either way. It
+                # moves out of the number instead of being added to the run.
+                generate(srv.url, INSTRUCTION.strip(), 1, gen_timeout,
+                         cache_prompt=False, sampling=samp, seed=999)
+                # Rows recorded before this are not comparable on prefill and
+                # must not be silently averaged with these.
+                row["prefill_warm"] = True
                 cold = generate(srv.url, prompt, min(16, n_predict), gen_timeout,
                                 cache_prompt=False, sampling=samp, seed=1000)
                 row["cold"] = cold
@@ -1806,6 +1834,7 @@ def _slim(r):
             "shared_excess": r.get("shared_excess"),
             "spill_inferred": r.get("spill_inferred"),
             "templated": r.get("templated"),
+            "prefill_warm": r.get("prefill_warm"),
             "template_id": r.get("template_id"),
             "chat_template": r.get("chat_template"),
             "template_kwargs": r.get("template_kwargs"),

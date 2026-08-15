@@ -1455,6 +1455,16 @@ function rowFlags(r){
     Math.round(r.spill_inferred) + " MiB moved out of VRAM into system RAM, deduced from a " +
     "floor that fell that far below the rest of the campaign. Still a real measurement - a " +
     "ladder slowing at its top rung is the wall being found."]);
+  /* Not a bad row - the decode figure is fine, it comes from the warm passes.
+     Only PREFILL is unusable: the pass it was taken from also paid the one-time
+     cost of faulting CPU-resident weights in, which a shallow prompt cannot
+     amortise. Measured, ~100s of it on an ncmoe config at fill 2048. */
+  if(r.prefill_warm !== true && r.prefill_tok_s)
+    f.push(["prefill unwarmed", "The prefill figure on this row includes one-time load cost " +
+      "- lazily-faulted CPU-resident weights and kernel init - because it was taken from the " +
+      "first request after the server came up. At a shallow fill that dominates it: 2,065 " +
+      "tokens took ~110s where the rate implies ~8s. Decode is unaffected; it comes from the " +
+      "warm passes. Re-measure for a prefill number you can compare."]);
   if(r.templated === false) f.push(["no template", "This backend had no /apply-template, so " +
     "the model was handed raw text with nothing marking it as a request and merely continued " +
     "the document. Not comparable with templated rows."]);

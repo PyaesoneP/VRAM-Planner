@@ -1415,6 +1415,28 @@ def _run_suite(require_refs, tmp, skipped_real):
         print("  BENCH busy port falls back instead of dying as EXIT  %s"
               % ("OK" if port_ok else "FAIL"))
 
+        # prefill is taken from the FIRST request after the server comes up, so
+        # it also paid for faulting CPU-resident weights in. bench_one already
+        # throws that pass's DECODE away for the same reason; it kept its
+        # prefill. A tiny throwaway generation now goes first, and rows say
+        # which side of that they were measured on - old ones must not be
+        # averaged with new ones as though the number meant the same thing.
+        import inspect as _i
+        src = _i.getsource(_b.bench_one)
+        warm_ok = ('row["prefill_warm"] = True' in src
+                   # the throwaway has to come BEFORE the timed cold pass, or it
+                   # warms nothing that matters
+                   and src.index("seed=999") < src.index("seed=1000")
+                   and "prefill_warm" in _i.getsource(_b._slim))
+        # the badge fires on rows lacking the flag, and only when there is a
+        # prefill figure to distrust
+        js = open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               "ui", "app.js"), encoding="utf-8").read()
+        warm_ok = warm_ok and "r.prefill_warm !== true && r.prefill_tok_s" in js
+        print("  WARM  prefill measured after the fault-in, and old rows say so  %s"
+              % ("OK" if warm_ok else "FAIL"))
+        port_ok = port_ok and warm_ok
+
         # Stop, twice. The soft stop lands between configs and keeps the store
         # free of half-measurements, but nearly all of a config's wall time is
         # one blocking request to the server, so at a deep fill it is minutes

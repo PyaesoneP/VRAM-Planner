@@ -1318,7 +1318,8 @@ function sweepResults(){
 /* -- 4. the launcher ------------------------------------------------------ */
 const SAMPLERS = ["temp", "top_k", "top_p", "min_p", "repeat_penalty",
                   "presence_penalty"];
-const SCRIPT_FIELDS = ["swport", "swhost", "swload", "sm_tmplfile", "sm_tmplkw"]
+const SCRIPT_FIELDS = ["swport", "swhost", "swload", "sm_tmplfile", "sm_tmplkw",
+                       "sm_reason", "sm_reasonpre"]
   .concat(SAMPLERS.map(k => "sm_" + k));
 
 /** Read the launch-script pane's inputs into SWEEP.form.
@@ -1531,7 +1532,12 @@ async function loadHistory(){
    model on the same build can hold several campaigns that asked different
    questions, and they must not open each other. */
 function campaignId(g){
-  return [g.model, g.gpu, g.file, g.prompt_id || "", g.template_id || ""].join(" ");
+  return [g.model, g.gpu, g.file, g.prompt_id || "", g.template_id || ""]// A separator that survives an HTML attribute round trip. This id goes out
+  // as data-id and comes back through el.dataset.id, and a control
+  // character does NOT make that trip: it is dropped, the returned id stops
+  // matching the one campaignRow() computes, and every campaign silently
+  // refuses to open.
+  .join("~");
 }
 
 async function openCampaign(id){

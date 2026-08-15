@@ -913,6 +913,27 @@ def _run_suite(require_refs, tmp, skipped_real):
             "m.gguf", base, shell="bash", sampling={"temp": 1.0, "min_p": ""})))
         if "--temp" not in run or "--min-p" in run:
             gen_ok = False; why.append("blank sampler handling")
+        # The browser assets, checked as BYTES. A stray control character in a
+        # string literal is invisible in an editor, parses fine, and passes
+        # node --check - and then breaks at runtime in a way that points
+        # nowhere near itself. A NUL landed in campaignId()'s separator, the id
+        # went out as data-id, came back through el.dataset.id with the NUL
+        # dropped, stopped matching the id campaignRow() computed, and every
+        # campaign silently refused to open. Nothing in the file looked wrong.
+        ui_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ui")
+        ctl_bad = []
+        for fn in sorted(os.listdir(ui_dir)) if os.path.isdir(ui_dir) else []:
+            if not fn.endswith((".js", ".css", ".html")):
+                continue
+            raw_b = open(os.path.join(ui_dir, fn), "rb").read()
+            for i, b in enumerate(raw_b):
+                if b < 9 or 13 < b < 32:
+                    ctl_bad.append("%s byte %d = 0x%02x (line %d)"
+                                   % (fn, i, b, raw_b[:i].count(b"\n") + 1))
+                    break
+        if ctl_bad:
+            gen_ok = False; why.append("control chars: " + "; ".join(ctl_bad))
+
         print("  SCRIPT no dead flags, flags match config, blank samplers omitted%s  %s"
               % ("" if gen_ok else "  " + "; ".join(why[:4]), "OK" if gen_ok else "FAIL"))
 

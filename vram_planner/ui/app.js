@@ -1068,12 +1068,73 @@ function sweepForm(pf){
         <input type="text" id="swverifyoverrides" placeholder="spec=draft-mtp spec_n_max=2">
       </div>
     </div>
+    ${raw(sweepAskSection())}
     <div class="actions">
       <button class="ghost" type="button" data-action="sweep-plan">Preview grid</button>
       <button class="go" type="button" style="width:auto" data-action="sweep-start">&#9654; Start measuring</button>
     </div>
     <div id="sweepplan"></div>
   </div>`;
+}
+
+/** How the model is ASKED, while it is being measured.
+ *
+ *  These are not axes. They are frozen for the campaign, exactly like context
+ *  and KV quant, and they are here because leaving them out made every campaign
+ *  measure something other than what the launcher would go on to run:
+ *
+ *    - no template, so an instruction-tuned model was handed raw text and
+ *      continued the document instead of answering it
+ *    - greedy sampling, which is speculation's BEST case, so an acceptance
+ *      rate measured here is an upper bound and not a result
+ *
+ *  The generated script now warns when it is launching a config that differs
+ *  from the row it cites. This is the other half: the way to make it not
+ *  differ. */
+function sweepAskSection(){
+  const tl = (SWEEP && SWEEP.templates) || [];
+  const num = (id, label, ph) => h`<div class="field"><label for="${id}">${label}</label>
+    <input type="number" id="${id}" step="0.01" placeholder="${ph}"></div>`;
+  return h`<details class="adv" id="swaskbox"><summary>How the model is asked while measuring
+      &mdash; template, thinking, samplers</summary>
+    <p class="hint">Frozen for the campaign, not swept &mdash; the same standing as context and
+      KV quant. Set these to <b>what you will actually run</b>. A row measured under other
+      settings is a different experiment: rows are keyed on the template&rsquo;s content hash
+      and on the samplers, so changing anything here re-measures rather than resuming.</p>
+    <div class="field">
+      <label for="swtmplfile">Chat template file</label>
+      <input type="text" id="swtmplfile" list="tmpllist2"
+             placeholder="&mdash; the model&rsquo;s own &mdash;">
+      <datalist id="tmpllist2">${raw(tl.map(t => h`<option value="${t}"></option>`).join(""))}</datalist>
+      <p class="hint">Without one the benchmark still asks through the server&rsquo;s
+        <span class="mono">/apply-template</span>, so it uses whatever the GGUF carries. Pin the
+        file here when the launcher will pin it, or the two are measuring different prompts.
+        Quotes around a pasted Windows path are stripped.</p>
+    </div>
+    <div class="field">
+      <label for="swtmplkw">Template keyword arguments (JSON object)</label>
+      <input type="text" id="swtmplkw" placeholder='{"reasoning_effort":"xhigh"}'>
+    </div>
+    <div class="row">
+      <div class="field"><label for="swreason">Thinking</label>
+        <select id="swreason"><option value="auto">auto</option>
+          <option value="on">on</option><option value="off">off</option></select></div>
+      <div class="field"><label for="swreasonpre">Preserve thinking</label>
+        <select id="swreasonpre"><option value="default">template default</option>
+          <option value="on">on</option><option value="off">off</option></select></div>
+    </div>
+    <p class="sublabel" style="margin-top:14px">SAMPLERS</p>
+    <p class="hint" style="margin-top:-4px">Blank means <b>greedy</b> (temp 0), which is the
+      right default for comparing configs &mdash; it makes the token stream reproducible, so two
+      rows differ by the knob under test and nothing else. It is the wrong thing to draw a
+      <b>speculation</b> conclusion from: llama.cpp accepts a draft token when the target&rsquo;s
+      own sampled token matches it, and under greedy that comparison is deterministic. Greedy is
+      speculation&rsquo;s best case, so fill these in before believing an acceptance rate.</p>
+    <div class="row">${raw(num("swtemp", "temp", "0 (greedy)") + num("swtopk", "top-k", "0")
+      + num("swtopp", "top-p", "1.0") + num("swminp", "min-p", "0"))}</div>
+    <div class="row">${raw(num("swreppen", "repeat-penalty", "1.0")
+      + num("swprespen", "presence-penalty", "0"))}</div>
+  </details>`;
 }
 
 function sweepStage(letter, label, hint){
@@ -1095,7 +1156,33 @@ function sweepBody(){
            repeat: v("swrep"), limit: v("swlimit"),
            chain: chain, rounds: chain ? (v("swrounds") || 1) : 1,
            verify: verify,
-           verify_overrides: verify ? ($("swverifyoverrides").value.trim() || null) : null };
+           verify_overrides: verify ? ($("swverifyoverrides").value.trim() || null) : null,
+           ...sweepAskBody() };
+}
+
+/** The "how the model is asked" fields, in the shapes the server expects.
+ *  Sampler names are the launch-script card's, so one vocabulary reaches both
+ *  and web.py does the single mapping to a sweep config's shorter spelling. */
+function sweepAskBody(){
+  const t = id => { const el = $(id); return (el && el.value.trim()) || null; };
+  const n = id => { const el = $(id); return el && el.value.trim() !== ""
+                                      ? parseFloat(el.value) : null; };
+  const sel = id => { const el = $(id); return el ? el.value : null; };
+  const sampling = {};
+  [["swtemp", "temp"], ["swtopk", "top_k"], ["swtopp", "top_p"],
+   ["swminp", "min_p"], ["swreppen", "repeat_penalty"],
+   ["swprespen", "presence_penalty"]].forEach(([id, k]) => {
+     const v = n(id); if(v !== null) sampling[k] = v;
+   });
+  return {
+    chat_template_file: t("swtmplfile"),
+    chat_template_kwargs: t("swtmplkw"),
+    // auto/default are llama.cpp's own answers, sent as null so no flag is
+    // emitted rather than one restating a default that could later move
+    reasoning: sel("swreason") === "auto" ? null : sel("swreason"),
+    reasoning_preserve: sel("swreasonpre") === "default" ? null : sel("swreasonpre"),
+    sampling: sampling
+  };
 }
 
 async function sweepPlan(){

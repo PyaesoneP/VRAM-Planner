@@ -91,6 +91,13 @@ class Handler(BaseHTTPRequestHandler):
     # bench/sweep are imported inside these handlers, not at module scope: they
     # pull in the subprocess machinery, and starting the web UI should not.
 
+    # The launch-script form's sampler names, mapped to what a sweep config
+    # calls them. One set of fields feeds both cards, which is the point: a
+    # campaign measured under settings the launcher does not use is how the
+    # header ends up quoting an acceptance rate from a different experiment.
+    _SWEEP_SAMPLER = {"repeat_penalty": "rep_pen",
+                      "presence_penalty": "pres_pen"}
+
     def _speed_args(self, data):
         """The subset of --speed-sweep's arguments the UI exposes.
 
@@ -125,6 +132,12 @@ class Handler(BaseHTTPRequestHandler):
             "chat_template_kwargs": data.get("chat_template_kwargs") or None,
             "reasoning": data.get("reasoning") or None,
             "reasoning_preserve": data.get("reasoning_preserve") or None,
+            # Frozen for the campaign, like ctx and kv - not swept. The form
+            # sends the launch-script spelling so one set of fields can feed
+            # both cards; a sweep config spells the last two shorter.
+            "sampling": {self._SWEEP_SAMPLER.get(k, k): v
+                         for k, v in (data.get("sampling") or {}).items()
+                         if v is not None and v != ""},
         }
 
     def _speed_start(self, data):

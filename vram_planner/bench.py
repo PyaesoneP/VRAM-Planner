@@ -413,6 +413,10 @@ def _copyback_ratio(text, prompt, n=8):
 _TEMPLATE_KEYS = ("chat_template_file", "chat_template_kwargs",
                   "reasoning", "reasoning_preserve")
 
+# The sampler names a sweep CONFIG uses - what sampling_of() reads and _key()
+# hashes. The launch-script form spells the last two out in full; web.py maps.
+_SWEEP_SAMPLER_KEYS = ("temp", "top_k", "top_p", "min_p", "rep_pen", "pres_pen")
+
 
 def bench_one(backend, model_path, c, port=BENCH_PORT, timeout=420.0,
               n_predict=N_PREDICT, repeat=N_REPEAT, gen_timeout=1800, log=print):
@@ -1111,7 +1115,7 @@ def speed_sweep(models=None, backend=None, dry_run=False, timeout=420.0,
                 on_row=None, should_stop=None, on_total=None,
                 chain=False, rounds=1, verify=False, verify_overrides=None,
                 chat_template_file=None, chat_template_kwargs=None,
-                reasoning=None, reasoning_preserve=None):
+                reasoning=None, reasoning_preserve=None, sampling=None):
     """Run the speed grid and append one row per config. Resumable like --sweep.
 
     `on_row` is called with each finished row, `on_total` when the number of
@@ -1176,6 +1180,17 @@ def speed_sweep(models=None, backend=None, dry_run=False, timeout=420.0,
         base["reasoning"] = rea
     if rea_p:
         base["reasoning_preserve"] = rea_p
+    # Samplers, frozen across the campaign rather than swept - the same standing
+    # as ctx and kv. They belong in the config dict because sampling_of() reads
+    # them from there and _key() includes them, so a campaign re-run at real
+    # settings does not resume greedy rows as though they were the same
+    # measurement. Which they are not, and the difference is largest exactly
+    # where it is least obvious: greedy makes the target's token deterministic,
+    # so it is speculation's best case, and an acceptance rate measured there is
+    # an upper bound rather than a result.
+    for k, v in (sampling or {}).items():
+        if k in _SWEEP_SAMPLER_KEYS and v is not None and v != "":
+            base[k] = float(v) if k != "top_k" else int(v)
     if fill is not None:
         base["fill"] = fill
     if ctx is not None:
@@ -1245,6 +1260,14 @@ def speed_sweep(models=None, backend=None, dry_run=False, timeout=420.0,
     if rea or rea_p:
         log("thinking: --reasoning %s, preserve history %s"
             % (rea or "auto", rea_p or "template default"))
+    # Said out loud either way. Greedy is the default and it is speculation's
+    # best case, so a campaign that never mentions its samplers is the one whose
+    # acceptance rate is most likely to be read as a result rather than a bound.
+    samp_set = [(k, base[k]) for k in _SWEEP_SAMPLER_KEYS if k in base]
+    log("sampling: %s" % (" ".join("%s %s" % kv for kv in samp_set) if samp_set
+                          else "greedy (temp 0) - reproducible across configs, and "
+                               "speculation's BEST case, so read acceptance as an "
+                               "upper bound"))
     log("output  : %s" % path)
     log("configs : %d to run, %d already recorded" % (len(plan), skipped))
     log("estimate: ~%.1f h  (load + %d warm + %d x %d tokens per config)"

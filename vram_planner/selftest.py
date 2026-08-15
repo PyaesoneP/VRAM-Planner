@@ -1622,14 +1622,44 @@ def _run_suite(require_refs, tmp, skipped_real):
             arg_ok = False
         except ValueError:
             pass
+        # Samplers are frozen for a campaign, like ctx and kv, and they have to
+        # reach the CONFIG - sampling_of() reads them there and _key() hashes
+        # them, so a campaign re-run at real settings must not resume its greedy
+        # rows as though they were the same measurement. They are not: greedy
+        # makes the target's token deterministic, so it is speculation's best
+        # case, and an acceptance rate measured there is an upper bound.
+        from vram_planner.bench import (stage_configs, sampling_of,
+                                        _SWEEP_SAMPLER_KEYS)
+        from vram_planner.sweep import _key
+        b_greedy = {"ctx": 4096, "kv": "q8_0", "fa": True, "seq": 1, "ub": 512,
+                    "ngl": 28, "fill": 2048}
+        b_real = dict(b_greedy, temp=1.0, top_k=20, top_p=0.95, rep_pen=1.05)
+        c_g = stage_configs("a", b_greedy, 65, False, [27, 28])[0]
+        c_r = stage_configs("a", b_real, 65, False, [27, 28])[0]
+        samp_ok = (sampling_of(c_g)["temperature"] == 0.0
+                   and sampling_of(c_r)["temperature"] == 1.0
+                   and sampling_of(c_r)["top_k"] == 20
+                   and sampling_of(c_r)["repeat_penalty"] == 1.05
+                   # ...and the two are different rows, so resume re-measures
+                   and _key("m.gguf", c_g) != _key("m.gguf", c_r)
+                   # every name the sweep uses survives the trip
+                   and all(k in b_real or k in ("min_p", "pres_pen")
+                           for k in _SWEEP_SAMPLER_KEYS))
+        # the web layer's field names map onto those, or the two cards would
+        # measure and launch under settings that only LOOK like each other
+        from vram_planner.web import Handler
+        mapped = {Handler._SWEEP_SAMPLER.get(k, k) for k in
+                  ("temp", "top_k", "top_p", "min_p", "repeat_penalty",
+                   "presence_penalty")}
+        samp_ok = samp_ok and mapped == set(_SWEEP_SAMPLER_KEYS)
         print("  TMPL  template splits experiments by content, --jinja leads it  %s"
-              % ("OK" if (ti_ok and cmp_ok and arg_ok) else "FAIL"))
+              % ("OK" if (ti_ok and cmp_ok and arg_ok and samp_ok) else "FAIL"))
         find_ok = (chain_ok and split_ok and alone_ok and clean_ok and par_ok
                    and dep_ok and warn_ok and gate_ok
                    and copy_ok and metric_ok and id_ok and vc_ok
                    and tmpl_ok and scheme_ok and port_ok
                    and meas_ok and inf_ok
-                   and ti_ok and cmp_ok and arg_ok)
+                   and ti_ok and cmp_ok and arg_ok and samp_ok)
     except Exception as e:
         find_ok = False
         print("  CHAIN/FIND raised %s: %s  FAIL" % (type(e).__name__, e))

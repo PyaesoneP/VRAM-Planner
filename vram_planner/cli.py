@@ -59,6 +59,21 @@ def main():
                     help="with --speed-chain: re-run the stages from the winner N "
                          "times. Cheap - a config a later round revisits unchanged "
                          "is already recorded and is skipped")
+    ap.add_argument("--speed-verify", action="store_true",
+                    help="with --speed-sweep: after the campaign, load the winner "
+                         "once more at the PRODUCTION config and only certify it if "
+                         "it actually loads - a split that fitted the grid does not "
+                         "automatically fit what you run")
+    ap.add_argument("--speed-verify-overrides", nargs="+", default=None, metavar="AXIS=V,V",
+                    help="with --speed-verify: the production config, e.g. "
+                         "spec=draft-mtp spec_n_max=2 temp=1 top_k=20 top_p=0.95. "
+                         "Overlaid on the winner's knobs; absent, the winner is "
+                         "verified as itself")
+    ap.add_argument("--refresh-corpus", action="store_true",
+                    help="rebuild the frozen speed-sweep filler corpus from this "
+                         "repository's README and sources. Rows record the corpus's "
+                         "hash, so an old corpus and a new one are different "
+                         "experiments and old rows stop resuming")
     ap.add_argument("--speed-report", action="store_true",
                     help="print every recorded speed row, fastest first")
     ap.add_argument("--insights", action="store_true",
@@ -143,16 +158,30 @@ def main():
     if args.speed_report:
         from .bench import report as speed_report, report_insights
         sys.exit(0 if (report_insights() if args.insights else speed_report()) else 1)
+    if args.refresh_corpus:
+        from .bench import prompt_identity, refresh_corpus
+        before = prompt_identity()
+        path = refresh_corpus()
+        after = prompt_identity()
+        print("wrote %s" % path)
+        print("corpus identity: %s -> %s%s"
+              % (before[:12], after[:12],
+                 " (unchanged - commit it so rows keep resuming)" if before == after
+                 else " - rows recorded against the old corpus will not be resumed"))
+        sys.exit(0)
     if args.speed_sweep:
         from .bench import speed_sweep         # deferred: needs subprocess work
         from .sweep import parse_overrides
         axes = parse_overrides(args.speed_axes) if args.speed_axes else None
+        overrides = (parse_overrides(args.speed_verify_overrides)
+                     if args.speed_verify_overrides else None)
         r = speed_sweep(models=args.models, backend=args.backend,
                         dry_run=args.dry_run, timeout=args.sweep_timeout,
                         limit=args.limit, axes=axes, stages=args.speed_stages,
                         fill=args.speed_fill, ctx=args.speed_ctx, kv=args.speed_kv,
                         n_predict=args.n_predict, repeat=args.repeat,
-                        chain=args.speed_chain, rounds=args.speed_rounds)
+                        chain=args.speed_chain, rounds=args.speed_rounds,
+                        verify=args.speed_verify, verify_overrides=overrides)
         sys.exit(0 if r else 1)
     if args.fit:
         from .fit import report

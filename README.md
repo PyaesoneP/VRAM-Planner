@@ -100,6 +100,7 @@ every number has one home:
 | `plan` | `analyze()` and the layer-split planners |
 | `sweep` | driving `llama-server` across a config grid, recording what it allocates |
 | `bench` | driving it across a grid and recording how fast it **generates** |
+| `_corpus.txt` | the frozen benchmark filler, committed on purpose — never delete (see *Measuring speed*) |
 | `fit` | scoring `compute` against sweep data, held out |
 | `launch` | turning a config into a runnable `llama-server` launch script |
 | `job` | the one background campaign the web UI can start and watch |
@@ -522,6 +523,14 @@ the path did not resolve — the flags are the valuable part and the path is one
 freezing context/KV, why the primary knob inverts on MoE, the axis reference, and the
 measurement discipline (bracketing controls, why greedy overstates speculation, and the
 repetition check that catches a fake acceptance rate).
+
+The prompt is a **frozen corpus** — this README plus the sources, snapshotted into
+`vram_planner/_corpus.txt` and committed. That half-megabyte file is not build output:
+every row records the corpus's hash, so if the file ever disappeared and were rebuilt
+from a changed tree, every deep-fill row you ever measured would become a different
+experiment and stop merging with new ones. It changes only when you deliberately run
+`--refresh-corpus`, which re-keys the rows so the re-measure is visible rather than
+silent.
 
 It launches `llama-server` per config, sizes the prompt with the server's own
 `/tokenize` so "32k of context" means 32k, runs **one cold pass** (that is the prefill

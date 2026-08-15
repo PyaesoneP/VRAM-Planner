@@ -227,8 +227,46 @@ def _params_used(argv):
     return seen
 
 
+# Settings in which a launched config may differ from the measured row it cites.
+# Samplers matter for a SPECULATIVE row (greedy is speculation's best case) and
+# nothing for a bandwidth-bound decode, but the header cannot know which case
+# it is in, so any difference is named.
+_EVIDENCE_KEYS = ("ctx", "kv", "fa", "seq", "ub", "ngl", "ncmoe", "fill",
+                  "spec", "spec_n_max", "mmproj_offload")
+
+_SAMPLER_KEYS = ("temp", "top_k", "top_p", "min_p", "rep_pen", "pres_pen")
+
+
+def _config_divergence(c, measured, sampling=None):
+    """The settings in which a launched config differs from the row it cites.
+
+    The winner of a sweep was measured at one config, and the script built from
+    it may not launch that same config - the form can add a spec, a draft depth,
+    samplers, a deeper fill. The row's tok/s and fit evidence then belong to a
+    config this script does not run, which is the quiet failure mode the header
+    warning exists for: the numbers still look like they were measured for this.
+    Returns a short description, or "" when the configs match."""
+    mc = (measured or {}).get("config") or {}
+    if not mc:
+        return ""
+    diffs = []
+    for k in _EVIDENCE_KEYS:
+        a, b = c.get(k), mc.get(k)
+        if k == "fa":
+            a, b = bool(a), bool(b)
+        if k == "mmproj_offload":
+            a, b = a is not False, b is not False
+        if a is not None and b is not None and a != b:
+            diffs.append("%s %s->%s" % (k, b, a))
+    for k in _SAMPLER_KEYS:
+        a, b = (sampling or {}).get(k), mc.get(k)
+        if a is not None and b is not None and a != b:
+            diffs.append("%s %s->%s" % (k, b, a))
+    return ", ".join(diffs)
+
+
 def _provenance(model_path, c, measured, backend, tmpl=(None, None),
-                path_resolved=True):
+                path_resolved=True, divergence=""):
     """Where these numbers came from - measured, or the planner's estimate."""
     out = ["Model    : %s" % os.path.basename(model_path or "?")]
     if not path_resolved:
@@ -273,6 +311,12 @@ def _provenance(model_path, c, measured, backend, tmpl=(None, None),
     if measured.get("spilled"):
         out.append("           !! this row SPILLED into shared memory - it loaded, but the")
         out.append("              GPU was over-committed. Treat the speed as suspect.")
+    if divergence:
+        out.append("           !! this config DIFFERS from the measured row: %s" % divergence)
+        out.append("              the tok/s and fit above belong to the row as measured,")
+        out.append("              not to what this script launches. A split that fits one")
+        out.append("              does not necessarily fit the other - re-measure, or")
+        out.append("              expect the numbers to change.")
     if measured.get("when"):
         out.append("           recorded %s"
                    % datetime.datetime.fromtimestamp(measured["when"]).strftime("%Y-%m-%d"))
@@ -283,7 +327,8 @@ def _provenance(model_path, c, measured, backend, tmpl=(None, None),
 # The two shells
 # ---------------------------------------------------------------------------
 def _powershell(model_path, c, argv, backend, mmproj, sampling, port, bind_host,
-                load_mode, log_dir, measured, params, tmpl, path_resolved):
+                load_mode, log_dir, measured, params, tmpl, path_resolved,
+                divergence=""):
     exe_name = EXE_BY_SHELL["powershell"]
     # PowerShell is case-insensitive about variables, but $model reading as $Model
     # in one place and not the other just looks like a bug to whoever edits this.
@@ -293,7 +338,8 @@ def _powershell(model_path, c, argv, backend, mmproj, sampling, port, bind_host,
     L = []
     A = L.append
 
-    for line in _provenance(model_path, c, measured, backend, tmpl, path_resolved):
+    for line in _provenance(model_path, c, measured, backend, tmpl, path_resolved,
+                            divergence):
         A("# " + line)
     A("#")
     A("# Usage:  powershell -ExecutionPolicy Bypass -File .\\%s"
@@ -499,7 +545,8 @@ def _powershell(model_path, c, argv, backend, mmproj, sampling, port, bind_host,
 
 
 def _bash(model_path, c, argv, backend, mmproj, sampling, port, bind_host,
-          load_mode, log_dir, measured, params, tmpl, path_resolved):
+          load_mode, log_dir, measured, params, tmpl, path_resolved,
+          divergence=""):
     exe_name = EXE_BY_SHELL["bash"]
     has_tmpl = bool(tmpl[0] or tmpl[1])
     # Paths come from the host, which may be Windows. Backslashes are an escape
@@ -513,7 +560,8 @@ def _bash(model_path, c, argv, backend, mmproj, sampling, port, bind_host,
 
     A("#!/usr/bin/env bash")
     A("# " + "-" * 68)
-    for line in _provenance(model_path, c, measured, backend, tmpl, path_resolved):
+    for line in _provenance(model_path, c, measured, backend, tmpl, path_resolved,
+                            divergence):
         A("# " + line)
     A("#")
     A("# Every setting below is an environment variable override, e.g.")
@@ -726,5 +774,7 @@ def launch_script(model_path, c, backend=None, mmproj=None, shell=None,
     tmpl = template_args(chat_template_file, chat_template_kwargs)
     params = _params_used(argv)
     fn = _powershell if shell == "powershell" else _bash
+    divergence = _config_divergence(c, measured, sampling)
     return fn(model_path, c, argv, backend, mmproj, samp, port, bind_host,
-              load_mode, log_dir, measured, params, tmpl, path_resolved)
+              load_mode, log_dir, measured, params, tmpl, path_resolved,
+              divergence)

@@ -991,7 +991,27 @@ def _run_suite(require_refs, tmp, skipped_real):
                    and "--load-mode" in "\n".join(command_lines(miss)))
         print("  TMPL  unresolved model still generates, and says so  %s"
               % ("OK" if lost_ok else "FAIL"))
-        script_ok = probe_ok and gen_ok and tmpl_ok and lost_ok
+
+        # 11e) A launcher built from a measured row must SAY when the launched
+        # config differs from the row's config. The row's tok/s and fit evidence
+        # belong to the row as measured - a script that adds MTP on top of a row
+        # measured without it, carrying the row's ngl into a config that OOMs on
+        # it, would otherwise look exactly like the row it is not.
+        from .launch import _config_divergence
+        rowcfg = dict(base, spec="none")
+        meas = {"tok_s": 9.45, "config": rowcfg}
+        same = launch_script("m.gguf", dict(base, spec="none"), shell="bash",
+                             measured=meas)
+        div = launch_script("m.gguf", dict(base, spec="draft-mtp", spec_n_max=2),
+                            shell="bash", measured=meas)
+        div_ok = ("DIFFERS from the measured row" in div
+                  and "spec none->draft-mtp" in div
+                  and "DIFFERS" not in same
+                  # a config that omits a knob groups with one that never set it
+                  and _config_divergence(dict(base), meas) == "")
+        print("  SCRIPT launcher says when the launched config differs from the row  %s"
+              % ("OK" if div_ok else "FAIL"))
+        script_ok = probe_ok and gen_ok and tmpl_ok and lost_ok and div_ok
     except Exception as e:
         script_ok = False
         print("  SCRIPT raised %s: %s  FAIL" % (type(e).__name__, e))
@@ -1186,8 +1206,77 @@ def _run_suite(require_refs, tmp, skipped_real):
                    and trustworthy(edge))
         print("  FIND  looping row warned at run time and gated by one threshold  %s"
               % ("OK" if (warn_ok and gate_ok) else "FAIL"))
+
+        # Copying the prompt back is the second degenerate mode, and it is the
+        # one distinct_ratio cannot see: a verbatim copy's 8-word windows are
+        # all distinct, so it reads a clean 1.00 - healthy - while inflating
+        # speculative acceptance exactly as much as looping does. The copy gate
+        # must mark the row at run time and refuse it, at one shared threshold.
+        from .bench import (COPY_RATIO, verify_config,
+                            _copyback_ratio, _distinct_ratio)
+        copied = row(2.9, {"spec": "draft-mtp", "spec_n_max": 2},
+                     distinct_ratio=1.0, copyback_ratio=0.96, accept_rate=1.0)
+        ct = _fmt_row(copied["config"], copied)
+        copy_ok = ("COPYING" in ct and "96%" in ct and "not the drafter" in ct
+                   and not trustworthy(copied) and "LOOPING" not in ct)
+        # a copy is one mode and a loop is the other; the note names what happened
+        plainc = row(2.9, distinct_ratio=1.0, copyback_ratio=0.9)
+        pt2 = _fmt_row(plainc["config"], plainc)
+        copy_ok = copy_ok and ("COPYING" in pt2 and "drafter" not in pt2
+                               and not trustworthy(plainc))
+        # a row that loops on the prompt's own text is BOTH modes - still marked,
+        # still refused, named as the copy it is
+        both = row(2.9, distinct_ratio=0.1, copyback_ratio=0.9)
+        bt = _fmt_row(both["config"], both)
+        copy_ok = copy_ok and ("COPYING" in bt and "excluded" in bt
+                               and not trustworthy(both))
+        # exactly at the line passes, like the looping edge above
+        edgec = row(2.9, distinct_ratio=1.0, copyback_ratio=COPY_RATIO)
+        copy_ok = copy_ok and trustworthy(edgec)
+        # the metric itself: verbatim windows hit, original prose misses, and a
+        # copy is exactly the case distinct_ratio calls healthy
+        prompt = ("alpha beta gamma delta epsilon zeta eta theta iota kappa "
+                  "lambda mu nu xi omicron pi rho sigma tau upsilon chi psi omega")
+        verbatim = ("alpha beta gamma delta epsilon zeta eta theta iota kappa "
+                    "lambda mu nu")
+        fresh = "completely different words that have no relation to the corpus"
+        metric_ok = (_copyback_ratio(verbatim, prompt) == 1.0
+                     and _copyback_ratio(fresh, prompt) == 0.0
+                     and _distinct_ratio(verbatim) == 1.0
+                     and _copyback_ratio("a b c", prompt) is None)
+        print("  FIND  copying detected, marked, and gated (distinct_ratio misses it)  %s"
+              % ("OK" if (copy_ok and metric_ok) else "FAIL"))
+
+        # The frozen corpus is an experiment condition. Two rows measured
+        # against different corpora - or one recorded before the corpus was
+        # frozen at all - are different experiments and must never meet in a
+        # baseline or an effect size.
+        pid_a, pid_b = "a" * 40, "b" * 40
+        id_ok = (not comparable(row(9.0, prompt_id=pid_a), "M.gguf", B, 128, 3,
+                                prompt_id=pid_b)
+                 and comparable(row(9.0, prompt_id=pid_a), "M.gguf", B, 128, 3,
+                                prompt_id=pid_a)
+                 # a row recorded before the freeze has no id: it is its own
+                 # experiment, not the campaign's
+                 and not comparable(row(9.0), "M.gguf", B, 128, 3, prompt_id=pid_a)
+                 # ...and ids also split effect sizes, never merging the corpora
+                 and sorted(v["value"] for v in [e for e in axis_effects(
+                     [row(5.0, {"ub": 512}, prompt_id=pid_a),
+                      row(6.0, {"ub": 1024}, prompt_id=pid_a),
+                      row(99.0, {"ub": 2048})])["effects"]
+                     if e["axis"] == "ub"][0]["values"]) == [512, 1024])
+        # --speed-verify composes the winner's knobs with the production
+        # config, so the row actually loaded is the config actually launched.
+        vc = verify_config({"ngl": 28, "ctx": 131072, "stage": "A", "fill": 100000},
+                           {"spec": ["draft-mtp"], "spec_n_max": [2], "temp": [1.0]})
+        vc_ok = (vc == {"ngl": 28, "ctx": 131072, "fill": 100000,
+                        "spec": "draft-mtp", "spec_n_max": 2, "temp": 1.0}
+                 and "stage" not in vc)
+        print("  FIND  prompt_id splits experiments, verify composes winner+production  %s"
+              % ("OK" if (id_ok and vc_ok) else "FAIL"))
         find_ok = (chain_ok and split_ok and alone_ok and clean_ok and par_ok
-                   and dep_ok and warn_ok and gate_ok)
+                   and dep_ok and warn_ok and gate_ok
+                   and copy_ok and metric_ok and id_ok and vc_ok)
     except Exception as e:
         find_ok = False
         print("  CHAIN/FIND raised %s: %s  FAIL" % (type(e).__name__, e))

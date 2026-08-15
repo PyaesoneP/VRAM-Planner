@@ -168,6 +168,26 @@ as a plan — the guess being exactly the frozen one this mode exists to escape.
 *counts* are still exact (a ladder's length does not depend on where it is centred), so the
 hour estimate is not a guess.
 
+## 3.2 The verify row: measure what you will launch
+
+The sweep's winner is one point on a ladder, and its knobs are rarely what you actually
+run — production usually adds MTP draft depth, different ubatch, a sampler. Those change
+the allocation the sweep never saw (MTP's draft cache alone moved the OOM wall one `ngl`
+rung in on one model). `--speed-verify` closes that: after the sweep finishes it loads the
+winner **plus** the config you pass with `--speed-verify-overrides` (same
+`k=v` grammar as `--speed-axes`) and records one more row, under the same `prompt_id`.
+
+```
+python -m vram_planner --speed-sweep --models MODEL \
+    --speed-verify --speed-verify-overrides "spec=draft-mtp spec_n_max=2"
+```
+
+It is a second opinion on the winner, not a replacement for it: the verify row lands in
+the same table and the report flags it. If it is untrustworthy — OOM at the winner's
+`ngl`, or the model loops/copies at that depth — the winner stays, but the log says what
+you will actually get when you press the launch button, which is the number that
+matters. Budget ~2 minutes (one load) per campaign.
+
 ---
 
 ## 4. Freezing settings vs chasing speed
@@ -249,6 +269,9 @@ If that prints `0`, only the `ngram-*` variants apply, and they are worth far le
 | `--sweep-timeout SECONDS` | per-load timeout (raise it for deep fills) |
 | `--speed-chain` | build each stage from the fastest row so far (§3.1) |
 | `--speed-rounds N` | with `--speed-chain`: re-run the stages from the winner |
+| `--speed-verify` | re-run the winner plus the production config (§3.2) |
+| `--speed-verify-overrides "k=v,v …"` | extra knobs for the verify row, same grammar as `--speed-axes` |
+| `--refresh-corpus` | regenerate `_corpus.txt` from the current sources (commit it, §7) |
 | `--speed-report` | every recorded row, fastest first |
 | `--speed-report --insights` | what the campaigns *found* rather than the ranking (§8.1) |
 
@@ -316,19 +339,45 @@ flatter speculation and must not be believed.
 
 Healthy prose is near 1.0. Well below that, discard the speculative comparison.
 
+### Check `copyback_ratio` on deep fills
+
+`distinct_ratio` catches looping, and only looping. The second way a model stops
+working looks identical to a healthy row: at deep fill it stops generating and copies its
+context back verbatim, whose windows are all distinct — a clean **1.00** with acceptance
+duly at **100%**. The row is flagged `copyback_ratio` (fraction of the output's 8-word
+windows that appear in the prompt); above **0.5** it is excluded and marked `COPYING` at
+run time. Two symptoms, one meaning: the model is not doing the work, and whatever
+acceptance rate the row reports is the loop or the copy, not the drafter.
+
+The distinction matters because the two gates are complements: a loop repeats a few
+windows, a copy produces nothing but distinct ones. Rows recorded before the gate
+existed carry no `copyback_ratio`; the campaigns report how many of their rows are
+pre-gate, and their deep-fill numbers are not usable for tuning.
+
 ### Acceptance rate is conditional on having drafted
 
 A drafter that fires rarely and is always right reports 100% acceptance and buys almost
 nothing. One `ngram-mod` row showed 100% acceptance while drafting **15 of 128 tokens** —
 a 7% gain. Read `draft_n` next to `accept_rate`, never the rate alone.
 
-### Long fills repeat the filler
+### Long fills repeat the filler — and the corpus is frozen
 
 The filler prompt is this repository's own README and sources — real prose and code,
 because a prompt built by repeating one paragraph hands n-gram speculation a result it
 could never reproduce on real work. Past the length of that corpus (~98k tokens) it must
 start repeating, and the row is flagged `corpus_repeated`. A repeat is trivially
 predictable, so speculative rows above that length are optimistic.
+
+**The corpus is frozen.** Every campaign records a `prompt_id` — the SHA-256 of the
+frozen corpus plus the instruction — and rows only resume under their own id. Editing the
+sources changes the filler, which silently invalidated every deep fill ever measured
+(one edit moved 65,870 → 66,085 tokens at the same fill). Now a campaign that cannot
+reproduce its own corpus is a different experiment and refuses to meet old rows. The
+copy lives at `vram_planner/_corpus.txt`; regenerate it with
+`python -m vram_planner --refresh-corpus` (it prints the before/after id — commit the
+file whenever it changes) and expect to re-measure the campaign's deep fills once.
+Rows recorded before the id existed carry none; those are pre-freeze and compare only
+with each other.
 
 ---
 
@@ -515,6 +564,24 @@ made-up default is worse than none, because llama.cpp's own (temp 0.80, top-k 40
 min-p 0.05) are not what every model card asks for. Whatever you do set becomes a
 *server* default: any client that sends its own values — Open WebUI, aider, most chat
 UIs — overrides them per request.
+
+**"Based on" does not mean "equal to".** When you launch from a measured row, the script
+states the row's tok/s and evidence — but the config you actually launched is what you
+have in the form, and the two can differ (the form's `spec` is set to `draft-mtp`, the
+row was measured with `none`; the row's `ngl` was safe *without* MTP's draft cache). The
+script says so out loud:
+
+```
+# based on M.gguf 9.45 tok/s @ ngl 28 ctx 131072 q8_0 (stage D, 2026-08-10)
+# !! this config DIFFERS from the measured row: spec none->draft-mtp
+```
+
+Everything under it is still generated — these are the knobs the sweep proved, and you
+are running them with production changes on top. But the stated tok/s belongs to the row
+as measured, so the mismatch is printed, not hidden. Evidence knobs (`ctx`, `kv`, `ngl`,
+`ncmoe`, `mmproj_offload`, fill depth) and samplers (`temp`, `top_k`, `top_p`, `min_p`,
+`rep_pen`, `pres_pen`) each warn under their own group of names; every *other* setting —
+host, port, template — is yours and never compared.
 
 ### Chat template
 

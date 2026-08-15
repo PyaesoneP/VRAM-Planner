@@ -1050,6 +1050,19 @@ function sweepForm(pf){
           combinations cost time.</p>
       </div>
     </div>
+    <div class="field">
+      <label class="check"><input type="checkbox" id="swverify"> Verify the winner with
+        the production config</label>
+      <p class="hint">One extra load after the sweep: the winning config plus the knobs
+        below, e.g. <span class="mono">spec=draft-mtp spec_n_max=2</span>. The row that
+        wins is often not the row you run &mdash; MTP&rsquo;s draft cache alone moved the
+        OOM wall one <span class="mono">ngl</span> rung on one model &mdash; so this
+        measures what you would actually launch, and says if it is trustworthy.</p>
+      <div class="field" id="swverifyfield" style="max-width:28em">
+        <label for="swverifyoverrides">Overrides (same grammar as axes)</label>
+        <input type="text" id="swverifyoverrides" placeholder="spec=draft-mtp spec_n_max=2">
+      </div>
+    </div>
     <div class="actions">
       <button class="ghost" type="button" data-action="sweep-plan">Preview grid</button>
       <button class="go" type="button" style="width:auto" data-action="sweep-start">&#9654; Start measuring</button>
@@ -1071,10 +1084,13 @@ function sweepStages(){
 function sweepBody(){
   const v = id => { const el = $(id); return el && el.value !== "" ? parseInt(el.value) : null; };
   const chain = $("swchain") ? $("swchain").checked : true;
+  const verify = $("swverify") ? $("swverify").checked : false;
   return { path: SWEEP.path, stages: sweepStages(), context: parseInt($("ctx").value),
            kv_type: $("kv").value, fill: v("swfill"), n_predict: v("swpred"),
            repeat: v("swrep"), limit: v("swlimit"),
-           chain: chain, rounds: chain ? (v("swrounds") || 1) : 1 };
+           chain: chain, rounds: chain ? (v("swrounds") || 1) : 1,
+           verify: verify,
+           verify_overrides: verify ? ($("swverifyoverrides").value.trim() || null) : null };
 }
 
 async function sweepPlan(){
@@ -1199,6 +1215,11 @@ function rowFlags(r){
   if(r.distinct_ratio != null && r.distinct_ratio < 0.5)
     f.push(["looping", "Only " + Math.round(100 * r.distinct_ratio) + "% of 8-word windows " +
       "were distinct - the model was repeating itself, so this speed is not real work."]);
+  if(r.copyback_ratio != null && r.copyback_ratio > 0.5)
+    f.push(["copying", Math.round(100 * r.copyback_ratio) + "% of the output was a verbatim " +
+      "copy of the prompt - the model stopped generating and echoed its context back, which " +
+      "distinct_ratio cannot see and which inflates speculative acceptance exactly like " +
+      "looping. Not real work."]);
   return f;
 }
 
@@ -1488,7 +1509,8 @@ function campaignRow(g){
       <span class="mono">${g.model}</span>
       <span class="muted small">${g.gpu || "?"} &middot; ${g.backend} &middot; ${span}</span>
       <span class="campnum">${g.n_ok}/${g.n_rows} ok${raw(
-        g.n_untrusted ? " &middot; " + g.n_untrusted + " flagged" : "")}</span>
+        g.n_untrusted ? " &middot; " + g.n_untrusted + " flagged" : "")}${raw(
+        g.n_ungated ? " &middot; " + g.n_ungated + " pre-copy-gate" : "")}</span>
       <span class="campbest">${g.best_tok_s ? g.best_tok_s.toFixed(2) + " tok/s" : "—"}</span>
       <span class="campcaret">${open ? "▾" : "▸"}</span>
     </button>
@@ -1534,7 +1556,8 @@ function axisPanel(ax){
       context, KV quant, fill depth or pass count are different experiments and never meet in
       one comparison &mdash; putting them together would manufacture an effect out of the
       difference between the runs.${raw(ax.n_excluded ? h` ${ax.n_excluded} row(s) are excluded
-      from every number here: they spilled into shared memory, or caught the model looping.` : "")}</p>
+      from every number here: they spilled into shared memory, looped, or copied the prompt
+      back verbatim.` : "")}</p>
     <div class="tablewrap"><table class="axtable"><tbody>${raw(body)}</tbody></table></div>`;
 }
 

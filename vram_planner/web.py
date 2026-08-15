@@ -97,6 +97,7 @@ class Handler(BaseHTTPRequestHandler):
         ctx and kv come straight off the main form, because the settings you are
         planning for are the ones worth measuring - they are --speed-ctx and
         --speed-kv, which freeze those axes instead of sweeping them."""
+        from .sweep import parse_overrides
         def as_int(k, default=None):
             v = data.get(k)
             return int(v) if v not in (None, "", False) else default
@@ -112,6 +113,10 @@ class Handler(BaseHTTPRequestHandler):
             # each knob at the split that won rather than at the planner's guess.
             "chain": bool(data.get("chain", True)),
             "rounds": max(1, as_int("rounds", 1) or 1),
+            # verify is opt-in from the browser, like --speed-verify on the CLI
+            "verify": bool(data.get("verify")),
+            "verify_overrides": (parse_overrides(data.get("verify_overrides").split())
+                                 if data.get("verify_overrides") else None),
         }
 
     def _speed_start(self, data):

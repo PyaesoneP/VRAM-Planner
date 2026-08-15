@@ -22,7 +22,7 @@ filter. compute.py has no term for a draft cache, so those megabytes would be
 absorbed into `floor` and `ctx` and quietly corrupt every future plan. Same
 format, same resume discipline, different tree.
 """
-import datetime, json, os, re, statistics, time, urllib.error, urllib.request
+import datetime, hashlib, json, os, re, statistics, time, urllib.error, urllib.request
 from .gpu import get_gpu_processes, gpu_list
 from .lmstudio import default_models_dir
 from .paths import _data_dir
@@ -68,9 +68,20 @@ def n_tokens(url, text, timeout=120):
     return len(_post(url, "/tokenize", {"content": text}, timeout).get("tokens") or [])
 
 
-# The filler corpus is this repository: real prose and real Python, deterministic,
-# always on disk next to the code that reads it, and representative of the mixed
-# doc-and-source workload a coding daily-driver actually sees.
+# The filler corpus is a FROZEN snapshot of this repository: real prose and real
+# Python, deterministic, always on disk next to the code that reads it, and
+# representative of the mixed doc-and-source workload a coding daily-driver
+# actually sees.
+#
+# It is a snapshot, not a live read, and that is the point. The corpus used to
+# be re-read from the working tree, so a campaign spanning an edit - and the
+# harness and the files it reads live in the same repository, so edits happen -
+# quietly measured a different prompt before and after, with nothing on the row
+# to say so. Benchmarks need frozen inputs: the corpus only changes when
+# --refresh-corpus deliberately rebuilds it, which is a committed, visible
+# event. Rows carry prompt_identity(), the hash of exactly the bytes a prompt
+# is built from, so even a deliberate refresh can never be mistaken for the
+# campaign it replaced.
 #
 # This matters more than it looks. N-gram speculation predicts from repetition in
 # the text, so a prompt built by repeating one paragraph would hand ngram-* a
@@ -78,20 +89,13 @@ def n_tokens(url, text, timeout=120):
 # would deny it one it genuinely deserves. Neither is a measurement. Real files
 # are the only honest filler.
 _CORPUS = None
+_CORPUS_ID = None
+
+_CORPUS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_corpus.txt")
 
 
-def corpus_text(refresh=False):
-    """Read once per process, then cached.
-
-    The caching is not an optimisation, it is a correctness requirement. A
-    campaign spans hours and re-reads this between configs; if the working tree
-    is edited in the meantime - and it will be, since the harness and the files
-    it reads live in the same repository - then later configs get a different
-    prompt from earlier ones and the comparison quietly stops being one. Snapshot
-    at the start, use the same bytes for every row."""
-    global _CORPUS
-    if _CORPUS is not None and not refresh:
-        return _CORPUS
+def _live_corpus_text():
+    """README and this package's sources, joined exactly as the corpus always was."""
     here = os.path.dirname(os.path.abspath(__file__))
     parts = []
     readme = os.path.join(os.path.dirname(here), "README.md")
@@ -101,12 +105,63 @@ def corpus_text(refresh=False):
         if fn.endswith(".py"):
             parts.append(open(os.path.join(here, fn), encoding="utf-8",
                               errors="replace").read())
-    _CORPUS = "\n\n".join(parts)
+    return "\n\n".join(parts)
+
+
+def refresh_corpus():
+    """Rewrite the frozen corpus snapshot from the live sources.
+
+    The one way the corpus changes. Deliberate, committed, and visible in the
+    row store: the new bytes hash differently, so every row recorded against
+    the old snapshot stops being comparable to new ones and a resumed campaign
+    re-measures instead of reusing them."""
+    global _CORPUS, _CORPUS_ID
+    text = _live_corpus_text()
+    with open(_CORPUS_PATH, "w", encoding="utf-8", newline="\n") as fh:
+        fh.write(text)
+    _CORPUS = text
+    _CORPUS_ID = None
+    return _CORPUS_PATH
+
+
+def corpus_text(refresh=False):
+    """The frozen snapshot, read once per process, then cached.
+
+    The caching is not an optimisation, it is a correctness requirement. A
+    campaign spans hours and must use the same bytes for every row. If the
+    snapshot is missing - a fresh clone, or a package that never ran
+    --refresh-corpus - it is rebuilt from the live sources on the spot, so
+    nothing silently runs on an empty prompt."""
+    global _CORPUS
+    if _CORPUS is not None and not refresh:
+        return _CORPUS
+    if os.path.isfile(_CORPUS_PATH):
+        with open(_CORPUS_PATH, encoding="utf-8", errors="replace") as fh:
+            _CORPUS = fh.read()
+    else:
+        _CORPUS = _live_corpus_text()
     return _CORPUS
 
 
 INSTRUCTION = ("\n\nSummarise, in detail, what the code and documentation above "
                "do and how the pieces fit together.\n")
+
+
+def prompt_identity():
+    """The hash of exactly the bytes a prompt is built from: corpus + INSTRUCTION.
+
+    Two rows with the same prompt_id and the same fill were measured against
+    byte-identical prompts, whatever the working tree said when each was
+    measured - which is what makes deep-fill numbers comparable across sessions
+    at all. Rows without the field predate the freeze and are their own
+    experiment; they group separately and are never resumed as already done."""
+    global _CORPUS_ID
+    if _CORPUS_ID is None:
+        h = hashlib.sha256()
+        h.update(corpus_text().encode("utf-8"))
+        h.update(INSTRUCTION.encode("utf-8"))
+        _CORPUS_ID = h.hexdigest()
+    return _CORPUS_ID
 
 
 def build_prompt(url, fill_tokens, timeout=120):
@@ -203,7 +258,8 @@ def generate(url, prompt, n_predict=N_PREDICT, timeout=1800, cache_prompt=False,
             "tokens_predicted": d.get("tokens_predicted"),
             "tokens_evaluated": d.get("tokens_evaluated"),
             "sample": txt[:600],
-            "distinct_ratio": _distinct_ratio(txt)}
+            "distinct_ratio": _distinct_ratio(txt),
+            "copyback_ratio": _copyback_ratio(txt, prompt)}
 
 
 def _distinct_ratio(text, n=8):
@@ -214,6 +270,24 @@ def _distinct_ratio(text, n=8):
         return None
     grams = [" ".join(w[i:i + n]) for i in range(len(w) - n + 1)]
     return round(len(set(grams)) / len(grams), 3)
+
+
+def _copyback_ratio(text, prompt, n=8):
+    """Fraction of n-word windows in the output that appear verbatim in the prompt.
+
+    Near 0.0 is a model doing its own work. Near 1.0 the model stopped
+    generating and is copying its context back at you - which distinct_ratio
+    cannot see, because a copy's windows are all distinct and it reads a clean
+    1.00. Copying inflates speculative acceptance exactly as much as looping
+    does: a drafter that predicts the next prompt word is trivially accepted by
+    a target that then samples the same prompt word. Two symptoms, one meaning."""
+    w = text.split()
+    pw = prompt.split()
+    if len(w) < n + 1 or len(pw) < n + 1:
+        return None
+    pgrams = set(zip(*(pw[i:] for i in range(n))))
+    hits = sum(1 for g in zip(*(w[i:] for i in range(n))) if g in pgrams)
+    return round(hits / (len(w) - n + 1), 3)
 
 
 # ---------------------------------------------------------------------------
@@ -250,6 +324,11 @@ def bench_one(backend, model_path, c, port=BENCH_PORT, timeout=420.0,
                 prompt, repeated = build_prompt(srv.url, c.get("fill") or 0)
                 row["prompt_tokens"] = n_tokens(srv.url, prompt)
                 row["corpus_repeated"] = bool(repeated)
+                # Which frozen corpus this row measured against. Everything a
+                # deep-fill number means lives or dies on this: two rows from
+                # different corpora are different experiments, and resume and
+                # every comparison below treat them that way.
+                row["prompt_id"] = prompt_identity()
                 samp = sampling_of(c)
                 row["sampling"] = samp
                 cold = generate(srv.url, prompt, min(16, n_predict), gen_timeout,
@@ -269,6 +348,9 @@ def bench_one(backend, model_path, c, port=BENCH_PORT, timeout=420.0,
                 dr = [r.get("distinct_ratio") for r in runs
                       if r.get("distinct_ratio") is not None]
                 row["distinct_ratio"] = round(min(dr), 3) if dr else None
+                cb = [r.get("copyback_ratio") for r in runs
+                      if r.get("copyback_ratio") is not None]
+                row["copyback_ratio"] = round(min(cb), 3) if cb else None
                 # Acceptance is the number that explains a speculative result.
                 # Absent on non-speculative runs, and absent on builds that do
                 # not report it - both are fine, and both are visible as None
@@ -557,6 +639,13 @@ CARRY_KEYS = ("ngl", "ncmoe", "ub", "mmproj_offload", "spec", "spec_n_max")
 # dropped without ever having been flagged - would be worse than either alone.
 LOOP_RATIO = 0.5
 
+# Above this fraction of 8-word windows that also appear in the prompt, the
+# output is a verbatim copy of the context - the second way a model can look
+# healthy while generating nothing new. distinct_ratio stays near 1.0 for a
+# copy, so the two gates are complements, and they share the marker-and-gate
+# rule above for the same reason.
+COPY_RATIO = 0.5
+
 
 def trustworthy(r):
     """May a conclusion be drawn from this row?
@@ -564,21 +653,34 @@ def trustworthy(r):
     A spilled row loaded and reported `ok`: WDDM put part of it in shared system
     memory instead of failing, so its speed is off a cliff for a reason that has
     nothing to do with the setting under test. A looping row generated the same
-    eight-word window over and over, which is not work.
+    eight-word window over and over. A copying row stopped generating and is
+    echoing its context back - distinct_ratio cannot see it (a copy's windows
+    are all distinct), but it inflates speculative acceptance exactly as much
+    as looping does.
 
-    Both still belong in the TABLE - they are evidence about where the wall is -
-    but neither may be the thing a baseline or an effect size is computed from.
-    Carrying a spilled row forward as a chained baseline would bend every stage
-    after it in the same direction, silently."""
+    All three still belong in the TABLE - they are evidence about where the
+    wall is - but none may be the thing a baseline or an effect size is
+    computed from. Carrying a spilled row forward as a chained baseline would
+    bend every stage after it in the same direction, silently.
+
+    A row recorded before the copy gate existed has no copyback_ratio and is
+    judged on the gates it does carry - history is not rewritten, it is just
+    labelled (see sweep_index's n_ungated)."""
     if r.get("status") != "ok" or not r.get("tok_s"):
         return False
     if r.get("spilled"):
         return False
     dr = r.get("distinct_ratio")
-    return not (dr is not None and dr < LOOP_RATIO)
+    if dr is not None and dr < LOOP_RATIO:
+        return False
+    cb = r.get("copyback_ratio")
+    # Strict, mirroring LOOP_RATIO's: a row exactly at the line is not (yet) a copy.
+    if cb is not None and cb > COPY_RATIO:
+        return False
+    return True
 
 
-def comparable(r, model, base, n_predict=None, repeat=None):
+def comparable(r, model, base, n_predict=None, repeat=None, prompt_id=None):
     """Was this row measured under the same conditions as the campaign?
 
     Speed is conditional on all of these, so a row taken at another depth or with
@@ -587,12 +689,19 @@ def comparable(r, model, base, n_predict=None, repeat=None):
     A 2k-fill row must never set the baseline for a 32k campaign, and neither
     must a greedy row set it for a campaign sweeping real sampler settings -
     greedy is speculation's best case, so those are two experiments and not two
-    configs."""
+    configs.
+
+    `prompt_id` is the frozen corpus a campaign is measuring against. A row from
+    another corpus - or from before the corpus was frozen at all - is a
+    different experiment for exactly the same reason, so when the campaign
+    passes its own id, the row must carry that same id."""
     if model and r.get("model") != model:
         return False
     if n_predict is not None and r.get("n_predict") != n_predict:
         return False
     if repeat is not None and r.get("repeat") != repeat:
+        return False
+    if prompt_id is not None and r.get("prompt_id") != prompt_id:
         return False
     c = r.get("config") or {}
     if not (c.get("ctx") == base.get("ctx")
@@ -610,14 +719,15 @@ def comparable(r, model, base, n_predict=None, repeat=None):
 
 
 def best_config(rows, model, base, n_predict=None, repeat=None,
-                incumbent_tok_s=None, margin=CHAIN_MARGIN):
+                incumbent_tok_s=None, margin=CHAIN_MARGIN, prompt_id=None):
     """The baseline for the next stage: (config, row) or (None, None).
 
     Reads rows that are already on DISK, not just the ones this process has in
     memory, so a campaign stopped after stage A and restarted tomorrow picks its
     winner back up instead of falling back to the planner's guess."""
     cand = [r for r in rows
-            if trustworthy(r) and comparable(r, model, base, n_predict, repeat)]
+            if trustworthy(r) and comparable(r, model, base, n_predict, repeat,
+                                             prompt_id)]
     if not cand:
         return None, None
     win = max(cand, key=lambda r: r["tok_s"])
@@ -654,6 +764,65 @@ def _carry_summary(c):
     return ("ngl %s ncmoe %s ub %s spec %s"
             % (c.get("ngl"), c.get("ncmoe") or 0, c.get("ub"),
                c.get("spec") or "none"))
+
+
+def verify_config(win_c, overrides=None):
+    """The exact config one verification load measures: the winner plus overrides.
+
+    The winner carries the knobs the search settled on; the overrides carry
+    everything that makes the config you actually run different - the spec, the
+    draft depth, the samplers. Pure, so the campaign and the self-test agree on
+    what gets loaded."""
+    c = dict(win_c or {})
+    c.pop("stage", None)
+    for k, vals in (overrides or {}).items():
+        if vals:
+            c[k] = vals[-1]
+    return c
+
+
+def _verify_step(backend, model_path, facts, name, base, path, pid, gpu,
+                 overrides=None, port=BENCH_PORT, timeout=420.0,
+                 n_predict=N_PREDICT, repeat=N_REPEAT, log=print):
+    """Load the campaign's winner at the PRODUCTION config, exactly once.
+
+    The staged search measures each knob at the config the grid asked for, and
+    the winner is the fastest row that fitted THOSE settings. The config a
+    person actually launches can differ - the MTP draft cache, real samplers, a
+    deeper fill - and a split that fitted one does not necessarily fit the
+    other; a launcher carrying the winner's ngl into a config that OOMs on it
+    is the quiet failure this exists for. One verification load settles it, and
+    the row lands in the same file with the same prompt_id, so the certified
+    answer is recorded data rather than a claim."""
+    win_c, win_r = best_config(load_rows(path), name, base, n_predict=n_predict,
+                               repeat=repeat, prompt_id=pid)
+    if win_c is None:
+        log("verify  : nothing to certify - no trustworthy row at this campaign's settings")
+        return None
+    c = verify_config(win_c, overrides)
+    log("verify  : the winner (%s) does not know the config you actually run -" % _carry_summary(win_c))
+    log("          loading %s%s once"
+        % (_carry_summary(c),
+           "  fill %s" % (c.get("fill") or 0)
+           if c.get("fill") else ""))
+    row = bench_one(backend, model_path, c, port=port, timeout=timeout,
+                    n_predict=n_predict, repeat=repeat, log=log)
+    row.update({"arch": facts["arch"], "n_layers": facts["n_layers"],
+                "when": int(time.time()), "gpu": gpu})
+    with open(path, "a", encoding="utf-8") as fh:
+        fh.write(json.dumps(row) + "\n")
+        fh.flush()
+        os.fsync(fh.fileno())
+    good = row.get("status") == "ok" and trustworthy(row)
+    if good:
+        log("verify  : OK - the winner loads at your production config and is certified")
+    else:
+        log("verify  : FAILED - the winner does not fit your production config (%s%s)"
+            % (row.get("status"), row.get("gen_error") or row.get("error") or ""))
+        log("          the tok/s and VRAM evidence above apply to the config as MEASURED,")
+        log("          not to this one. Lower ngl / draft depth, or drop the projector")
+        log("          offload, before launching.")
+    return {"ok": good, "row": _slim(row), "config": c}
 
 
 # ---------------------------------------------------------------------------
@@ -718,7 +887,7 @@ def speed_sweep(models=None, backend=None, dry_run=False, timeout=420.0,
                 ctx=None, kv=None,
                 n_predict=N_PREDICT, repeat=N_REPEAT, log=print, skip_preflight=False,
                 on_row=None, should_stop=None, on_total=None,
-                chain=False, rounds=1):
+                chain=False, rounds=1, verify=False, verify_overrides=None):
     """Run the speed grid and append one row per config. Resumable like --sweep.
 
     `on_row` is called with each finished row, `on_total` when the number of
@@ -778,6 +947,21 @@ def speed_sweep(models=None, backend=None, dry_run=False, timeout=420.0,
 
     gpu = (gpu_list(fresh=True) or [{}])[0].get("name") or ""
     path = bench_path(gpu, b["build"])
+    # The frozen corpus every row of this campaign measures against. A row
+    # recorded under a different prompt_id - another corpus, or before the
+    # corpus was frozen at all - is a different experiment, and resuming it as
+    # already done would mix two prompts into one campaign with no sign.
+    pid = prompt_identity()
+    # A missing snapshot degrades to "different experiment", not to corruption:
+    # the rebuild hashes differently, so these rows refuse to merge with any
+    # other checkout's. But it must be said out loud - silently re-basing a
+    # campaign's identity on the working tree is the exact failure the freeze
+    # exists to catch.
+    if not os.path.isfile(_CORPUS_PATH):
+        log("corpus  : _corpus.txt is MISSING - rebuilt from this working tree, "
+            "so this campaign is its own experiment and its rows will not merge "
+            "with another clone's. Commit the snapshot (python -m vram_planner "
+            "--refresh-corpus).")
     # Resume must also match how the row was MEASURED, not just what was
     # configured. A row taken at n_predict 32 / repeat 1 - a smoke test - is not
     # the same measurement as one taken at 128 / 3, and silently accepting it as
@@ -785,7 +969,8 @@ def speed_sweep(models=None, backend=None, dry_run=False, timeout=420.0,
     # other row and give no sign it had happened.
     done = {_key(r["model"], r["config"]) for r in load_rows(path)
             if r.get("config") and r.get("status") in ("ok", "oom")
-            and r.get("n_predict") == n_predict and r.get("repeat") == repeat}
+            and r.get("n_predict") == n_predict and r.get("repeat") == repeat
+            and r.get("prompt_id") == pid}
     plan = [c for c in cfgs if _key(os.path.basename(mp), c) not in done]
     skipped = len(cfgs) - len(plan)
     if limit:
@@ -796,6 +981,7 @@ def speed_sweep(models=None, backend=None, dry_run=False, timeout=420.0,
     log("model   : %s  (%d blocks, %s)" % (os.path.basename(mp), facts["n_layers"],
                                            facts["arch"]))
     log("mmproj  : %s" % (os.path.basename(mmproj) if mmproj else "none"))
+    log("prompt  : %s (frozen corpus; rows are keyed on it, so a refresh re-measures)" % pid[:12])
     log("output  : %s" % path)
     log("configs : %d to run, %d already recorded" % (len(plan), skipped))
     log("estimate: ~%.1f h  (load + %d warm + %d x %d tokens per config)"
@@ -835,6 +1021,13 @@ def speed_sweep(models=None, backend=None, dry_run=False, timeout=420.0,
         if chain and len(shown) < len(plan):
             log("  .. and %d more in later stages, built from what the ones above find"
                 % (len(plan) - len(shown)))
+        if verify:
+            log("verify  : after the campaign, the winner is loaded once more at the")
+            extra = (" (" + " ".join("%s=%s" % (k, ",".join(map(str, v)))
+                                     for k, v in sorted(verify_overrides.items()))
+                     + ")") if verify_overrides else ""
+            log("          production config%s - a split that fits the grid is not"
+                " automatically one that fits what you actually run" % extra)
         # The config list rides along so the UI can show the same preview the CLI
         # prints, rather than parsing the lines above back out of a log.
         return {"planned": len(plan), "path": path, "dry_run": True,
@@ -845,6 +1038,7 @@ def speed_sweep(models=None, backend=None, dry_run=False, timeout=420.0,
                 "chained": bool(chain), "rounds": int(rounds or 1),
                 "provisional": bool(chain) and len(shown) < len(plan),
                 "stage_sizes": sizes,
+                "verify": bool(verify),
                 "estimate_h": round(len(plan) * (60.0 + repeat * n_predict / 4.0)
                                     / 3600.0, 2)}
     if not skip_preflight and not preflight(log=log):
@@ -931,7 +1125,7 @@ def speed_sweep(models=None, backend=None, dry_run=False, timeout=420.0,
                     # the ones that say where the previous stage got to.
                     nxt, win = best_config(load_rows(path), name, base,
                                            n_predict=n_predict, repeat=repeat,
-                                           incumbent_tok_s=best_tok)
+                                           incumbent_tok_s=best_tok, prompt_id=pid)
                     if nxt is None:
                         log("  baseline unchanged: nothing beat %s by more than %.0f%%"
                             % ("%.2f tok/s" % best_tok if best_tok
@@ -945,8 +1139,16 @@ def speed_sweep(models=None, backend=None, dry_run=False, timeout=420.0,
                     break
     log("")
     log("%d rows -> %s" % (len(out), path))
+    verified = None
+    if verify and not dry_run and not stopped:
+        # Cancellation lands between configs: the verify step is a config load,
+        # and a campaign the user stopped mid-way must not start loading again.
+        verified = _verify_step(b, mp, facts, name, base, path, pid, gpu,
+                                overrides=verify_overrides, port=port,
+                                timeout=timeout, n_predict=n_predict,
+                                repeat=repeat, log=log)
     return {"rows": out, "path": path, "stopped": stopped, "planned": total[0],
-            "chained": bool(chain)}
+            "chained": bool(chain), "verified": verified}
 
 
 def _fmt_row(c, row, i=None, n=None):
@@ -968,33 +1170,43 @@ def _fmt_row(c, row, i=None, n=None):
         + ("  [filler repeats - speculative rate inflated]"
            if row.get("corpus_repeated") and row["config"].get("spec") not in (None, "none")
            else "")
-        + _looping_note(row))
+        + _degenerate_note(row))
 
 
-def _looping_note(row):
+def _degenerate_note(row):
     """The warning for a row that measured a model talking to itself.
 
-    distinct_ratio is already recorded and already gates trustworthy(), so a
-    looping row is silently dropped from every conclusion later. Printing the
-    number at run time is what makes that visible while the campaign is still
-    worth stopping - a whole grid can otherwise complete, look ordinary, and
-    contribute nothing.
+    distinct_ratio and copyback_ratio are already recorded and already gate
+    trustworthy(), so a degenerate row is silently dropped from every conclusion
+    later. Printing the numbers at run time is what makes that visible while the
+    campaign is still worth stopping - a whole grid can otherwise complete, look
+    ordinary, and contribute nothing.
 
-    The speculative case gets its own sentence because the two symptoms point
-    opposite ways to a reader: an acceptance rate near 100% looks like the
-    draft model excelling, when repeated output is exactly what makes any
-    draft trivially correct. High acceptance ON looping text is evidence of
+    The two symptoms point opposite ways on the distinct_ratio scale: a loop
+    repeats a few windows, while a copy of the context produces nothing but
+    distinct ones - which is exactly why the copy went unread until the second
+    gate existed. The speculative case gets its own sentence in both because the
+    symptom misreads the same way: an acceptance rate near 100% looks like the
+    draft model excelling, when repeated output is precisely what makes any
+    draft trivially correct. High acceptance ON degenerate text is evidence of
     the degeneration, not of speculation working."""
     dr = row.get("distinct_ratio")
-    if dr is None or dr >= LOOP_RATIO:
-        return ""
+    cb = row.get("copyback_ratio")
     spec = (row.get("config") or {}).get("spec") not in (None, "none")
+    loop = dr is not None and dr < LOOP_RATIO
+    copy = cb is not None and cb > COPY_RATIO
+    if not (loop or copy):
+        return ""
+    if copy:
+        what = "COPYING - %.0f%% of the output is a verbatim copy of the prompt, so" \
+               % (100 * cb)
+    else:
+        what = "LOOPING - output is %.0f%% repetition, so" % (100 * (1 - dr))
     if spec and (row.get("accept_rate") or 0) >= 0.95:
-        return ("  LOOPING - output is %.0f%% repetition, so the %.0f%% acceptance "
-                "is the loop, not the drafter; excluded from conclusions"
-                % (100 * (1 - dr), 100 * row["accept_rate"]))
-    return ("  LOOPING - output is %.0f%% repetition; excluded from conclusions"
-            % (100 * (1 - dr)))
+        return ("  %s the %.0f%% acceptance is the %s, not the drafter; "
+                "excluded from conclusions"
+                % (what, 100 * row["accept_rate"], "copy" if copy else "loop"))
+    return "  %s excluded from conclusions" % what
 
 
 # ---------------------------------------------------------------------------
@@ -1092,7 +1304,7 @@ def _control(r, owned=()):
     c = r.get("config") or {}
     ctl = [("model", r.get("model")), ("gpu", r.get("gpu")),
            ("file", r.get("_file")), ("n_predict", r.get("n_predict")),
-           ("repeat", r.get("repeat"))]
+           ("repeat", r.get("repeat")), ("prompt_id", r.get("prompt_id"))]
     for k in _CONFIG_KEYS:
         if k in owned:
             continue
@@ -1118,7 +1330,9 @@ def _slim(r):
             "proc_vram_mib": r.get("proc_vram_mib"),
             "accept_rate": r.get("accept_rate"), "draft_n": r.get("draft_n"),
             "spilled": r.get("spilled"), "corpus_repeated": r.get("corpus_repeated"),
-            "distinct_ratio": r.get("distinct_ratio"), "when": r.get("when"),
+            "distinct_ratio": r.get("distinct_ratio"),
+            "copyback_ratio": r.get("copyback_ratio"),
+            "prompt_id": r.get("prompt_id"), "when": r.get("when"),
             "n_predict": r.get("n_predict"), "repeat": r.get("repeat"),
             "status": r.get("status")}
 
@@ -1147,6 +1361,13 @@ def sweep_index(rows):
             "n_failed": sum(1 for r in rs if r.get("status") != "ok"),
             "n_untrusted": sum(1 for r in rs
                                if r.get("status") == "ok" and not trustworthy(r)),
+            # Rows recorded before the copy-back gate existed: they carry no
+            # copyback_ratio, so a verbatim-copying model could not be detected
+            # in them. The campaign is real; it is just not fully gated.
+            "n_ungated": sum(1 for r in rs if r.get("status") == "ok"
+                             and r.get("copyback_ratio") is None),
+            "prompt_id": next((r.get("prompt_id") for r in rs
+                               if r.get("prompt_id")), None),
             "first": min(when) if when else None,
             "last": max(when) if when else None,
             "fills": fills, "stages": stages,
@@ -1305,6 +1526,11 @@ def report_insights(path=None, log=print):
             % (g["model"][:34], (g["gpu"] or "?")[:24], g["backend"][-8:],
                g["n_rows"], g["n_ok"],
                ("%.2f tok/s" % g["best_tok_s"]) if g["best_tok_s"] else "-", span))
+    ung = [g for g in sweep_index(rows) if g["n_ungated"]]
+    if ung:
+        log("  %d campaign(s) were recorded before the copy-back gate: their rows carry")
+        log("  no copyback_ratio, so a model copying its context back could not be")
+        log("  detected in them. Deep-fill numbers there are not usable for tuning.")
 
     ax = axis_effects(rows)
     log("")
@@ -1312,7 +1538,8 @@ def report_insights(path=None, log=print):
     log("model, GPU, backend, context, KV quant, depth or pass count never meet)")
     if ax["n_excluded"]:
         log("  %d row%s excluded from every conclusion below - spilled into shared "
-            "memory, or looping" % (ax["n_excluded"], "" if ax["n_excluded"] == 1 else "s"))
+            "memory, looping, or copying the prompt back"
+            % (ax["n_excluded"], "" if ax["n_excluded"] == 1 else "s"))
     for e in ax["effects"]:
         if e.get("single"):
             log("  %-20s only one value ever tried (%s) - nothing to compare"
@@ -1379,8 +1606,9 @@ def report(path=None, log=print):
                r.get("proc_vram_mib") or 0.0,
                ("%.0f%%" % (100 * r["accept_rate"])) if r.get("accept_rate") else "-",
                # Ranked fastest-first, and a looping row can WIN that ranking:
-               # repetition is cheap to generate. Marked here for the same reason
-               # SPILLED is - the row is real evidence, it just is not evidence
-               # about the setting in its own columns.
-               ("  SPILLED" if r.get("spilled") else "") + _looping_note(r)))
+               # repetition is cheap to generate, and so is copying the prompt
+               # back. Marked here for the same reason SPILLED is - the row is
+               # real evidence, it just is not evidence about the setting in its
+               # own columns.
+               ("  SPILLED" if r.get("spilled") else "") + _degenerate_note(r)))
     return True

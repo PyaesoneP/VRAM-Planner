@@ -129,10 +129,21 @@ class Handler(BaseHTTPRequestHandler):
         if not kw["models"]:
             return {"ok": False, "error": "No such model file: %s" % (data.get("path") or "")}
 
+        def add_row(row):
+            # Keep only what the table renders. A full row carries every measured
+            # pass, a ~600-char text sample and the parsed load log, and the whole
+            # list of them is re-shipped on every 1.5s poll - so a long campaign
+            # pays for its own history over and over. Slimming at the producer
+            # keeps job.py free of any dependency on what a row means.
+            from .bench import _slim
+            job_row = _slim(row)
+            job_row["config"] = row.get("config")
+            JOB._add_row(job_row)
+
         def work(job):
             # skip_preflight: already checked above, and re-reading it here would
             # race against the driver still releasing memory.
-            return speed_sweep(log=job._append, on_row=job._add_row,
+            return speed_sweep(log=job._append, on_row=add_row,
                                should_stop=job.cancelled, on_total=job.set_total,
                                skip_preflight=True, **kw)
 
@@ -162,11 +173,21 @@ class Handler(BaseHTTPRequestHandler):
         directly. Look the name up under the models folder; failing that, hand back
         the name itself and say it did not resolve. Refusing outright would be the
         wrong call: the flags are the valuable part of a launcher and the path is
-        one edit."""
+        one edit.
+
+        `model_name` WINS over `path` when the two name different files. The page
+        always sends the analyzed model's path, but the row being turned into a
+        script may have come from another model's campaign in Past sweeps - and
+        preferring the path there would build a launcher for the analyzed model
+        carrying the other one's config and the other one's measured tok/s in its
+        header. That is worse than any error: both halves look right."""
         path = data.get("path") or ""
+        name = data.get("model_name") or ""
+        if name and path and os.path.basename(path) != name:
+            path = ""
         if path and os.path.exists(path):
             return path, True
-        name = data.get("model_name") or (os.path.basename(path) if path else "")
+        name = name or (os.path.basename(path) if path else "")
         if name:
             root = data.get("dir") or default_models_dir()
             try:
@@ -286,7 +307,16 @@ class Handler(BaseHTTPRequestHandler):
         if u.path == "/api/speed/status":
             from .job import JOB
             q = parse_qs(u.query)
-            return self._send(200, JOB.snapshot(since=int((q.get("since") or ["0"])[0])))
+            # A query string is user input even when only our own code writes it.
+            # An unparseable `since` used to raise straight out of do_GET, which
+            # drops the connection with no response at all - so a polling UI would
+            # see a network error and have nothing to report. Bad offset, start
+            # from the top.
+            try:
+                since = int((q.get("since") or ["0"])[0])
+            except (TypeError, ValueError):
+                since = 0
+            return self._send(200, JOB.snapshot(since=since))
         if u.path == "/api/speed/rows":
             # Ranked history, with no job ever having run in this process - a
             # campaign from last week is exactly as usable as one from this hour.

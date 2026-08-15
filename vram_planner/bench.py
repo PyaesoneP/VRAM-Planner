@@ -275,7 +275,14 @@ def bench_one(backend, model_path, c, port=BENCH_PORT, timeout=420.0,
                 # rather than as a fabricated zero.
                 dn = [r["timings"].get("draft_n") for r in runs]
                 da = [r["timings"].get("draft_n_accepted") for r in runs]
-                if any(dn) and any(da):
+                # `any(da)` would treat a genuine 0% acceptance as "not reported"
+                # and drop the whole group, so the row - and the launcher header
+                # built from it - would say nothing where it should say that
+                # speculation drafted N tokens and got none of them back. That is
+                # the most useful thing a speculative row can tell you. Test for
+                # PRESENCE instead, which still excludes builds that do not report
+                # the field at all.
+                if any(dn) and any(x is not None for x in da):
                     tot_n = sum(x for x in dn if x)
                     tot_a = sum(x for x in da if x)
                     row["draft_n"] = tot_n
@@ -533,6 +540,12 @@ def build_speed_grid(facts, mmproj=None, base=None, stages="abcd", model_path=No
 # two runs of the same machine.
 CHAIN_MARGIN = 0.02
 
+# Neutral value per config key, so a row that omits one groups with a row that
+# sets it explicitly to its default. Anything absent here defaults to None.
+_CONFIG_DEFAULTS = {"ncmoe": 0, "spec_n_max": 0, "fill": 0, "seq": 1,
+                    "temp": 0.0, "top_k": 0, "top_p": 1.0, "min_p": 0.0,
+                    "rep_pen": 1.0, "pres_pen": 0.0}
+
 # What carries forward. Not ctx / kv / fill / seq / fa: those are frozen by the
 # form and are the campaign's definition rather than any of its results. Not
 # `stage`, which is a label.
@@ -565,7 +578,10 @@ def comparable(r, model, base, n_predict=None, repeat=None):
     Speed is conditional on all of these, so a row taken at another depth or with
     another KV quant is not a slower config - it is a different experiment, and
     treating it as a rival would silently rewrite what the campaign is measuring.
-    A 2k-fill row must never set the baseline for a 32k campaign."""
+    A 2k-fill row must never set the baseline for a 32k campaign, and neither
+    must a greedy row set it for a campaign sweeping real sampler settings -
+    greedy is speculation's best case, so those are two experiments and not two
+    configs."""
     if model and r.get("model") != model:
         return False
     if n_predict is not None and r.get("n_predict") != n_predict:
@@ -573,11 +589,18 @@ def comparable(r, model, base, n_predict=None, repeat=None):
     if repeat is not None and r.get("repeat") != repeat:
         return False
     c = r.get("config") or {}
-    return (c.get("ctx") == base.get("ctx")
+    if not (c.get("ctx") == base.get("ctx")
             and c.get("kv") == base.get("kv")
             and (c.get("fill") or 0) == (base.get("fill") or 0)
             and (c.get("seq") or 1) == (base.get("seq") or 1)
-            and bool(c.get("fa")) == bool(base.get("fa")))
+            and bool(c.get("fa")) == bool(base.get("fa"))):
+        return False
+    for k in ("temp", "top_k", "top_p", "min_p", "rep_pen", "pres_pen"):
+        d = _CONFIG_DEFAULTS[k]
+        if (c.get(k) if c.get(k) is not None else d) != \
+                (base.get(k) if base.get(k) is not None else d):
+            return False
+    return True
 
 
 def best_config(rows, model, base, n_predict=None, repeat=None,
@@ -962,7 +985,16 @@ def rank_rows(rows):
 
 # Every config field that identifies WHICH experiment a row belongs to.
 _CONFIG_KEYS = ("ctx", "kv", "fa", "seq", "ub", "ngl", "ncmoe", "spec",
-                "spec_n_max", "mmproj_offload", "fill")
+                "spec_n_max", "mmproj_offload", "fill",
+                # Samplers belong here for the same reason _key() carries them:
+                # greedy is speculation's BEST case, so two rows taken under
+                # different sampler settings are not two configs, they are two
+                # experiments. Leaving them out let axis_effects average a greedy
+                # row against a sampled one and call the difference an effect of
+                # whatever axis happened to differ - the exact confusion the
+                # corpus_repeated warning exists to prevent, arriving by a
+                # different door.
+                "temp", "top_k", "top_p", "min_p", "rep_pen", "pres_pen")
 
 # (name, label, the config keys this axis owns, natural reference value).
 # The reference is the value the question is really asked against: what
@@ -1014,8 +1046,9 @@ def _control(r, owned=()):
             ctl.append((k, c.get(k) or "none"))
         elif k == "fa":
             ctl.append((k, bool(c.get(k))))
-        elif k in ("ncmoe", "spec_n_max", "fill"):
-            ctl.append((k, c.get(k) or 0))
+        elif k in _CONFIG_DEFAULTS:
+            v = c.get(k)
+            ctl.append((k, _CONFIG_DEFAULTS[k] if v is None else v))
         else:
             ctl.append((k, c.get(k)))
     return tuple(ctl)

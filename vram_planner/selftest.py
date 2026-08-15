@@ -1036,7 +1036,9 @@ def _run_suite(require_refs, tmp, skipped_real):
     # every stage after it in one direction, and an insight that compares across
     # experiments manufactures an effect out of the difference between the runs.
     try:
-        from .bench import axis_effects, best_config, pareto, depth_curve
+        from .bench import (axis_effects, best_config, comparable, pareto,
+                            depth_curve)
+        from .sweep import _key as _skey
 
         B = {"ctx": 32768, "kv": "q8_0", "fa": True, "seq": 1, "ub": 512,
              "ngl": 28, "fill": 2048}
@@ -1073,6 +1075,35 @@ def _run_suite(require_refs, tmp, skipped_real):
         if not c or c["ub"] != 2048 or c["spec"] != "draft-mtp" or "stage" in c \
                 or c["ctx"] != B["ctx"] or c["fill"] != B["fill"]:
             chain_ok = False; cwhy.append("carried the wrong keys")
+        # Samplers are a condition of the measurement, not a config knob: greedy
+        # is speculation's best case, so a greedy row and a sampled one are two
+        # experiments. They must not meet in a baseline OR in an effect size.
+        samp_ok = (not comparable(row(9.0), "M.gguf", dict(B, temp=0.7), 128, 3)
+                   and comparable(row(9.0, {"temp": 0.7}), "M.gguf",
+                                  dict(B, temp=0.7), 128, 3)
+                   # and a config that omits a sampler groups with one that sets
+                   # it to its neutral value - they are the same measurement
+                   and comparable(row(9.0, {"rep_pen": 1.0, "pres_pen": 0.0}),
+                                  "M.gguf", B, 128, 3))
+        mixed_s = [row(5.0, {"ub": 512}), row(6.0, {"ub": 1024}),
+                   row(99.0, {"ub": 2048, "temp": 0.7})]
+        ub_s = [e for e in axis_effects(mixed_s)["effects"] if e["axis"] == "ub"][0]
+        samp_ok = samp_ok and sorted(v["value"] for v in ub_s["values"]) == [512, 1024]
+        print("  CHAIN samplers are a condition, not a knob: greedy never meets "
+              "sampled  %s" % ("OK" if samp_ok else "FAIL"))
+
+        # rep_pen/pres_pen are real --speed-axes names, so a ladder over either
+        # has to produce distinct resume keys - and a config that omits them must
+        # still key identically to every row already on disk.
+        kb = {"ctx": 32768, "ngl": 28, "ub": 512, "seq": 1, "fa": True, "kv": "q8_0"}
+        key_ok = (_skey("M", kb) == _skey("M", dict(kb, rep_pen=1.0, pres_pen=0.0))
+                  and len({_skey("M", dict(kb, rep_pen=v))
+                           for v in (1.0, 1.05, 1.1)}) == 3
+                  and len({_skey("M", dict(kb, pres_pen=v))
+                           for v in (0.0, 0.5, 1.0)}) == 3)
+        print("  CHAIN sampler ladders resume distinctly, old rows key unchanged  %s"
+              % ("OK" if key_ok else "FAIL"))
+        chain_ok = chain_ok and samp_ok and key_ok
         print("  CHAIN untrustworthy/incomparable rows refused, 2%% margin held%s  %s"
               % ("" if chain_ok else "  " + "; ".join(cwhy[:3]), "OK" if chain_ok else "FAIL"))
 

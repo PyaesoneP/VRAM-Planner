@@ -91,16 +91,23 @@ async function boot(){
 async function showPastSweeps(){
   if(LAST) return;                       // a plan arrived first; render() owns the page
   SWEEP = sweepDefaults();
-  await loadHistory();
+  await Promise.all([loadHistory(), attachRunningJob()]);
   if(LAST) return;
   const n = (SWEEP.campaigns || []).length;
-  if(!n) return;                         // nothing recorded: leave the plain prompt
-  $("out").innerHTML =
-    h`<div class="card"><p class="placeholder">Pick a model and press Analyze fit.</p></div>` +
-    renderHistory() +
-    h`<section class="card" id="sweepscriptcard">
-        <h2>Launch script</h2><div id="sweepscript"></div></section>`;
-  drawSweep({ grid: false, results: false, script: true, history: true });
+  // A campaign started in another tab is worth showing even with nothing else
+  // recorded yet - that is exactly when the page would otherwise look idle
+  // while the GPU is busy.
+  if(!n && !(SWEEP.status && SWEEP.status.status === "running")) return;
+  const busy = !!(SWEEP.status && SWEEP.status.status === "running");
+  $("out").innerHTML = busy
+    // A sweep is running from another tab or from before a reload. Show the
+    // whole measured column so it can be watched and stopped, not just listed.
+    ? renderSweep() + renderHistory()
+    : h`<div class="card"><p class="placeholder">Pick a model and press Analyze fit.</p></div>` +
+      renderHistory() +
+      h`<section class="card" id="sweepscriptcard">
+          <h2>Launch script</h2><div id="sweepscript"></div></section>`;
+  drawSweep({ grid: busy, results: busy, script: true, history: true });
 }
 
 function renderPlatform(p){
@@ -884,12 +891,30 @@ async function initSweep(r){
     ngl: r.plan.n_gpu_layers, ncmoe: r.plan.n_cpu_moe || 0
   };
   PICKABLE = {};
-  await Promise.all([loadPreflight(), loadSweepRows(), loadHistory(), loadTemplates()]);
+  await Promise.all([loadPreflight(), loadSweepRows(), loadHistory(), loadTemplates(),
+                     attachRunningJob()]);
   // Pre-select this model's campaign, so Past sweeps opens on what was just
   // analyzed instead of on whatever ran most recently.
   const mine = (SWEEP.campaigns || []).filter(g => g.model === SWEEP.model);
   if(mine.length === 1) openCampaign(campaignId(mine[0]));
   drawSweepAll();
+}
+
+/** Pick a campaign that is already running back up.
+ *
+ *  The job lives in the server, not the page, so a reload - or opening a second
+ *  tab - used to leave a two-hour sweep running with nothing watching it: no
+ *  progress, no log, no Stop, and a new Start refused as "already running" with
+ *  no visible reason. Ask once on load, and resume polling if there is one. */
+async function attachRunningJob(){
+  let st;
+  try{ st = await (await fetch("/api/speed/status?since=0")).json(); }
+  catch(e){ return; }
+  if(!st || st.status !== "running") return;
+  SWEEP.status = st;
+  SWEEP.since = st.log_next || 0;
+  if(SWEEP.timer) clearInterval(SWEEP.timer);
+  SWEEP.timer = setInterval(pollSweep, 1500);
 }
 
 async function loadPreflight(){

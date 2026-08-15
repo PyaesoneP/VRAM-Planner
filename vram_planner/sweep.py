@@ -602,7 +602,16 @@ def _key(model, c):
             # different measurement, not the same one already done
             float(c.get("temp") or 0), int(c.get("top_k") or 0),
             float(c.get("top_p") if c.get("top_p") is not None else 1.0),
-            float(c.get("min_p") or 0))
+            float(c.get("min_p") or 0),
+            # rep_pen/pres_pen are real --speed-axes names (parse_overrides reads
+            # them, sampling_of sends them), so leaving them out of the key made a
+            # ladder over either one collapse to a single row: the second value
+            # keyed the same as the first and resume skipped it as already done.
+            # The defaults match sampling_of's, so a config that omits them keys
+            # identically to one that sets them to their neutral values - which is
+            # what keeps every row recorded before this from re-running.
+            float(c.get("rep_pen") if c.get("rep_pen") is not None else 1.0),
+            float(c.get("pres_pen") or 0))
 
 
 def load_rows(path):

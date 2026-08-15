@@ -1247,6 +1247,81 @@ def _run_suite(require_refs, tmp, skipped_real):
         print("  FIND  copying detected, marked, and gated (distinct_ratio misses it)  %s"
               % ("OK" if (copy_ok and metric_ok) else "FAIL"))
 
+        # /completion is raw continuation. An instruction-tuned model handed a
+        # wall of source with no role markers has nothing telling it a REQUEST
+        # was made, so it continues the document - which is what produced 23
+        # unusable rows. The prompt now goes through the model's own chat
+        # template, and a build too old to offer one must say so per row rather
+        # than quietly reproducing the old behaviour.
+        import hashlib
+        from .bench import (apply_template, PROMPT_SCHEME, prompt_identity,
+                            corpus_text)
+        calls = []
+
+        def fake_post(url, path, payload, timeout=600):
+            calls.append(path)
+            if path == "/apply-template":
+                return {"prompt": "<|im_start|>user\n"
+                                  + payload["messages"][0]["content"]
+                                  + "<|im_end|>\n<|im_start|>assistant\n"}
+            raise RuntimeError("no such endpoint")
+
+        import vram_planner.bench as _b
+        real_post = _b._post
+        try:
+            _b._post = fake_post
+            got, applied = apply_template("u", "hello")
+            tmpl_ok = (applied is True and "<|im_start|>user" in got
+                       and "hello" in got)
+            # a build without the endpoint falls back rather than failing the
+            # campaign - but reports it, so the row can be marked RAW
+            _b._post = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("404"))
+            got2, applied2 = apply_template("u", "hello")
+            tmpl_ok = tmpl_ok and got2 == "hello" and applied2 is False
+        finally:
+            _b._post = real_post
+        # an untemplated row is named even when its output looks healthy: the
+        # defect is in how the row was produced, not in what came out
+        rawrow = row(3.9, distinct_ratio=1.0, copyback_ratio=0.0, templated=False)
+        rt = _fmt_row(rawrow["config"], rawrow)
+        okrow = row(3.9, distinct_ratio=1.0, copyback_ratio=0.0, templated=True)
+        tmpl_ok = (tmpl_ok and "RAW" in rt
+                   and "RAW" not in _fmt_row(okrow["config"], okrow))
+        # changing HOW a prompt is assembled must re-key it, or rows measured on
+        # raw continuation would merge with templated ones and average two
+        # different experiments together
+        h = hashlib.sha256()
+        h.update(corpus_text().encode("utf-8"))
+        h.update(_b.INSTRUCTION.encode("utf-8"))
+        scheme_ok = (h.hexdigest() != prompt_identity()
+                     and PROMPT_SCHEME in ("chat",))
+        print("  FIND  prompt goes through the chat template, raw builds say so  %s"
+              % ("OK" if (tmpl_ok and scheme_ok) else "FAIL"))
+
+        # A campaign starts a server every few minutes on the same port. The
+        # previous socket is still in TIME_WAIT, llama-server does not set
+        # SO_REUSEADDR, and the row dies as EXIT - which reads as a crash, so
+        # the config looks like evidence about the wall when it is a harness
+        # fault. Two rows of the 32k campaign were lost exactly this way.
+        import socket as _sock
+        from .bench import free_port, BENCH_PORT
+        held = _sock.socket()
+        held.bind(("127.0.0.1", 0))
+        held.listen(1)
+        taken = held.getsockname()[1]
+        try:
+            alt = free_port(taken)
+            port_ok = (alt != taken and 1024 < alt < 65536
+                       # and an unused port is handed back unchanged, so the
+                       # ordinary case still lands on the documented default
+                       and free_port(BENCH_PORT) in (BENCH_PORT,))
+            # probing must not itself leave the port unusable for the server
+            port_ok = port_ok and free_port(alt) == alt
+        finally:
+            held.close()
+        print("  BENCH busy port falls back instead of dying as EXIT  %s"
+              % ("OK" if port_ok else "FAIL"))
+
         # The frozen corpus is an experiment condition. Two rows measured
         # against different corpora - or one recorded before the corpus was
         # frozen at all - are different experiments and must never meet in a
@@ -1276,7 +1351,8 @@ def _run_suite(require_refs, tmp, skipped_real):
               % ("OK" if (id_ok and vc_ok) else "FAIL"))
         find_ok = (chain_ok and split_ok and alone_ok and clean_ok and par_ok
                    and dep_ok and warn_ok and gate_ok
-                   and copy_ok and metric_ok and id_ok and vc_ok)
+                   and copy_ok and metric_ok and id_ok and vc_ok
+                   and tmpl_ok and scheme_ok and port_ok)
     except Exception as e:
         find_ok = False
         print("  CHAIN/FIND raised %s: %s  FAIL" % (type(e).__name__, e))

@@ -22,7 +22,7 @@ filter. compute.py has no term for a draft cache, so those megabytes would be
 absorbed into `floor` and `ctx` and quietly corrupt every future plan. Same
 format, same resume discipline, different tree.
 """
-import datetime, hashlib, json, os, re, statistics, time, urllib.error, urllib.request
+import datetime, hashlib, json, os, re, socket, statistics, time, urllib.error, urllib.request
 from .gpu import get_gpu_processes, gpu_list
 from .lmstudio import default_models_dir
 from .paths import _data_dir
@@ -31,6 +31,38 @@ from .sweep import (build_argv, discover_models, finish_row, model_facts,
 
 
 BENCH_PORT = 8232          # 8231 is the allocation sweep's; 1234 is LM Studio's
+
+
+def free_port(preferred=BENCH_PORT):
+    """A port llama-server can actually bind, right now.
+
+    One fixed port is not safe to reuse back to back. A campaign tears a server
+    down and starts the next within seconds, but the old socket sits in
+    TIME_WAIT for a minute or more afterwards, and llama-server does not set
+    SO_REUSEADDR - it prints "couldn't bind HTTP server socket" and exits.
+
+    That is not a hypothetical: it cost two rows of the 32k campaign, recorded
+    as EXIT. EXIT reads like a crash or a driver fault, so those configs looked
+    like evidence about the wall when they were nothing but a port collision -
+    a harness failure wearing a result's clothes.
+
+    Probing with bind() mirrors exactly what llama-server is about to attempt,
+    and a socket that never listened leaves no TIME_WAIT of its own. The
+    fallback asks the OS for any free port rather than guessing at offsets."""
+    s = socket.socket()
+    try:
+        s.bind(("127.0.0.1", int(preferred)))
+        return int(preferred)
+    except OSError:
+        pass
+    finally:
+        s.close()
+    s = socket.socket()
+    try:
+        s.bind(("127.0.0.1", 0))
+        return int(s.getsockname()[1])
+    finally:
+        s.close()
 
 N_PREDICT = 128            # tokens generated per measured pass
 
@@ -146,6 +178,41 @@ def corpus_text(refresh=False):
 INSTRUCTION = ("\n\nSummarise, in detail, what the code and documentation above "
                "do and how the pieces fit together.\n")
 
+# Bumped whenever the way a prompt is ASSEMBLED changes, not just its bytes.
+# "chat" is the move from raw /completion continuation to the model's own chat
+# template; rows measured either side of it are different experiments even
+# though the corpus is identical, and the id is what stops them merging.
+PROMPT_SCHEME = "chat"
+
+
+def apply_template(url, text, timeout=120):
+    """Wrap `text` as a user turn using the SERVER's own chat template.
+
+    /completion is a raw-continuation endpoint: it hands the model exactly these
+    bytes, with no role markers and nothing marking the text as a REQUEST. An
+    instruction-tuned model given a wall of source that happens to end in a
+    sentence has no signal that it was asked anything, so it does the only thing
+    the endpoint asks for - it continues the document. In practice that means
+    echoing the instruction back or copying the source, which is what every row
+    of the 32k campaign did. That was never the model failing at depth; it was
+    the benchmark measuring a base model that does not exist.
+
+    Templating is also the only way these numbers describe what actually runs:
+    production serves /v1/chat/completions with --jinja and a template.
+
+    Returns (prompt, applied). A build without /apply-template falls back to the
+    raw text rather than failing the campaign - visibly, because `applied` lands
+    in every row and the scheme lands in the prompt id."""
+    try:
+        d = _post(url, "/apply-template",
+                  {"messages": [{"role": "user", "content": text}]}, timeout)
+    except Exception:
+        return text, False
+    out = d.get("prompt") if isinstance(d, dict) else None
+    if isinstance(out, str) and out:
+        return out, True
+    return text, False
+
 
 def prompt_identity():
     """The hash of exactly the bytes a prompt is built from: corpus + INSTRUCTION.
@@ -160,6 +227,7 @@ def prompt_identity():
         h = hashlib.sha256()
         h.update(corpus_text().encode("utf-8"))
         h.update(INSTRUCTION.encode("utf-8"))
+        h.update(PROMPT_SCHEME.encode("utf-8"))
         _CORPUS_ID = h.hexdigest()
     return _CORPUS_ID
 
@@ -171,10 +239,19 @@ def build_prompt(url, fill_tokens, timeout=120):
     characters and re-tokenises to land close. Exactness is not the point -
     knowing the number is, so it goes in the row."""
     if not fill_tokens:
-        return INSTRUCTION.strip(), None
+        p, applied = apply_template(url, INSTRUCTION.strip(), timeout)
+        return p, None, applied
     body = corpus_text()
     if not body.strip():
         body = "The quick brown fox jumps over the lazy dog. "
+    # The template's own markers cost tokens. Measured once against empty text
+    # and subtracted from the target, so `fill 32768` still means a 32768-token
+    # prompt rather than 32768 plus however many this model's template adds -
+    # otherwise the depth a row claims and the depth it measured would drift
+    # apart by a per-model constant.
+    shell, applied = apply_template(url, "", timeout)
+    overhead = n_tokens(url, shell, timeout) if applied else 0
+    fill_tokens = max(1, fill_tokens - overhead)
     per_char = max(1e-6, n_tokens(url, body[:20000], timeout) / 20000.0)
     want_chars = int(fill_tokens / per_char)
     # Past the length of the corpus there is nothing left to say, so the filler
@@ -199,7 +276,8 @@ def build_prompt(url, fill_tokens, timeout=120):
         if abs(got - fill_tokens) < max(32, fill_tokens * 0.01):
             best = body[:mid]
             break
-    return best + INSTRUCTION, repeated
+    prompt, applied = apply_template(url, best + INSTRUCTION, timeout)
+    return prompt, repeated, applied
 
 
 def sampling_of(c):
@@ -317,13 +395,22 @@ def bench_one(backend, model_path, c, port=BENCH_PORT, timeout=420.0,
            "speed": True, "n_predict": n_predict, "repeat": repeat}
     cfg = dict(c)
     cfg["warmup"] = True          # a speed run should not pay for lazy init
+    # Resolved per config, not once per campaign: the collision only appears
+    # BETWEEN rows, when the previous server's socket is still winding down.
+    port = free_port(port)
     with serve(backend, model_path, cfg, port=port, timeout=timeout,
                log_dir=log_dir, log_name="bench.log") as srv:
         if srv.ok:
             try:
-                prompt, repeated = build_prompt(srv.url, c.get("fill") or 0)
+                prompt, repeated, templated = build_prompt(srv.url,
+                                                           c.get("fill") or 0)
                 row["prompt_tokens"] = n_tokens(srv.url, prompt)
                 row["corpus_repeated"] = bool(repeated)
+                # False means this build has no /apply-template and the row was
+                # measured on raw continuation - the mode that produced 23
+                # unusable rows. Recorded per row because it is a property of
+                # the BACKEND, so it can differ between two rows in one file.
+                row["templated"] = bool(templated)
                 # Which frozen corpus this row measured against. Everything a
                 # deep-fill number means lives or dies on this: two rows from
                 # different corpora are different experiments, and resume and
@@ -1195,8 +1282,14 @@ def _degenerate_note(row):
     spec = (row.get("config") or {}).get("spec") not in (None, "none")
     loop = dr is not None and dr < LOOP_RATIO
     copy = cb is not None and cb > COPY_RATIO
+    # An untemplated row is the KNOWN-BAD mode rather than a symptom of it: the
+    # backend had no /apply-template, so the model was handed raw text with
+    # nothing marking it as a request. Said even when the output happens to look
+    # fine, because the failure is in how the row was produced.
+    raw = "  RAW - no chat template on this build, so the model was asked " \
+          "nothing and merely continued the text" if row.get("templated") is False else ""
     if not (loop or copy):
-        return ""
+        return raw
     if copy:
         what = "COPYING - %.0f%% of the output is a verbatim copy of the prompt, so" \
                % (100 * cb)
@@ -1204,9 +1297,9 @@ def _degenerate_note(row):
         what = "LOOPING - output is %.0f%% repetition, so" % (100 * (1 - dr))
     if spec and (row.get("accept_rate") or 0) >= 0.95:
         return ("  %s the %.0f%% acceptance is the %s, not the drafter; "
-                "excluded from conclusions"
-                % (what, 100 * row["accept_rate"], "copy" if copy else "loop"))
-    return "  %s excluded from conclusions" % what
+                "excluded from conclusions%s"
+                % (what, 100 * row["accept_rate"], "copy" if copy else "loop", raw))
+    return "  %s excluded from conclusions%s" % (what, raw)
 
 
 # ---------------------------------------------------------------------------

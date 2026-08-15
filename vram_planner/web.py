@@ -171,6 +171,8 @@ class Handler(BaseHTTPRequestHandler):
             # race against the driver still releasing memory.
             return speed_sweep(log=job._append, on_row=add_row,
                                should_stop=job.cancelled, on_total=job.set_total,
+                               should_abort=job.aborting,
+                               on_server=job.set_live_proc,
                                skip_preflight=True, **kw)
 
         ok, msg = JOB.start("speed sweep", work)

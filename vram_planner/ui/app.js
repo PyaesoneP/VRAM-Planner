@@ -1288,10 +1288,18 @@ function sweepRunning(st){
     <div class="prog"><i style="width:${pct}%"></i></div>
     <div class="actions">
       <button class="ghost" type="button" data-action="sweep-stop" ${
-        st.cancelling ? "disabled" : ""}>&#9632; Stop</button>
-      <span class="muted small">Stopping finishes the config in flight first, so its row is
-        complete rather than half-written. Nothing is lost either way &mdash; every row is
-        already on disk and keyed, so starting again resumes from here.</span>
+        st.aborting ? "disabled" : ""}>&#9632; ${st.cancelling && !st.aborting
+          ? "Stop now &mdash; abandon this config" : "Stop"}</button>
+      <span class="muted small">${raw(st.aborting
+        ? "Abandoning the config in flight. Its row is discarded rather than recorded, so it " +
+          "is re-measured next time rather than kept as a failure it never really was."
+        : st.cancelling
+          ? "Finishing the config in flight so its row is complete rather than half-written. " +
+            "That can be minutes at a deep fill &mdash; nearly all of a config's time is one " +
+            "blocking request to the server. <b>Press again</b> to kill it now instead."
+          : "Stopping finishes the config in flight first, so its row is complete rather than " +
+            "half-written. Nothing is lost either way &mdash; every row is already on disk and " +
+            "keyed, so starting again resumes from here.")}</span>
     </div>
     ${raw(st.log_dropped ? h`<p class="muted small">${st.log_dropped} earlier log line${
       st.log_dropped == 1 ? "" : "s"} dropped</p>` : "")}

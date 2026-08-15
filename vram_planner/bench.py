@@ -419,7 +419,8 @@ _SWEEP_SAMPLER_KEYS = ("temp", "top_k", "top_p", "min_p", "rep_pen", "pres_pen")
 
 
 def bench_one(backend, model_path, c, port=BENCH_PORT, timeout=420.0,
-              n_predict=N_PREDICT, repeat=N_REPEAT, gen_timeout=1800, log=print):
+              n_predict=N_PREDICT, repeat=N_REPEAT, gen_timeout=1800, log=print,
+              on_server=None):
     """Load one config, measure it, tear it down.
 
     Two kinds of pass, because prefill and decode want opposite things from the
@@ -467,6 +468,12 @@ def bench_one(backend, model_path, c, port=BENCH_PORT, timeout=420.0,
     port = free_port(port)
     with serve(backend, model_path, cfg, port=port, timeout=timeout,
                log_dir=log_dir, log_name="bench.log") as srv:
+        # Publish the live server so a hard stop has something to act on. Nearly
+        # all of a config's wall time is spent inside one blocking request to
+        # it - a 120k-token prefill is minutes - so a flag checked between
+        # configs cannot end a run promptly, and killing the server can.
+        if on_server:
+            on_server(srv.proc)
         if srv.ok:
             try:
                 prompt, repeated, templated = build_prompt(srv.url,
@@ -530,6 +537,8 @@ def bench_one(backend, model_path, c, port=BENCH_PORT, timeout=420.0,
                 row["shared_mib"] = gpu_shared_mib(srv.proc.pid)
             except Exception:
                 row["shared_mib"] = None
+    if on_server:
+        on_server(None)             # torn down; nothing left to kill
     finish_row(row, srv, log_dir=log_dir)
     # finish_row takes its verdict from the server, which came up fine; a
     # generation that then failed is still a failed measurement.
@@ -1113,6 +1122,7 @@ def speed_sweep(models=None, backend=None, dry_run=False, timeout=420.0,
                 ctx=None, kv=None,
                 n_predict=N_PREDICT, repeat=N_REPEAT, log=print, skip_preflight=False,
                 on_row=None, should_stop=None, on_total=None,
+                should_abort=None, on_server=None,
                 chain=False, rounds=1, verify=False, verify_overrides=None,
                 chat_template_file=None, chat_template_kwargs=None,
                 reasoning=None, reasoning_preserve=None, sampling=None):
@@ -1357,9 +1367,20 @@ def speed_sweep(models=None, backend=None, dry_run=False, timeout=420.0,
                         % (len(out), total[0]))
                     return False
                 row = bench_one(b, mp, c, port=port, timeout=timeout,
-                                n_predict=n_predict, repeat=repeat, log=log)
+                                n_predict=n_predict, repeat=repeat, log=log,
+                                on_server=on_server)
                 row.update({"arch": facts["arch"], "n_layers": facts["n_layers"],
                             "when": int(time.time()), "gpu": gpu})
+                # A hard stop kills the server mid-request, so this row failed
+                # because it was ABANDONED, not because the config cannot run.
+                # Writing it would record a fabricated wall - and worse, a
+                # `genfail` here is indistinguishable on disk from a real one,
+                # so the next campaign would carry the lie forward. Dropped, so
+                # the config is simply re-measured.
+                if should_abort and should_abort() and row.get("status") != "ok":
+                    log("abandoned %s - not recorded, so it will be re-measured"
+                        % _carry_summary(c))
+                    return False
                 fh.write(json.dumps(row) + "\n")
                 fh.flush()
                 os.fsync(fh.fileno())

@@ -1112,6 +1112,7 @@ def _run_suite(require_refs, tmp, skipped_real):
     # 12) the job runner: one at a time, and a cancel that is actually observed
     try:
         import threading, time as _time
+        import time as _t
         from .job import Job
         j = Job()
         gate, seen = threading.Event(), {}
@@ -1413,6 +1414,43 @@ def _run_suite(require_refs, tmp, skipped_real):
             held.close()
         print("  BENCH busy port falls back instead of dying as EXIT  %s"
               % ("OK" if port_ok else "FAIL"))
+
+        # Stop, twice. The soft stop lands between configs and keeps the store
+        # free of half-measurements, but nearly all of a config's wall time is
+        # one blocking request to the server, so at a deep fill it is minutes
+        # away. A second press kills the server, which ends that request at
+        # once, and the abandoned row is DISCARDED - a genfail written here
+        # would be indistinguishable on disk from a real one and the next
+        # campaign would carry it forward as a wall that does not exist.
+        import time as _t
+        from .job import Job
+        class _P(object):
+            def __init__(self): self.killed = False
+            def poll(self): return None
+            def kill(self): self.killed = True
+        jb = Job()
+        stop_ok = jb.cancel() == (False, "nothing running")   # idle refuses
+        jb.status, jb.started = "running", _t.time()
+        proc = _P()
+        jb.set_live_proc(proc)
+        ok1, m1 = jb.cancel()
+        stop_ok = (stop_ok and ok1 and m1 == "stopping"
+                   and jb.cancelled() and not jb.aborting()
+                   # the first press must NOT kill: the row in flight is still
+                   # going to be finished and recorded
+                   and not proc.killed
+                   and jb.snapshot()["cancelling"] and not jb.snapshot()["aborting"])
+        ok2, m2 = jb.cancel()
+        stop_ok = (stop_ok and ok2 and m2 == "aborting"
+                   and jb.aborting() and proc.killed
+                   and jb.snapshot()["aborting"])
+        # nothing to kill between configs is not an error
+        jb2 = Job(); jb2.status, jb2.started = "running", _t.time()
+        jb2.cancel()
+        stop_ok = stop_ok and jb2.cancel()[0] and jb2.aborting()
+        print("  STOP  first press finishes the config, second abandons it  %s"
+              % ("OK" if stop_ok else "FAIL"))
+        port_ok = port_ok and stop_ok
 
         # WDDM does not fail an allocation past the dedicated budget - it moves
         # part of the process to system RAM and keeps going, so the row says ok

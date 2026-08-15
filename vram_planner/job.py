@@ -41,6 +41,8 @@ class Job(object):
         self.error = None
         self.result = None
         self._cancel = threading.Event()
+        self._abort = threading.Event()   # second Stop: abandon the config in flight
+        self.live_proc = None             # the llama-server up right now, if any
 
     # -- writing, from the worker thread --------------------------------------
     def _append(self, line):
@@ -95,6 +97,7 @@ class Job(object):
                 "total": self.total, "done": len(self.rows),
                 "stage": self.stage, "planned": self.planned,
                 "cancelling": self._cancel.is_set() and self.status == "running",
+                "aborting": self._abort.is_set() and self.status == "running",
                 "rows": list(self.rows),
                 "log": list(self.log)[start:], "log_next": emitted,
                 "log_dropped": self.dropped,
@@ -142,14 +145,55 @@ class Job(object):
         self._thread.start()
         return True, "started"
 
+    def set_live_proc(self, proc):
+        """The llama-server this campaign has up right now, or None between configs.
+
+        Held so a HARD stop has something to act on. Cancellation is checked
+        between configs by the worker thread, but the worker spends nearly all of
+        its time inside one blocking HTTP call to that server - a 120k-token
+        prefill is minutes - and a flag it will not look at until the call
+        returns is not a stop button, however correct it is."""
+        with self._lock:
+            self.live_proc = proc
+
     def cancel(self):
+        """First press finishes the config in flight. Second abandons it.
+
+        The soft stop is the right default and stays the default: a row is only
+        worth having if it was measured start to finish, so ending between
+        configs is what keeps the store free of half-measurements. But it can be
+        several minutes away, and someone pressing Stop twice wants the card
+        back, not a lecture about data hygiene.
+
+        A hard stop kills the server, which makes the in-flight request fail at
+        once rather than at its timeout. The row that was being measured is then
+        discarded rather than written - see run_group() - so the campaign resumes
+        from the last COMPLETE row and re-measures the abandoned one."""
         with self._lock:
             if not self.running:
                 return False, "nothing running"
+            first = not self._cancel.is_set()
             self._cancel.set()
-        self._append("stop requested - finishing the config in flight first, so the "
-                     "row it is measuring is complete rather than half-written")
-        return True, "stopping"
+            proc = None
+            if not first:
+                self._abort.set()
+                proc = self.live_proc
+        if first:
+            self._append("stop requested - finishing the config in flight first, so the "
+                         "row it is measuring is complete rather than half-written. "
+                         "Press Stop again to abandon it instead.")
+            return True, "stopping"
+        if proc is not None and proc.poll() is None:
+            try:
+                proc.kill()
+            except Exception as e:
+                self._append("could not kill the server: %s" % e)
+        self._append("stop forced - the config in flight was abandoned and its row "
+                     "discarded, so it will be re-measured rather than half-recorded")
+        return True, "aborting"
+
+    def aborting(self):
+        return self._abort.is_set()
 
 
 # The singleton. Module-level because the HTTP handler is instantiated per

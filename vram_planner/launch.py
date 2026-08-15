@@ -125,6 +125,51 @@ def sampler_args(sampling):
     return out
 
 
+# --reasoning replaces enable_thinking in --chat-template-kwargs, which current
+# builds accept and then warn about:
+#   Setting 'enable_thinking' via --chat-template-kwargs is deprecated.
+#   Use --reasoning on / --reasoning off instead.
+# "auto" is llama.cpp's own default and means "detect from the template".
+REASONING_MODES = ("auto", "on", "off")
+
+# Tri-state, and it has to be: --reasoning-preserve and --no-reasoning-preserve
+# are a pair whose default is "whatever the template says", which is a third
+# value a boolean cannot hold. "default" emits no flag at all.
+PRESERVE_MODES = ("default", "on", "off")
+
+
+def reasoning_args(reasoning=None, reasoning_preserve=None):
+    """Validate the two thinking knobs, returning (mode, preserve) or (None, None).
+
+    These are NOT template variables and cannot be reached through
+    --chat-template-kwargs, which is the trap worth naming. A Qwen3 template
+    reads `preserve_thinking`, so setting it there looks like it should work -
+    but llama-server strips the <think> blocks out of the message history
+    BEFORE the template is rendered, so by the time the variable is read there
+    is nothing left for it to preserve. The server says as much on startup:
+
+        chat template supports preserving reasoning,
+        consider enabling it via --reasoning-preserve
+
+    It only shows up from the second turn onward, which is exactly why it
+    survives a single-turn benchmark and then loses the reasoning trace in
+    everyday use."""
+    m = (reasoning or "").strip().lower() or None
+    if m is not None and m not in REASONING_MODES:
+        raise ValueError("--reasoning must be one of %s - got %r"
+                         % (", ".join(REASONING_MODES), reasoning))
+    p = reasoning_preserve
+    if isinstance(p, bool):
+        p = "on" if p else "off"
+    p = (p or "").strip().lower() or None
+    if p == "default":
+        p = None
+    if p is not None and p not in PRESERVE_MODES:
+        raise ValueError("--reasoning-preserve must be one of %s - got %r"
+                         % (", ".join(PRESERVE_MODES), reasoning_preserve))
+    return m, p
+
+
 def template_args(chat_template_file=None, chat_template_kwargs=None):
     """Validate the chat-template pair, returning (path, kwargs_json).
 
@@ -334,7 +379,9 @@ def _powershell(model_path, c, argv, backend, mmproj, sampling, port, bind_host,
     # in one place and not the other just looks like a bug to whoever edits this.
     var = lambda n: "$" + (n.lower() if n in _NOT_A_PARAM else n)
     body = _lines_from_argv(argv, var)
-    has_tmpl = bool(tmpl[0] or tmpl[1])
+    # Any of the four turns the block on: they share one runtime-built array,
+    # because every one of them has to be able to emit no flag at all.
+    has_tmpl = any(tmpl)
     L = []
     A = L.append
 
@@ -407,8 +454,27 @@ def _powershell(model_path, c, argv, backend, mmproj, sampling, port, bind_host,
         A("    # rejected, so a typo here is silent. These are SERVER defaults: a")
         A("    # client sending chat_template_kwargs in the request wins for that")
         A("    # request.")
-        A("    [string]$ChatTemplateKwargs = %s%s"
-          % (ps_quote(tmpl[1] or ""), "," if sampling else ""))
+        A("    [string]$ChatTemplateKwargs = %s," % ps_quote(tmpl[1] or ""))
+        A("")
+        A("    # Whether the model thinks at all. This REPLACES enable_thinking in")
+        A("    # the kwargs above, which current builds accept and then warn about:")
+        A("    #   Setting 'enable_thinking' via --chat-template-kwargs is")
+        A("    #   deprecated. Use --reasoning on / --reasoning off instead.")
+        A("    # 'auto' is llama.cpp's default and detects it from the template.")
+        A("    [ValidateSet(%s)]" % ",".join(ps_quote(m) for m in REASONING_MODES))
+        A("    [string]$Reasoning = %s," % ps_quote(tmpl[2] or "auto"))
+        A("")
+        A("    # Keep the thinking trace for the WHOLE history, not just the last")
+        A("    # assistant message. This one cannot be set from the template kwargs")
+        A("    # even when the template has a variable for it - llama-server strips")
+        A("    # <think> out of the history BEFORE rendering, so by the time the")
+        A("    # template reads the variable there is nothing left to preserve. It")
+        A("    # only shows from the second turn on, which is how it survives a")
+        A("    # benchmark and then quietly loses the trace in daily use.")
+        A("    # 'default' emits no flag and leaves the template's own answer.")
+        A("    [ValidateSet(%s)]" % ",".join(ps_quote(m) for m in PRESERVE_MODES))
+        A("    [string]$ReasoningPreserve = %s%s"
+          % (ps_quote(tmpl[3] or "default"), "," if sampling else ""))
     if sampling:
         A("")
         A("    # Sampling. These are SERVER DEFAULTS - a client that sends its own")
@@ -517,11 +583,18 @@ def _powershell(model_path, c, argv, backend, mmproj, sampling, port, bind_host,
         A("    }")
         A("    $tmplArgs += @('--chat-template-kwargs', $kwargs)")
         A("}")
+        A("if ($Reasoning -ne 'auto') { $tmplArgs += @('--reasoning', $Reasoning) }")
+        A("if ($ReasoningPreserve -ne 'default') {")
+        A("    $tmplArgs += $(if ($ReasoningPreserve -eq 'on')")
+        A("                   { '--reasoning-preserve' }")
+        A("                   else { '--no-reasoning-preserve' })")
+        A("}")
         A("")
     A("Write-Host \"model   : $(Split-Path $model -Leaf)\"")
     if has_tmpl:
         A("if ($ChatTemplateFile) { Write-Host \"template: $(Split-Path $ChatTemplateFile -Leaf)\" }")
         A("if ($ChatTemplateKwargs) { Write-Host \"tmpl-kw : $ChatTemplateKwargs\" }")
+        A("Write-Host \"thinking: $Reasoning  (preserve history: $ReasoningPreserve)\"")
     A("Write-Host \"log     : $(if ($LogFile) { $LogFile } else { 'console only (not saved)' })\"")
     A("Write-Host \"serving : http://${BindHost}:$Port  (OpenAI-compatible at /v1)\"")
     A("if ($BindHost -eq '0.0.0.0') {")
@@ -548,7 +621,9 @@ def _bash(model_path, c, argv, backend, mmproj, sampling, port, bind_host,
           load_mode, log_dir, measured, params, tmpl, path_resolved,
           divergence=""):
     exe_name = EXE_BY_SHELL["bash"]
-    has_tmpl = bool(tmpl[0] or tmpl[1])
+    # Any of the four turns the block on: they share one runtime-built array,
+    # because every one of them has to be able to emit no flag at all.
+    has_tmpl = any(tmpl)
     # Paths come from the host, which may be Windows. Backslashes are an escape
     # character in sh, and every shell that runs this on Windows (Git Bash, MSYS)
     # takes forward slashes anyway.
@@ -612,6 +687,23 @@ def _bash(model_path, c, argv, backend, mmproj, sampling, port, bind_host,
         A("# chat_template_kwargs in the request wins for that request.")
         A("_tmpl_kwargs_default=%s" % sh_quote(tmpl[1] or ""))
         A('CHATTEMPLATEKWARGS="${CHATTEMPLATEKWARGS-$_tmpl_kwargs_default}"')
+        A("")
+        A("# Whether the model thinks at all: auto|on|off. This REPLACES")
+        A("# enable_thinking in the kwargs above, which current builds accept and")
+        A("# then warn about - 'Setting enable_thinking via --chat-template-kwargs")
+        A("# is deprecated. Use --reasoning on / --reasoning off instead.' 'auto' is")
+        A("# llama.cpp's own default and detects it from the template.")
+        A('REASONING="${REASONING:-%s}"' % (tmpl[2] or "auto"))
+        A("")
+        A("# Keep the thinking trace for the WHOLE history, not just the last")
+        A("# assistant message: default|on|off. This one CANNOT be set from the")
+        A("# template kwargs even when the template has a variable for it -")
+        A("# llama-server strips <think> out of the history BEFORE rendering, so by")
+        A("# the time the template reads the variable there is nothing left to")
+        A("# preserve. It only shows from the second turn on, which is how it")
+        A("# survives a benchmark and then quietly loses the trace in daily use.")
+        A("# 'default' emits no flag and leaves the template's own answer.")
+        A('REASONINGPRESERVE="${REASONINGPRESERVE:-%s}"' % (tmpl[3] or "default"))
     if sampling:
         A("")
         A("# Sampling. These are SERVER DEFAULTS - a client that sends its own")
@@ -695,6 +787,18 @@ def _bash(model_path, c, argv, backend, mmproj, sampling, port, bind_host,
         A('if [ -n "$CHATTEMPLATEKWARGS" ]; then')
         A('  tmpl_args+=(--chat-template-kwargs "$CHATTEMPLATEKWARGS")')
         A("fi")
+        A('case "$REASONING" in')
+        A('  auto) ;;')
+        A('  on|off) tmpl_args+=(--reasoning "$REASONING") ;;')
+        A('  *) echo "REASONING must be auto|on|off, got: $REASONING" >&2; exit 1 ;;')
+        A('esac')
+        A('case "$REASONINGPRESERVE" in')
+        A('  default) ;;')
+        A('  on)  tmpl_args+=(--reasoning-preserve) ;;')
+        A('  off) tmpl_args+=(--no-reasoning-preserve) ;;')
+        A('  *) echo "REASONINGPRESERVE must be default|on|off, got: $REASONINGPRESERVE" >&2')
+        A('     exit 1 ;;')
+        A('esac')
         A("")
     A('echo "model   : $(basename "$MODEL")"')
     if has_tmpl:
@@ -707,6 +811,7 @@ def _bash(model_path, c, argv, backend, mmproj, sampling, port, bind_host,
         A('if [ -n "$CHATTEMPLATEKWARGS" ]; then')
         A('  echo "tmpl-kw : $CHATTEMPLATEKWARGS"')
         A("fi")
+        A('echo "thinking: $REASONING  (preserve history: $REASONINGPRESERVE)"')
     A('echo "log     : ${LOGFILE:-console only (not saved)}"')
     A('echo "serving : http://$BINDHOST:$PORT  (OpenAI-compatible at /v1)"')
     A("echo")
@@ -737,6 +842,7 @@ def launch_script(model_path, c, backend=None, mmproj=None, shell=None,
                   sampling=None, port=8080, bind_host="127.0.0.1",
                   load_mode="none", log_dir=None, measured=None,
                   chat_template_file=None, chat_template_kwargs=None,
+                  reasoning=None, reasoning_preserve=None,
                   path_resolved=True):
     """The text of a launcher for one config.
 
@@ -771,7 +877,11 @@ def launch_script(model_path, c, backend=None, mmproj=None, shell=None,
     # measurable and would be wrong in something you use every day.
     argv = build_argv("<exe>", model_path, c, port, probe=False, host=bind_host)[1:]
     samp = sampler_args(sampling)
-    tmpl = template_args(chat_template_file, chat_template_kwargs)
+    # One tuple, because these four flags share a fate: every one of them has to
+    # be built at script RUNTIME rather than written into the command, since an
+    # empty value must produce NO flag instead of an empty one.
+    tmpl = template_args(chat_template_file, chat_template_kwargs) \
+        + reasoning_args(reasoning, reasoning_preserve)
     params = _params_used(argv)
     fn = _powershell if shell == "powershell" else _bash
     divergence = _config_divergence(c, measured, sampling)

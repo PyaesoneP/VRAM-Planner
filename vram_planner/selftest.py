@@ -957,6 +957,42 @@ def _run_suite(require_refs, tmp, skipped_real):
                 pass
         if template_args(None, {"b": 1, "a": 2})[1] != '{"a":2,"b":1}':
             tmpl_ok = False; twhy.append("dict kwargs not serialised stably")
+
+        # --reasoning-preserve. The trap: a Qwen3 template HAS a preserve_thinking
+        # variable, so setting it in --chat-template-kwargs looks like it works -
+        # but llama-server strips <think> out of the history BEFORE rendering, so
+        # the variable has nothing left to act on. It has to be a real flag.
+        from .launch import reasoning_args
+        for shell, want in (("powershell", "$ReasoningPreserve = 'on'"),
+                            ("bash", 'REASONINGPRESERVE="${REASONINGPRESERVE:-on}"')):
+            t = "\n".join(command_lines(launch_script(
+                "m.gguf", base, shell=shell, reasoning="on",
+                reasoning_preserve="on")))
+            # BOTH branches are in the script on purpose - it is a parameter, so
+            # it has to be flippable at launch without regenerating the file.
+            # What the caller chose is the DEFAULT, not the only branch present.
+            if "--reasoning-preserve" not in t or "--no-reasoning-preserve" not in t:
+                tmpl_ok = False; twhy.append("%s has only one preserve branch" % shell)
+            if want not in t:
+                tmpl_ok = False; twhy.append("%s default is not 'on'" % shell)
+            if "--reasoning" not in t:
+                tmpl_ok = False; twhy.append("%s lost --reasoning" % shell)
+            # unset stays unset: 'default' is a real third value here, because
+            # the flag pair's own default is "whatever the template says"
+            blank = "\n".join(command_lines(launch_script("m.gguf", base, shell=shell)))
+            if "reasoning" in blank.lower():
+                tmpl_ok = False; twhy.append("%s emits reasoning when unset" % shell)
+        if reasoning_args(None, None) != (None, None) \
+                or reasoning_args("ON", True) != ("on", "on") \
+                or reasoning_args(None, False) != (None, "off") \
+                or reasoning_args(None, "default") != (None, None):
+            tmpl_ok = False; twhy.append("reasoning_args normalisation")
+        for bad in (("yes", None), (None, "maybe")):
+            try:
+                reasoning_args(*bad)
+                tmpl_ok = False; twhy.append("accepted %r" % (bad,))
+            except ValueError:
+                pass
         print("  TMPL  --jinja precedes the template flags, bad kwargs refused%s  %s"
               % ("" if tmpl_ok else "  " + "; ".join(twhy[:4]), "OK" if tmpl_ok else "FAIL"))
 

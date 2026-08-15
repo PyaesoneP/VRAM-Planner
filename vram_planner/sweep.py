@@ -274,6 +274,15 @@ def build_argv(exe, model_path, c, port, probe=True, host="127.0.0.1"):
         av += ["--chat-template-file", tf]
     if tk:
         av += ["--chat-template-kwargs", tk]
+    # The thinking knobs. Not template variables and not reachable through
+    # --chat-template-kwargs: llama-server strips <think> out of the history
+    # before the template is rendered, so `preserve_thinking` has nothing left
+    # to act on by the time the template reads it. See reasoning_args().
+    if probe and c.get("reasoning"):
+        av += ["--reasoning", c["reasoning"]]
+    if probe and c.get("reasoning_preserve") in ("on", "off"):
+        av.append("--reasoning-preserve" if c["reasoning_preserve"] == "on"
+                  else "--no-reasoning-preserve")
     if probe:
         av += ["--cache-ram", "0",   # host-side prompt cache; noise for our purposes
                "-v"]

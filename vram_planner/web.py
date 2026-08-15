@@ -123,6 +123,8 @@ class Handler(BaseHTTPRequestHandler):
             # row recorded before this was measured against.
             "chat_template_file": data.get("chat_template_file") or None,
             "chat_template_kwargs": data.get("chat_template_kwargs") or None,
+            "reasoning": data.get("reasoning") or None,
+            "reasoning_preserve": data.get("reasoning_preserve") or None,
         }
 
     def _speed_start(self, data):
@@ -237,6 +239,8 @@ class Handler(BaseHTTPRequestHandler):
                 load_mode=load_mode, measured=data.get("measured") or None,
                 chat_template_file=data.get("chat_template_file") or None,
                 chat_template_kwargs=data.get("chat_template_kwargs") or None,
+                reasoning=data.get("reasoning") or None,
+                reasoning_preserve=data.get("reasoning_preserve") or None,
                 path_resolved=resolved)
         except ValueError as e:
             # Raised by template_args() for kwargs that are not a JSON object.

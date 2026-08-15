@@ -232,7 +232,8 @@ def prompt_identity():
     return _CORPUS_ID
 
 
-def template_identity(path=None, kwargs_json=None):
+def template_identity(path=None, kwargs_json=None, reasoning=None,
+                      reasoning_preserve=None):
     """The hash of the chat template a row was measured under, or None.
 
     Sibling of prompt_identity(), and for the same reason: what the model was
@@ -245,8 +246,14 @@ def template_identity(path=None, kwargs_json=None):
     invalidate the rows measured against the old one - a path would not notice,
     and the campaign would silently mix both halves. None means no template was
     pinned and the GGUF's own metadata one was used, which is its own answer and
-    groups separately from every pinned template."""
-    if not path and not kwargs_json:
+    groups separately from every pinned template.
+
+    The thinking flags belong to the same identity: --reasoning off makes one
+    template produce a different answer of a different length, which is a
+    different measurement. They are appended only when SET, so a campaign that
+    does not use them hashes to the same bytes it did before they existed and
+    its rows keep resuming."""
+    if not (path or kwargs_json or reasoning or reasoning_preserve):
         return None
     h = hashlib.sha256()
     if path:
@@ -254,6 +261,9 @@ def template_identity(path=None, kwargs_json=None):
             h.update(fh.read())
     h.update(b"\x00")
     h.update((kwargs_json or "").encode("utf-8"))
+    if reasoning or reasoning_preserve:
+        h.update(("\x00%s\x00%s" % (reasoning or "",
+                                    reasoning_preserve or "")).encode("utf-8"))
     return h.hexdigest()[:16]
 
 
@@ -396,6 +406,14 @@ def _copyback_ratio(text, prompt, n=8):
 # ---------------------------------------------------------------------------
 # One config
 # ---------------------------------------------------------------------------
+# Campaign-level, not points in the grid. They ride in the config dict because
+# build_argv reads from it, and are stripped back out of the stored row: an
+# absolute path is not a knob anyone sweeps over, and every comparison in this
+# module groups on config equality. template_id carries them instead.
+_TEMPLATE_KEYS = ("chat_template_file", "chat_template_kwargs",
+                  "reasoning", "reasoning_preserve")
+
+
 def bench_one(backend, model_path, c, port=BENCH_PORT, timeout=420.0,
               n_predict=N_PREDICT, repeat=N_REPEAT, gen_timeout=1800, log=print):
     """Load one config, measure it, tear it down.
@@ -419,16 +437,18 @@ def bench_one(backend, model_path, c, port=BENCH_PORT, timeout=420.0,
     # so it is stamped on the row beside prompt_id rather than left in the config
     # dict: an absolute path is not a setting anyone is sweeping over, and every
     # comparison in this file groups on config equality.
-    stored = {k: v for k, v in c.items()
-              if k not in ("chat_template_file", "chat_template_kwargs")}
+    stored = {k: v for k, v in c.items() if k not in _TEMPLATE_KEYS}
     row = {"status": "error", "config": stored,
            "model": os.path.basename(model_path), "backend": backend["build"],
            "speed": True, "n_predict": n_predict, "repeat": repeat}
     tf, tk = c.get("chat_template_file"), c.get("chat_template_kwargs")
-    if tf or tk:
-        row["template_id"] = template_identity(tf, tk)
+    rea, rea_p = c.get("reasoning"), c.get("reasoning_preserve")
+    if tf or tk or rea or rea_p:
+        row["template_id"] = template_identity(tf, tk, rea, rea_p)
         row["chat_template"] = os.path.basename(tf) if tf else None
         row["template_kwargs"] = tk
+        row["reasoning"] = rea
+        row["reasoning_preserve"] = rea_p
     # Which frozen corpus this row measured against. Everything a deep-fill
     # number means lives or dies on this: two rows from different corpora are
     # different experiments, and resume and every comparison below treat them
@@ -978,7 +998,7 @@ def verify_config(win_c, overrides=None):
 def _verify_step(backend, model_path, facts, name, base, path, pid, gpu,
                  overrides=None, port=BENCH_PORT, timeout=420.0,
                  n_predict=N_PREDICT, repeat=N_REPEAT, log=print,
-                 template=(None, None), template_id=_ANY):
+                 template=(None, None, None, None), template_id=_ANY):
     """Load the campaign's winner at the PRODUCTION config, exactly once.
 
     The staged search measures each knob at the config the grid asked for, and
@@ -999,11 +1019,9 @@ def _verify_step(backend, model_path, facts, name, base, path, pid, gpu,
     # The winner came back off DISK, where template keys are deliberately not
     # stored. Re-attach them, or the one load that certifies the campaign would
     # be the only load in it measured against a different template.
-    tf, tk = template
-    if tf:
-        c["chat_template_file"] = tf
-    if tk:
-        c["chat_template_kwargs"] = tk
+    for k, v in zip(_TEMPLATE_KEYS, template):
+        if v:
+            c[k] = v
     log("verify  : the winner (%s) does not know the config you actually run -" % _carry_summary(win_c))
     log("          loading %s%s once"
         % (_carry_summary(c),
@@ -1092,7 +1110,8 @@ def speed_sweep(models=None, backend=None, dry_run=False, timeout=420.0,
                 n_predict=N_PREDICT, repeat=N_REPEAT, log=print, skip_preflight=False,
                 on_row=None, should_stop=None, on_total=None,
                 chain=False, rounds=1, verify=False, verify_overrides=None,
-                chat_template_file=None, chat_template_kwargs=None):
+                chat_template_file=None, chat_template_kwargs=None,
+                reasoning=None, reasoning_preserve=None):
     """Run the speed grid and append one row per config. Resumable like --sweep.
 
     `on_row` is called with each finished row, `on_total` when the number of
@@ -1133,22 +1152,30 @@ def speed_sweep(models=None, backend=None, dry_run=False, timeout=420.0,
     # Validated before a single server is launched. A bad kwargs string is a
     # four-hour campaign that dies on config one, or worse - a template path with
     # a typo is not an error at all, just a silent fallback to the GGUF's own.
-    from .launch import template_args
+    from .launch import template_args, reasoning_args
     try:
         tmpl_f, tmpl_k = template_args(chat_template_file, chat_template_kwargs)
+        rea, rea_p = reasoning_args(reasoning, reasoning_preserve)
     except ValueError as e:
         log("template: %s" % e)
         return None
     if tmpl_f and not os.path.isfile(tmpl_f):
         log("template: no such file - %s" % tmpl_f)
         return None
-    tmpl_id = template_identity(tmpl_f, tmpl_k)
+    # The thinking flags are part of the template's identity, not separate from
+    # it: --reasoning off makes the same template produce a different answer of
+    # a different length, which is a different measurement.
+    tmpl_id = template_identity(tmpl_f, tmpl_k, rea, rea_p)
 
     base = dict(SPEED_BASE)
     if tmpl_f:
         base["chat_template_file"] = tmpl_f
     if tmpl_k:
         base["chat_template_kwargs"] = tmpl_k
+    if rea:
+        base["reasoning"] = rea
+    if rea_p:
+        base["reasoning_preserve"] = rea_p
     if fill is not None:
         base["fill"] = fill
     if ctx is not None:
@@ -1215,6 +1242,9 @@ def speed_sweep(models=None, backend=None, dry_run=False, timeout=420.0,
                tmpl_k or "", tmpl_id[:12]))
     else:
         log("template: none pinned - the GGUF's own metadata template")
+    if rea or rea_p:
+        log("thinking: --reasoning %s, preserve history %s"
+            % (rea or "auto", rea_p or "template default"))
     log("output  : %s" % path)
     log("configs : %d to run, %d already recorded" % (len(plan), skipped))
     log("estimate: ~%.1f h  (load + %d warm + %d x %d tokens per config)"
@@ -1381,7 +1411,7 @@ def speed_sweep(models=None, backend=None, dry_run=False, timeout=420.0,
                                 overrides=verify_overrides, port=port,
                                 timeout=timeout, n_predict=n_predict,
                                 repeat=repeat, log=log,
-                                template=(tmpl_f, tmpl_k), template_id=tmpl_id)
+                                template=(tmpl_f, tmpl_k, rea, rea_p), template_id=tmpl_id)
     return {"rows": out, "path": path, "stopped": stopped, "planned": total[0],
             "chained": bool(chain), "verified": verified}
 

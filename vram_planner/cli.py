@@ -78,6 +78,16 @@ def main():
                     help='template variables as a JSON object, e.g. '
                          '\'{"enable_thinking":true,"reasoning_effort":"xhigh"}\'. '
                          "Validated before the first server starts")
+    ap.add_argument("--reasoning", default=None, choices=("auto", "on", "off"),
+                    help="whether the model thinks. Replaces enable_thinking in "
+                         "--chat-template-kwargs, which current builds accept and "
+                         "then deprecate. Default auto: detect from the template")
+    ap.add_argument("--reasoning-preserve", default=None,
+                    choices=("default", "on", "off"),
+                    help="keep the thinking trace across the WHOLE history, not "
+                         "just the last assistant message. Cannot be set from the "
+                         "template kwargs: llama-server strips <think> out of the "
+                         "history before the template is rendered")
     ap.add_argument("--refresh-corpus", action="store_true",
                     help="rebuild the frozen speed-sweep filler corpus from this "
                          "repository's README and sources. Rows record the corpus's "
@@ -192,7 +202,9 @@ def main():
                         chain=args.speed_chain, rounds=args.speed_rounds,
                         verify=args.speed_verify, verify_overrides=overrides,
                         chat_template_file=args.chat_template_file,
-                        chat_template_kwargs=args.chat_template_kwargs)
+                        chat_template_kwargs=args.chat_template_kwargs,
+                        reasoning=args.reasoning,
+                        reasoning_preserve=args.reasoning_preserve)
         sys.exit(0 if r else 1)
     if args.fit:
         from .fit import report

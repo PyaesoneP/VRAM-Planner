@@ -1415,6 +1415,36 @@ function sweepScript(){
           <b>server defaults</b>: a client that sends its own
           <span class="mono">chat_template_kwargs</span> wins for that request.</p>
       </div>
+      <div class="row">
+        <div class="field">
+          <label for="sm_reason">Thinking</label>
+          <select id="sm_reason">
+            <option value="auto"${fv('sm_reason') === 'on' || fv('sm_reason') === 'off' ? "" : " selected"}>auto — detect from the template</option>
+            <option value="on"${fv('sm_reason') === 'on' ? " selected" : ""}>on</option>
+            <option value="off"${fv('sm_reason') === 'off' ? " selected" : ""}>off</option>
+          </select>
+          <p class="hint">Replaces <span class="mono">enable_thinking</span> in the kwargs above,
+            which current builds accept and then warn about:
+            <i>&ldquo;Setting 'enable_thinking' via --chat-template-kwargs is deprecated. Use
+            --reasoning on / --reasoning off instead.&rdquo;</i></p>
+        </div>
+        <div class="field">
+          <label for="sm_reasonpre">Preserve thinking across history</label>
+          <select id="sm_reasonpre">
+            <option value="default"${fv('sm_reasonpre') === 'on' || fv('sm_reasonpre') === 'off' ? "" : " selected"}>template default</option>
+            <option value="on"${fv('sm_reasonpre') === 'on' ? " selected" : ""}>on</option>
+            <option value="off"${fv('sm_reasonpre') === 'off' ? " selected" : ""}>off</option>
+          </select>
+          <p class="hint">Keeps the reasoning trace for the <b>whole</b> history, not just the
+            last assistant message. This one <b>cannot</b> be set from the kwargs above even
+            when the template has a variable for it (Qwen3 spells it
+            <span class="mono">preserve_thinking</span>): llama-server strips
+            <span class="mono">&lt;think&gt;</span> out of the history <i>before</i> rendering,
+            so by the time the template reads the variable there is nothing left to preserve.
+            Only shows from the second turn on &mdash; which is how it survives a benchmark and
+            then quietly loses the trace in daily use.</p>
+        </div>
+      </div>
     </details>
     <details class="adv" ${raw(fopen(1))}><summary>Sampling (optional)</summary>
       <p class="hint">Left blank, no sampler flags are written at all &mdash; a made-up default
@@ -1459,6 +1489,12 @@ function sweepScriptBody(){
            sampling: sampling,
            chat_template_file: val("sm_tmplfile"),
            chat_template_kwargs: val("sm_tmplkw"),
+           // "auto"/"default" are llama.cpp's own answers, so they are sent as
+           // null - meaning no flag at all rather than a flag that restates the
+           // default and would then be wrong if the default ever moved.
+           reasoning: val("sm_reason") === "auto" ? null : val("sm_reason"),
+           reasoning_preserve: val("sm_reasonpre") === "default"
+             ? null : val("sm_reasonpre"),
            port: parseInt(($("swport") || {}).value || 8080),
            bind_host: ($("swhost") || {}).value || "127.0.0.1",
            load_mode: ($("swload") || {}).value || "none",

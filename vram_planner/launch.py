@@ -183,7 +183,17 @@ def template_args(chat_template_file=None, chat_template_kwargs=None):
     parsed the request body and re-serialising to make this re-parse it would be
     a round trip that could only lose. Keys are sorted so regenerating the same
     script twice produces the same bytes."""
-    f = (chat_template_file or "").strip() or None
+    # Surrounding quotes come off. Windows Explorer's "Copy as path" - the
+    # normal way anybody produces a Windows path to paste - ALWAYS wraps its
+    # result in double quotes, and they are not part of the filename. Left on,
+    # they end up inside the script's single-quoted default, Test-Path returns
+    # false for a file that plainly exists, and the launcher dies on its own
+    # guard with "No such chat template" naming a path you can see is there.
+    # The stray quote is visible in the header too, which is the only clue.
+    f = (chat_template_file or "").strip()
+    if len(f) >= 2 and f[0] == f[-1] and f[0] in "\"'":
+        f = f[1:-1].strip()
+    f = f or None
     kw = chat_template_kwargs
     if kw is None or (isinstance(kw, str) and not kw.strip()):
         return f, None
@@ -281,6 +291,22 @@ _EVIDENCE_KEYS = ("ctx", "kv", "fa", "seq", "ub", "ngl", "ncmoe", "fill",
 
 _SAMPLER_KEYS = ("temp", "top_k", "top_p", "min_p", "rep_pen", "pres_pen")
 
+# What a sweep row was ACTUALLY measured at when it names no sampler: greedy,
+# which is bench.sampling_of()'s default. Absent must not read as "unknown, skip
+# the comparison" - a config carries these keys only when someone swept them, so
+# skipping meant the divergence line went silent in exactly the ordinary case.
+#
+# It matters most for speculation, and bench.sampling_of() says why: llama.cpp
+# accepts a draft token when the target's own sampled token matches it, and
+# under greedy that comparison is deterministic. Greedy is speculation's BEST
+# case. A header that quotes 85% acceptance for a script running temp 1.0 is
+# quoting an upper bound as though it were the measurement.
+_MEASURED_SAMPLER_DEFAULTS = {"temp": 0.0, "top_k": 0, "top_p": 1.0,
+                              "min_p": 0.0, "rep_pen": 1.0, "pres_pen": 0.0}
+
+# A sweep config and the script form spell the last two differently.
+_SAMPLER_ALIAS = {"rep_pen": "repeat_penalty", "pres_pen": "presence_penalty"}
+
 
 def _config_divergence(c, measured, sampling=None):
     """The settings in which a launched config differs from the row it cites.
@@ -304,8 +330,18 @@ def _config_divergence(c, measured, sampling=None):
         if a is not None and b is not None and a != b:
             diffs.append("%s %s->%s" % (k, b, a))
     for k in _SAMPLER_KEYS:
-        a, b = (sampling or {}).get(k), mc.get(k)
-        if a is not None and b is not None and a != b:
+        # The two sides spell the last two differently: a sweep config says
+        # rep_pen/pres_pen, the script form says repeat_penalty/presence_penalty.
+        # Without the map, `sampling.get("rep_pen")` was always None and those
+        # two could never diverge however far apart they were set.
+        a = (sampling or {}).get(_SAMPLER_ALIAS.get(k, k))
+        # The measured side falls back to what the bench actually used, not to
+        # None. See _MEASURED_SAMPLER_DEFAULTS: a row that names no sampler was
+        # measured greedy, and that is a fact about the row, not a gap in it.
+        b = mc.get(k)
+        if b is None:
+            b = _MEASURED_SAMPLER_DEFAULTS.get(k)
+        if a is not None and b is not None and float(a) != float(b):
             diffs.append("%s %s->%s" % (k, b, a))
     return ", ".join(diffs)
 

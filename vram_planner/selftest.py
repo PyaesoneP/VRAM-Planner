@@ -979,6 +979,41 @@ def _run_suite(require_refs, tmp, skipped_real):
         if template_args(None, {"b": 1, "a": 2})[1] != '{"a":2,"b":1}':
             tmpl_ok = False; twhy.append("dict kwargs not serialised stably")
 
+        # Windows Explorer's "Copy as path" - the normal way anyone produces a
+        # path to paste - always wraps it in double quotes, and they are not
+        # part of the filename. Left on, Test-Path fails for a file that plainly
+        # exists and the launcher dies on its own guard.
+        want_p = "C:\\d\\chat.jinja"
+        for given in ('"C:\\d\\chat.jinja"', "'C:\\d\\chat.jinja'",
+                      '  "C:\\d\\chat.jinja"  '):
+            if template_args(given, None)[0] != want_p:
+                tmpl_ok = False; twhy.append("quotes kept in %r" % given)
+        # ...but a quote that is part of the name survives, and an unbalanced
+        # one is not a wrapper
+        for keep in ("C:\\it's\\chat.jinja", '"C:\\d\\chat.jinja'):
+            if template_args(keep, None)[0] != keep:
+                tmpl_ok = False; twhy.append("mangled %r" % keep)
+
+        # The header's divergence line. A row that names no sampler was measured
+        # GREEDY - that is a fact about it, not a gap - and greedy is
+        # speculation's best case, so a script running temp 1.0 must not quote
+        # the acceptance rate as though it applied.
+        from .launch import _config_divergence
+        meas = {"config": {"ngl": 28, "spec": "draft-mtp", "spec_n_max": 2}}
+        dv = _config_divergence(meas["config"], meas,
+                                {"temp": 1.0, "top_k": 20, "top_p": 0.95,
+                                 "repeat_penalty": 1.05})
+        if "temp 0.0->1.0" not in dv or "top_k 0->20" not in dv:
+            tmpl_ok = False; twhy.append("greedy baseline not reported: %r" % dv)
+        # rep_pen/pres_pen are spelled differently on the two sides; without the
+        # alias they could never diverge however far apart they were set
+        if "rep_pen 1.0->1.05" not in dv:
+            tmpl_ok = False; twhy.append("rep_pen alias not applied: %r" % dv)
+        # and matching samplers still report nothing
+        if _config_divergence(meas["config"], meas,
+                              {"temp": 0.0, "top_k": 0, "top_p": 1.0}):
+            tmpl_ok = False; twhy.append("greedy-vs-greedy reported a difference")
+
         # --reasoning-preserve. The trap: a Qwen3 template HAS a preserve_thinking
         # variable, so setting it in --chat-template-kwargs looks like it works -
         # but llama-server strips <think> out of the history BEFORE rendering, so

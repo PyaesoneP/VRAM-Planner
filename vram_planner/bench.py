@@ -1336,8 +1336,14 @@ def speed_sweep(models=None, backend=None, dry_run=False, timeout=420.0,
            "tok/s", "prefill", "VRAM", "accept", "distin"))
     out, stopped = [], False
     total = [len(plan)]                 # a list so run_group can revise it
+    # The campaign's own estimate, which under a chained search is NOT the same
+    # number as the bar's denominator: chaining measures one stage at a time and
+    # only the running stage has a known config list. Reported separately rather
+    # than reconciled, because they are answers to two different questions and
+    # picking one to show made the other look like a mistake.
+    planned = len(plan)
     if on_total:
-        on_total(total[0])
+        on_total(total[0], stage=None, planned=planned)
     name = os.path.basename(mp)
 
     with open(path, "a", encoding="utf-8") as fh:
@@ -1401,8 +1407,12 @@ def speed_sweep(models=None, backend=None, dry_run=False, timeout=420.0,
                         % (tag, len(todo), "" if len(todo) == 1 else "s",
                            _carry_summary(gb)))
                     total[0] = len(out) + len(todo)
+                    # The campaign estimate was built from the unchained grid, so
+                    # a rebased stage can outgrow it. Never let it claim fewer
+                    # configs than have already been measured.
+                    planned = max(planned, total[0])
                     if on_total:
-                        on_total(total[0])
+                        on_total(total[0], stage=tag, planned=planned)
                     if not run_group(todo):
                         stopped = True
                         break

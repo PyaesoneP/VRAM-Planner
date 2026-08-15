@@ -1268,9 +1268,23 @@ function sweepRunning(st){
   const pct = st.total ? clampPct(100 * st.done / st.total) : 0;
   const mins = st.elapsed_s != null ? (st.elapsed_s / 60).toFixed(1) : "?";
   const tail = (st.log || []).slice(-14).join("\n");
+  /* Under a chained search the bar's denominator is THIS STAGE, not the
+     campaign: a later stage's configs are built from a baseline that does not
+     exist yet, so only the running one has a known list. The header meanwhile
+     prints the campaign's estimate. Showing one and not the other made the
+     other look like a mistake - "1 of 9" under a log saying "36 to run". */
+  const chained = !!st.stage;
+  const head = chained
+    ? h`<b>Measuring</b> &mdash; ${st.stage} &middot; ${st.done} of ${st.total || "?"}
+        &middot; ~${st.planned || "?"} planned for the campaign, ${mins} min elapsed`
+    : h`<b>Measuring</b> &mdash; ${st.done} of ${st.total || "?"} configs, ${mins} min elapsed`;
   return h`<div class="running">
-    <p><b>Measuring</b> &mdash; ${st.done} of ${st.total || "?"} configs, ${mins} min elapsed
+    <p>${raw(head)}
       ${raw(st.cancelling ? '<span style="color:var(--warn)">&middot; stopping</span>' : "")}</p>
+    ${raw(chained ? h`<p class="hint" style="margin:-2px 0 8px">The bar tracks the stage that is
+      running. Chained, the stages after it are built from a baseline that has not been measured
+      yet, so their contents are not known in advance &mdash; the campaign figure is an estimate
+      from the unchained grid and can move.</p>` : "")}
     <div class="prog"><i style="width:${pct}%"></i></div>
     <div class="actions">
       <button class="ghost" type="button" data-action="sweep-stop" ${

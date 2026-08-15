@@ -1015,6 +1015,23 @@ def resolve_search(axes, chain):
     return chain, None
 
 
+def resolve_rounds(chain, rounds):
+    """Rounds only means something with chaining on. Returns (rounds, note).
+
+    A round re-runs the stages from the WINNER, and without chaining there is no
+    winner to re-run them from - every stage is built off the same fixed
+    baseline, so round two re-derives an identical grid and skips all of it as
+    already recorded. The setting was accepted in that state and did precisely
+    nothing, with nothing said. Same reasoning as resolve_search(): a knob that
+    silently does not apply is worse than one that is refused."""
+    rounds = max(1, int(rounds or 1))
+    if rounds > 1 and not chain:
+        return 1, ("note    : rounds=%d ignored - a round re-runs the stages from "
+                   "the winner, and without chaining there is no winner to re-run "
+                   "them from" % rounds)
+    return rounds, None
+
+
 def _carry_summary(c):
     return ("ngl %s ncmoe %s ub %s spec %s"
             % (c.get("ngl"), c.get("ncmoe") or 0, c.get("ub"),
@@ -1240,13 +1257,26 @@ def speed_sweep(models=None, backend=None, dry_run=False, timeout=420.0,
     if axes:
         # An explicit ladder replaces the staged grid: this is how a stage gets
         # re-run at the ngl the previous stage actually settled on.
-        combos = [dict(base, **({"mmproj": mmproj} if mmproj else {}))]
+        #
+        # It starts from the RESOLVED base, not from SPEED_BASE. Those differ in
+        # the one place it matters most: SPEED_BASE carries ngl 26, a value that
+        # belongs to no model, while grid_context() asks the planner where the
+        # layers actually land - ngl 41 on the MoE this was found on. A ladder
+        # over ncmoe anchored at ngl 26 puts fifteen whole blocks on the CPU and
+        # measures a config nobody asked about, next to stage rows that used 41.
+        # It also clamps ctx to what the model was trained on, which the staged
+        # path has always done and this one silently did not.
+        gbase = grid_context(facts, mmproj=mmproj, base=base, model_path=mp)[0]
+        combos = [dict(gbase, **({"mmproj": mmproj} if mmproj else {}))]
         for k, vals in axes.items():
             combos = [dict(c, **{k: v}) for c in combos for v in vals]
         cfgs = combos
     chain, note = resolve_search(axes, chain)
     if note:
         log(note)
+    rounds, rnote = resolve_rounds(chain, rounds)
+    if rnote:
+        log(rnote)
 
     gpu = (gpu_list(fresh=True) or [{}])[0].get("name") or ""
     path = bench_path(gpu, b["build"])
@@ -1465,6 +1495,7 @@ def speed_sweep(models=None, backend=None, dry_run=False, timeout=420.0,
                     if not run_group(todo):
                         stopped = True
                         break
+                    _spec_wall_note(out, todo, gb, log)
                     # Re-read from DISK, not from `out`: a campaign resumed after a
                     # stop has rows this process never saw, and they are exactly
                     # the ones that say where the previous stage got to.
@@ -1496,6 +1527,51 @@ def speed_sweep(models=None, backend=None, dry_run=False, timeout=420.0,
                                 template=(tmpl_f, tmpl_k, rea, rea_p), template_id=tmpl_id)
     return {"rows": out, "path": path, "stopped": stopped, "planned": total[0],
             "chained": bool(chain), "verified": verified}
+
+
+def _spec_wall_note(out, todo, base, log):
+    """Say what an all-OOM speculation stage actually means.
+
+    A draft model needs its own KV cache, and llama.cpp keeps it at f16 whatever
+    the main cache is quantised to - so speculation costs several hundred MiB
+    that the split it is being tried at was never chosen to leave room for.
+
+    Stage D only ever tries it at the split stage A/B settled on, and that split
+    is by construction the FASTEST one that fits, which usually means the one
+    with the least headroom left. So every draft row OOMs, and the campaign
+    reads as "speculation does not work on this model" when what it measured is
+    "speculation does not fit at this particular split". Those are different
+    findings and only one of them is true.
+
+    The remedy is an interaction the staged grid cannot express - vary the split
+    AND the speculation together - so this prints the ladder to run rather than
+    leaving it to be deduced from four OOM lines."""
+    keys = {(c.get("spec") or "none") for c in todo}
+    drafts = [c for c in todo if (c.get("spec") or "none").startswith("draft")]
+    if not drafts or len(keys) < 2:
+        return
+    ran = [r for r in out if (r.get("config") or {}).get("spec", "").startswith("draft")]
+    if not ran or any(r.get("status") == "ok" for r in ran):
+        return
+    moe = base.get("ncmoe") is not None and base.get("ncmoe") != 0
+    axis, cur = ("ncmoe", base.get("ncmoe")) if moe else ("ngl", base.get("ngl"))
+    if cur is None:
+        return
+    # More ncmoe means MORE on the CPU and less in VRAM; more ngl means the
+    # opposite. Either way, walk in the direction that frees memory.
+    rungs = [cur + i for i in range(1, 5)] if moe else \
+            [cur - i for i in range(1, 5) if cur - i >= 0]
+    log("")
+    log("note    : every draft-* row OOMed at %s %s. That is not a verdict on"
+        % (axis, cur))
+    log("          speculation - the draft KV cache is f16 whatever -ctk says, and")
+    log("          this split was picked as the fastest that FITS, so it had no room")
+    log("          spare. Vary the split and the speculation together:")
+    log("            --speed-axes %s=%s spec=draft-mtp spec_n_max=2%s"
+        % (axis, ",".join(str(v) for v in sorted(rungs)),
+           " mmproj_offload=false" if base.get("mmproj_offload") is False else ""))
+    log("          or paste that into 'Sweep exact values instead of the stages'.")
+    log("")
 
 
 def _fmt_row(c, row, i=None, n=None):

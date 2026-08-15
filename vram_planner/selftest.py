@@ -1415,6 +1415,30 @@ def _run_suite(require_refs, tmp, skipped_real):
         print("  BENCH busy port falls back instead of dying as EXIT  %s"
               % ("OK" if port_ok else "FAIL"))
 
+        # A knob that silently does not apply is worse than one that is refused.
+        # rounds re-runs the stages from the WINNER, so without chaining there is
+        # no winner to re-run them from - it was accepted in that state and did
+        # precisely nothing, with nothing said.
+        from .bench import resolve_rounds
+        rnd_ok = (resolve_rounds(True, 3) == (3, None)
+                  and resolve_rounds(True, 1) == (1, None)
+                  and resolve_rounds(False, 1) == (1, None)
+                  and resolve_rounds(False, 3)[0] == 1
+                  and "ignored" in (resolve_rounds(False, 3)[1] or "")
+                  # nonsense normalises rather than raising mid-campaign
+                  and resolve_rounds(True, 0) == (1, None)
+                  and resolve_rounds(True, None) == (1, None))
+        # ...and the two controls that cannot act are hidden by CSS, not by JS:
+        # the grid pane is rewritten every 1.5s while a campaign runs, so a
+        # script toggle is one missed redraw away from being wrong.
+        css = open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                "ui", "app.css"), encoding="utf-8").read()
+        rnd_ok = (rnd_ok and "#swchain:not(:checked)) > #swroundsfield" in css
+                  and "#swverify:not(:checked)) > #swverifyfield" in css)
+        print("  ROUND rounds refused without chaining, dead controls hidden  %s"
+              % ("OK" if rnd_ok else "FAIL"))
+        port_ok = port_ok and rnd_ok
+
         # prefill is taken from the FIRST request after the server comes up, so
         # it also paid for faulting CPU-resident weights in. bench_one already
         # throws that pass's DECODE away for the same reason; it kept its

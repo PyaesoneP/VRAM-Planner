@@ -328,6 +328,18 @@ tr.cur td{color:var(--kv)}
 }
 .tier > i{font-style:normal;font-size:var(--t-small);color:var(--dim)}
 
+/* A control that cannot do anything should not be asking. Rounds re-runs the
+   stages from the winner, so with chaining off it re-derives an identical grid
+   and skips all of it; verify's overrides describe a load that will not happen.
+   Both were shown regardless, and both have carried an id for this since they
+   were written - nothing ever used it.
+
+   CSS rather than JS on purpose: the grid pane is rewritten every 1.5s while a
+   campaign runs, so anything toggled by script has to be re-applied on each
+   redraw and is one missed call away from being wrong. This cannot drift. */
+.field:has(> label > #swchain:not(:checked)) > #swroundsfield,
+.field:has(> label > #swverify:not(:checked)) > #swverifyfield{display:none}
+
 /* -- the three steps ------------------------------------------------------
    Twelve sections used to stack in this column at once, so nothing in it was
    the next thing to do. Now one step renders at a time and the others keep

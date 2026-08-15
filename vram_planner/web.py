@@ -124,6 +124,15 @@ class Handler(BaseHTTPRequestHandler):
             "verify": bool(data.get("verify")),
             "verify_overrides": (parse_overrides(data.get("verify_overrides").split())
                                  if data.get("verify_overrides") else None),
+            # An explicit ladder, which REPLACES the staged grid. The staged
+            # search measures one knob at a time from a baseline, which cannot
+            # answer a question about an INTERACTION - "does speculation work at
+            # a split that leaves room for its draft cache" - because stage D
+            # only ever tries speculation at the split stage B already settled
+            # on. If that split is at the ceiling, every speculative row OOMs
+            # and the campaign reads as "speculation does not work here".
+            "axes": (parse_overrides(data.get("axes").split())
+                     if data.get("axes") else None),
             # Same two fields the launch-script card already carries, so a
             # campaign can be MEASURED under the template it will be RUN under.
             # Absent means the GGUF's own metadata template, which is what every

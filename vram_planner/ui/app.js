@@ -1167,12 +1167,16 @@ function sweepForm(pf){
         model looping is never carried forward &mdash; it would bend every later stage the same
         way, silently. A new baseline also has to win by more than 2%, because tok/s is a median
         of a few passes and rebasing on jitter would make the campaign&rsquo;s path depend on noise.</p>
-      <div class="field" id="swroundsfield" style="max-width:16em">
+      <div class="field" id="swroundsfield" style="max-width:22em">
         <label for="swrounds">Rounds</label>
         <input type="number" id="swrounds" value="1" min="1" max="4" step="1">
-        <p class="hint">Re-run the stages from the winner. Cheap: a config a later round
-          revisits unchanged is already recorded and is skipped, so only genuinely new
-          combinations cost time.</p>
+        <p class="hint">Runs A&ndash;D again from the winner. The point is that A and B choose
+          the memory split <i>before</i> D turns speculation on, and speculation costs VRAM
+          &mdash; so the wall A found has moved by the time D is done. A second round re-walks
+          the split with the speculation that won already switched on.
+          <b>The preview cannot price it</b>: which configs a later round adds depends on what
+          this one finds. It is cheap by construction though &mdash; anything a round revisits
+          unchanged is already recorded and is skipped, so only new combinations cost time.</p>
       </div>
     </div>
     <div class="field">
@@ -1188,6 +1192,22 @@ function sweepForm(pf){
         <input type="text" id="swverifyoverrides" placeholder="spec=draft-mtp spec_n_max=2">
       </div>
     </div>
+    <details class="adv" id="swaxesbox"><summary>Sweep exact values instead of the stages</summary>
+      <p class="hint">The staged grid moves one knob at a time from a baseline, which cannot
+        answer a question about an <b>interaction</b>. Stage D only ever tries speculation at the
+        split stage B settled on &mdash; so if that split is already at the memory ceiling, every
+        speculative row OOMs and the campaign reads as &ldquo;speculation does not work here&rdquo;
+        when the truth is &ldquo;speculation needs one more rung of offload&rdquo;.</p>
+      <div class="field">
+        <label for="swaxes">Axes</label>
+        <input type="text" id="swaxes"
+               placeholder="ncmoe=30,31,32,33 spec=draft-mtp spec_n_max=2 mmproj_offload=false">
+        <p class="hint">Space-separated <span class="mono">key=v,v,v</span>, run as a full cross
+          product. Anything left out keeps the value from the form above.
+          <b>This replaces the stages and the chaining</b> &mdash; a ladder you wrote down is
+          already the search, so there is nothing left to chain.</p>
+      </div>
+    </details>
     ${raw(sweepAskSection())}
     <div class="actions">
       <button class="ghost" type="button" data-action="sweep-plan">Preview grid</button>
@@ -1277,6 +1297,7 @@ function sweepBody(){
            chain: chain, rounds: chain ? (v("swrounds") || 1) : 1,
            verify: verify,
            verify_overrides: verify ? ($("swverifyoverrides").value.trim() || null) : null,
+           axes: ($("swaxes") && $("swaxes").value.trim()) || null,
            ...sweepAskBody() };
 }
 
@@ -1333,6 +1354,14 @@ async function sweepPlan(){
         values for them would be a guess dressed up as a plan. The <i>counts</i> are exact
         &mdash; a ladder&rsquo;s length does not depend on where it is centred &mdash; so the
         estimate above is not a guess. Stages: ${raw(later)}.</p>` : "") +
+    /* The estimate covers round 1 only, and said nothing about it - the preview
+       was byte-identical for rounds 1 and rounds 4, so the control changed
+       nothing anyone could inspect before committing the hours. */
+    ((d.rounds || 1) > 1 ? h`<p class="note"><b>${String(d.rounds)} rounds.</b> The count and
+        the estimate above are for <b>round 1</b>. What a later round adds cannot be listed or
+        priced here &mdash; it is built from a winner that does not exist yet &mdash; but it is
+        bounded: anything a round revisits unchanged is already recorded and is skipped, so a
+        round only pays for combinations round 1 never tried.</p>` : "") +
     (d.planned ? h`<div class="tablewrap"><table>
       <thead><tr><th>stage</th><th>ngl</th><th>ncmoe</th><th>ub</th><th>fill</th>
         <th>spec</th><th>n-max</th><th>projector</th></tr></thead>

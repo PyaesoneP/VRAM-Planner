@@ -44,8 +44,28 @@ def main():
                          "b=projector placement, c=ubatch, d=speculation)")
     ap.add_argument("--speed-fill", type=int, default=None, metavar="TOKENS",
                     help="with --speed-sweep: prompt length to measure at")
+    ap.add_argument("--speed-ctx", type=int, default=None, metavar="N",
+                    help="with --speed-sweep: freeze context length (clamped to the "
+                         "model's trained context)")
+    ap.add_argument("--speed-kv", default=None, metavar="TYPE",
+                    help="with --speed-sweep: freeze KV cache quant, e.g. q8_0")
+    ap.add_argument("--speed-chain", action="store_true",
+                    help="with --speed-sweep: build each stage against the fastest "
+                         "row measured so far instead of against the planner's "
+                         "guess. Same number of loads, so the same hours - but "
+                         "ubatch is then measured at the layer split that actually "
+                         "won rather than at one nothing has confirmed")
+    ap.add_argument("--speed-rounds", type=int, default=1, metavar="N",
+                    help="with --speed-chain: re-run the stages from the winner N "
+                         "times. Cheap - a config a later round revisits unchanged "
+                         "is already recorded and is skipped")
     ap.add_argument("--speed-report", action="store_true",
                     help="print every recorded speed row, fastest first")
+    ap.add_argument("--insights", action="store_true",
+                    help="with --speed-report: print what the campaigns FOUND - what "
+                         "each knob was worth, how speed fell with context depth, and "
+                         "which configs nothing beats on both speed and VRAM - instead "
+                         "of the flat ranking")
     ap.add_argument("--n-predict", type=int, default=128,
                     help="with --speed-sweep: tokens generated per measured pass")
     ap.add_argument("--repeat", type=int, default=3,
@@ -121,8 +141,8 @@ def main():
             print("\n!! %s" % st["outdated"])
         sys.exit(0)
     if args.speed_report:
-        from .bench import report as speed_report
-        sys.exit(0 if speed_report() else 1)
+        from .bench import report as speed_report, report_insights
+        sys.exit(0 if (report_insights() if args.insights else speed_report()) else 1)
     if args.speed_sweep:
         from .bench import speed_sweep         # deferred: needs subprocess work
         from .sweep import parse_overrides
@@ -130,8 +150,9 @@ def main():
         r = speed_sweep(models=args.models, backend=args.backend,
                         dry_run=args.dry_run, timeout=args.sweep_timeout,
                         limit=args.limit, axes=axes, stages=args.speed_stages,
-                        fill=args.speed_fill, n_predict=args.n_predict,
-                        repeat=args.repeat)
+                        fill=args.speed_fill, ctx=args.speed_ctx, kv=args.speed_kv,
+                        n_predict=args.n_predict, repeat=args.repeat,
+                        chain=args.speed_chain, rounds=args.speed_rounds)
         sys.exit(0 if r else 1)
     if args.fit:
         from .fit import report

@@ -1,0 +1,142 @@
+"""One background campaign, watchable from the browser.
+
+A speed sweep is a 1.5-2 hour blocking call and the web server answers requests
+synchronously, so the sweep cannot BE a request. It runs on a thread and the UI
+polls this module for what has happened so far.
+
+Deliberately one job, not a queue. A campaign owns the GPU outright - that is the
+whole point of the preflight guard - so a second concurrent run would not be
+slower, it would be wrong, and both sets of numbers would be wrong in a way that
+still looks like numbers. A second start is refused rather than queued.
+
+Cancellation is cooperative and lands between configs. See speed_sweep().
+"""
+import collections, threading, time
+
+# The sweep is chatty - one config prints a load line, a row line and whatever
+# llama-server said. An unbounded transcript on a two-hour run is a slow leak, so
+# the tail is bounded and the UI is told how much it missed.
+LOG_LINES = 500
+
+
+class Job(object):
+    """State of the current (or last) campaign. All access under `_lock`."""
+
+    def __init__(self):
+        self._lock = threading.RLock()
+        self._thread = None
+        self.reset()
+
+    def reset(self):
+        self.status = "idle"          # idle | running | done | failed | cancelled
+        self.started = None
+        self.finished = None
+        self.kind = None              # what is running, for the UI's heading
+        self.total = 0                # configs planned, 0 until the plan is known
+        self.rows = []
+        self.log = collections.deque(maxlen=LOG_LINES)
+        self.dropped = 0              # log lines that fell off the front
+        self.error = None
+        self.result = None
+        self._cancel = threading.Event()
+
+    # -- writing, from the worker thread --------------------------------------
+    def _append(self, line):
+        with self._lock:
+            if len(self.log) == self.log.maxlen:
+                self.dropped += 1
+            self.log.append(str(line))
+
+    def _add_row(self, row):
+        with self._lock:
+            self.rows.append(row)
+
+    def set_total(self, n):
+        with self._lock:
+            self.total = int(n or 0)
+
+    # -- reading, from request threads ----------------------------------------
+    @property
+    def running(self):
+        return self.status == "running"
+
+    def cancelled(self):
+        return self._cancel.is_set()
+
+    def snapshot(self, since=0):
+        """Everything the UI needs for one poll.
+
+        `since` is a log offset, so a poll ships only what is new. It counts lines
+        ever emitted, including dropped ones, so the offset stays meaningful after
+        the buffer has wrapped."""
+        with self._lock:
+            emitted = self.dropped + len(self.log)
+            since = max(0, min(int(since or 0), emitted))
+            start = max(0, since - self.dropped)
+            return {
+                "status": self.status, "kind": self.kind,
+                "started": self.started, "finished": self.finished,
+                "elapsed_s": round((self.finished or time.time()) - self.started, 1)
+                             if self.started else None,
+                "total": self.total, "done": len(self.rows),
+                "cancelling": self._cancel.is_set() and self.status == "running",
+                "rows": list(self.rows),
+                "log": list(self.log)[start:], "log_next": emitted,
+                "log_dropped": self.dropped,
+                "error": self.error, "result": self.result,
+            }
+
+    # -- control --------------------------------------------------------------
+    def start(self, kind, fn):
+        """Run fn(job) on a thread. Returns (ok, message).
+
+        `fn` receives this job so it can call `_append`, `_add_row`, `set_total`
+        and `cancelled`."""
+        with self._lock:
+            if self.running:
+                return False, "a %s is already running" % (self.kind or "job")
+            self.reset()
+            self.status = "running"
+            self.kind = kind
+            self.started = time.time()
+
+        def run():
+            try:
+                res = fn(self)
+                with self._lock:
+                    self.result = res
+                    # A run that was asked to stop reports `cancelled` even though
+                    # it returned normally - it did, that is what cooperative
+                    # cancellation looks like - so the UI does not claim a partial
+                    # campaign finished.
+                    self.status = "cancelled" if self._cancel.is_set() else "done"
+            except Exception as e:
+                with self._lock:
+                    self.error = "%s: %s" % (type(e).__name__, e)
+                    self.status = "failed"
+                self._append("FAILED: %s" % self.error)
+            finally:
+                with self._lock:
+                    self.finished = time.time()
+
+        # daemon: Ctrl+C on the server should not be held hostage by a sweep with
+        # an hour left to run. The rows already written are on disk and keyed, so
+        # nothing is lost by dying here.
+        self._thread = threading.Thread(target=run, name="vramplanner-%s" % kind,
+                                        daemon=True)
+        self._thread.start()
+        return True, "started"
+
+    def cancel(self):
+        with self._lock:
+            if not self.running:
+                return False, "nothing running"
+            self._cancel.set()
+        self._append("stop requested - finishing the config in flight first, so the "
+                     "row it is measuring is complete rather than half-written")
+        return True, "stopping"
+
+
+# The singleton. Module-level because the HTTP handler is instantiated per
+# request and has nowhere else to keep it.
+JOB = Job()

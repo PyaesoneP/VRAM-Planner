@@ -1,7 +1,7 @@
 """Version, byte units, and the MiB helper every other module uses."""
 
 
-__version__ = "1.3.0"
+__version__ = "1.5.0"
 
 
 MiB = 1024 * 1024

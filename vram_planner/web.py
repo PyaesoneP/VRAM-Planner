@@ -87,6 +87,168 @@ class Handler(BaseHTTPRequestHandler):
                                 "all_layers": bool((rt or {}).get("all_layers"))}})
         return out
 
+    # -- speed sweep ---------------------------------------------------------
+    # bench/sweep are imported inside these handlers, not at module scope: they
+    # pull in the subprocess machinery, and starting the web UI should not.
+
+    def _speed_args(self, data):
+        """The subset of --speed-sweep's arguments the UI exposes.
+
+        ctx and kv come straight off the main form, because the settings you are
+        planning for are the ones worth measuring - they are --speed-ctx and
+        --speed-kv, which freeze those axes instead of sweeping them."""
+        def as_int(k, default=None):
+            v = data.get(k)
+            return int(v) if v not in (None, "", False) else default
+        path = data.get("path") or ""
+        return {
+            "models": [path] if path and os.path.exists(path) else None,
+            "stages": (data.get("stages") or "abcd").lower(),
+            "ctx": as_int("context"), "kv": data.get("kv_type") or None,
+            "fill": as_int("fill"), "limit": as_int("limit"),
+            "n_predict": as_int("n_predict", 128), "repeat": as_int("repeat", 3),
+            "timeout": float(data.get("timeout") or 420.0),
+            # Chained is the UI's default: it costs the same hours and measures
+            # each knob at the split that won rather than at the planner's guess.
+            "chain": bool(data.get("chain", True)),
+            "rounds": max(1, as_int("rounds", 1) or 1),
+        }
+
+    def _speed_start(self, data):
+        from .bench import preflight_state, speed_sweep
+        from .job import JOB
+        if JOB.running:
+            return {"ok": False, "running": True,
+                    "error": "A sweep is already running. One at a time: a campaign "
+                             "owns the GPU, so two at once would not be slower, they "
+                             "would both be wrong."}
+        st = preflight_state()
+        if not st["ok"]:
+            return {"ok": False, "preflight": st, "error": st["reason"]}
+        kw = self._speed_args(data)
+        if not kw["models"]:
+            return {"ok": False, "error": "No such model file: %s" % (data.get("path") or "")}
+
+        def work(job):
+            # skip_preflight: already checked above, and re-reading it here would
+            # race against the driver still releasing memory.
+            return speed_sweep(log=job._append, on_row=job._add_row,
+                               should_stop=job.cancelled, on_total=job.set_total,
+                               skip_preflight=True, **kw)
+
+        ok, msg = JOB.start("speed sweep", work)
+        return {"ok": ok, "error": None if ok else msg, "preflight": st}
+
+    def _speed_plan(self, data):
+        from .bench import speed_sweep
+        kw = self._speed_args(data)
+        if not kw["models"]:
+            return {"ok": False, "error": "No such model file: %s" % (data.get("path") or "")}
+        lines = []
+        try:
+            res = speed_sweep(dry_run=True, log=lines.append, **kw)
+        except Exception as e:
+            return {"ok": False, "error": "%s: %s" % (type(e).__name__, e)}
+        if not res:
+            return {"ok": False, "error": "\n".join(lines) or "could not build a grid"}
+        res.update({"ok": True, "log": lines})
+        return res
+
+    def _resolve_model(self, data):
+        """(path, resolved) for a script request.
+
+        Speed rows record a model's BASENAME, not a path, so a script built from
+        an old campaign - or one measured on another machine - has nothing to open
+        directly. Look the name up under the models folder; failing that, hand back
+        the name itself and say it did not resolve. Refusing outright would be the
+        wrong call: the flags are the valuable part of a launcher and the path is
+        one edit."""
+        path = data.get("path") or ""
+        if path and os.path.exists(path):
+            return path, True
+        name = data.get("model_name") or (os.path.basename(path) if path else "")
+        if name:
+            root = data.get("dir") or default_models_dir()
+            try:
+                for m in scan_models(root) or []:
+                    if os.path.basename(m.get("path") or "") == name:
+                        return m["path"], True
+            except Exception:
+                pass
+        return (path or name or ""), False
+
+    def _script(self, data):
+        from .launch import LOAD_MODES, SHELLS, default_shell, launch_script, script_name
+        path, resolved = self._resolve_model(data)
+        c = data.get("config") or {}
+        if not c:
+            return {"ok": False, "error": "no config"}
+        shell = data.get("shell") or default_shell()
+        if shell not in SHELLS:
+            return {"ok": False, "error": "unknown shell: %s" % shell}
+        load_mode = data.get("load_mode") or "none"
+        if load_mode not in LOAD_MODES:
+            return {"ok": False, "error": "unknown load mode: %s" % load_mode}
+        # The UI knows whether the plan includes the projector, but not where it
+        # is - analyze() reports its name and size, not its path. `true` means
+        # "find it", which is the same rule the sweep uses.
+        mmproj = data.get("mmproj")
+        if mmproj is True:
+            from .bench import find_mmproj_for
+            mmproj = find_mmproj_for(path) if os.path.exists(path) else None
+        try:
+            text = launch_script(
+                path, c, mmproj=mmproj or None, shell=shell,
+                sampling=data.get("sampling") or None,
+                port=int(data.get("port") or 8080),
+                bind_host=data.get("bind_host") or "127.0.0.1",
+                load_mode=load_mode, measured=data.get("measured") or None,
+                chat_template_file=data.get("chat_template_file") or None,
+                chat_template_kwargs=data.get("chat_template_kwargs") or None,
+                path_resolved=resolved)
+        except ValueError as e:
+            # Raised by template_args() for kwargs that are not a JSON object.
+            # It is the user's typo, not a crash, so it reads as a message.
+            return {"ok": False, "error": str(e)}
+        except Exception as e:
+            return {"ok": False, "error": "%s: %s" % (type(e).__name__, e)}
+        return {"ok": True, "text": text, "shell": shell, "path": path,
+                "path_resolved": resolved, "filename": script_name(path, shell)}
+
+    def _script_save(self, data):
+        """Write the script and report where it went.
+
+        Next to the model by default: on Windows a browser download lands in
+        Downloads/ with a .ps1 that then trips execution policy, and the model
+        folder is somewhere the user already knows. Falls back to the tool's own
+        data directory when that folder is not writable."""
+        res = self._script(data)
+        if not res.get("ok"):
+            return res
+        # The RESOLVED path: a script built from an old row may name a model this
+        # request never sent a path for, and saving beside it is still right when
+        # the lookup found it.
+        path = res.get("path") if res.get("path_resolved") else ""
+        cands = []
+        if path and os.path.isdir(os.path.dirname(os.path.abspath(path))):
+            cands.append(os.path.dirname(os.path.abspath(path)))
+        cands.append(_data_dir())
+        for d in cands:
+            dest = os.path.join(d, res["filename"])
+            try:
+                with open(dest, "w", encoding="utf-8", newline="\n") as f:
+                    f.write(res["text"])
+                if res["shell"] == "bash":
+                    try:
+                        os.chmod(dest, 0o755)
+                    except OSError:
+                        pass       # no chmod on Windows; the text is what matters
+                res["saved"] = dest
+                return res
+            except OSError as e:
+                res["error"] = "could not write %s: %s" % (dest, e)
+        return {"ok": False, "error": res.get("error") or "could not write the script"}
+
     def _send(self, code, body, ctype="application/json"):
         if isinstance(body, (dict, list)):
             body = json.dumps(body).encode("utf-8")
@@ -118,6 +280,64 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, res)
         if u.path == "/api/bandwidth":
             return self._send(200, get_bandwidth())
+        if u.path == "/api/speed/preflight":
+            from .bench import preflight_state
+            return self._send(200, preflight_state())
+        if u.path == "/api/speed/status":
+            from .job import JOB
+            q = parse_qs(u.query)
+            return self._send(200, JOB.snapshot(since=int((q.get("since") or ["0"])[0])))
+        if u.path == "/api/speed/rows":
+            # Ranked history, with no job ever having run in this process - a
+            # campaign from last week is exactly as usable as one from this hour.
+            from .bench import bench_dir, load_speed_rows, rank_rows
+            q = parse_qs(u.query)
+            name = (q.get("model") or [""])[0]
+            rows = load_speed_rows()
+            if name:
+                rows = [r for r in rows if r.get("model") == name]
+            return self._send(200, {"rows": rank_rows(rows), "dir": bench_dir(),
+                                    "n_all": len(rows)})
+        if u.path == "/api/speed/history":
+            # Every campaign on disk, with no model argument and nothing analyzed:
+            # hours already spent should be readable the moment the page opens.
+            from .bench import bench_dir, load_speed_rows, sweep_index
+            rows = load_speed_rows()
+            return self._send(200, {"ok": True, "campaigns": sweep_index(rows),
+                                    "dir": bench_dir(), "n_rows": len(rows)})
+        if u.path == "/api/speed/insights":
+            from .bench import insights, load_speed_rows
+            q = parse_qs(u.query)
+            get = lambda k: (q.get(k) or [""])[0]
+            rows = load_speed_rows()
+            # Filter BEFORE analysing, not after: the whole correctness of
+            # axis_effects() is that rows from different experiments never meet,
+            # and narrowing to one campaign is the strongest form of that.
+            for key, field in (("model", "model"), ("gpu", "gpu"), ("file", "_file")):
+                v = get(key)
+                if v:
+                    rows = [r for r in rows if r.get(field) == v]
+            if not rows:
+                return self._send(200, {"ok": False, "error": "no rows match"})
+            res = insights(rows)
+            res["ok"] = True
+            return self._send(200, res)
+        if u.path == "/api/templates":
+            # A browser <input type=file> cannot hand back a real path, so the
+            # field is a text box - and typing an absolute Windows path by hand is
+            # the entire friction this list removes.
+            q = parse_qs(u.query)
+            path = (q.get("path") or [""])[0]
+            d = os.path.dirname(os.path.abspath(path)) if path else ""
+            found = []
+            if d and os.path.isdir(d):
+                try:
+                    for fn in sorted(os.listdir(d)):
+                        if fn.lower().endswith((".jinja", ".jinja2", ".j2")):
+                            found.append(os.path.join(d, fn))
+                except OSError:
+                    pass
+            return self._send(200, {"ok": True, "dir": d, "templates": found})
         if u.path == "/api/speedhistory":
             q = parse_qs(u.query)
             recs = scan_speed_history()
@@ -142,10 +362,15 @@ class Handler(BaseHTTPRequestHandler):
                                     "calibration": calibration_status()})
         if u.path == "/api/system":
             fresh = parse_qs(u.query).get("fresh", ["0"])[0] == "1"
+            from .launch import LOAD_MODES, SHELLS, default_shell
             return self._send(200, {"gpus": get_gpus(fresh=fresh), "ram": get_ram(),
                                     "default_dir": default_models_dir(),
                                     "version": __version__,
-                                    "platform": platform_support()})
+                                    "platform": platform_support(),
+                                    # which launcher this machine actually runs -
+                                    # the browser cannot tell reliably
+                                    "shell": default_shell(), "shells": list(SHELLS),
+                                    "load_modes": list(LOAD_MODES)})
         if u.path == "/api/models":
             q = parse_qs(u.query)
             d = (q.get("dir", [""])[0]) or default_models_dir()
@@ -169,15 +394,29 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         u = urlparse(self.path)
-        if u.path not in ("/api/analyze", "/api/calibrate"):
+        POSTS = ("/api/analyze", "/api/calibrate", "/api/script", "/api/script/save",
+                 "/api/speed/plan", "/api/speed/start", "/api/speed/stop")
+        if u.path not in POSTS:
             return self._send(404, {"error": "not found"})
         try:
             n = int(self.headers.get("Content-Length", 0))
-            data = json.loads(self.rfile.read(n).decode("utf-8"))
+            data = json.loads(self.rfile.read(n).decode("utf-8")) if n else {}
         except Exception as e:
             return self._send(200, {"ok": False, "error": "bad request: %s" % e})
         if u.path == "/api/calibrate":
             return self._send(200, self._calibrate(data))
+        if u.path == "/api/script":
+            return self._send(200, self._script(data))
+        if u.path == "/api/script/save":
+            return self._send(200, self._script_save(data))
+        if u.path == "/api/speed/plan":
+            return self._send(200, self._speed_plan(data))
+        if u.path == "/api/speed/start":
+            return self._send(200, self._speed_start(data))
+        if u.path == "/api/speed/stop":
+            from .job import JOB
+            ok, msg = JOB.cancel()
+            return self._send(200, {"ok": ok, "message": msg})
         try:
             path = data["path"]
             # A missing file is not an error when we have a card for it - that is

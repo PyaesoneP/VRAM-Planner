@@ -219,7 +219,7 @@ def gpu_side(buffers):
 # ---------------------------------------------------------------------------
 # Running one config
 # ---------------------------------------------------------------------------
-def build_argv(exe, model_path, c, port):
+def build_argv(exe, model_path, c, port, probe=True, host="127.0.0.1"):
     """The full command line for one config.
 
     -fa takes on|off|auto in current builds, not a bare boolean, and passing it as
@@ -229,16 +229,26 @@ def build_argv(exe, model_path, c, port):
     default, so a config written by build_grid() produces exactly the command line
     it always did. The extras exist for bench.py, which measures generation rather
     than allocation and therefore needs the projector, the speculation flags, and
-    a warmup pass."""
+    a warmup pass.
+
+    `probe` distinguishes the two callers. True - the default, and what the sweep
+    and the bench both use - adds the three flags that make a run measurable and
+    would be wrong in a daily driver: `-v` and `--cache-ram 0` so the log can be
+    parsed and the host-side prompt cache cannot flatter a repeat pass, plus
+    `--no-warmup` unless the config asked for one. False is for launch.py, which
+    emits a command a person will actually live with. This is the single source of
+    truth for flag spelling either way; a second copy would drift, and the flags
+    most worth getting right here are exactly the ones that changed names."""
     av = [exe, "-m", model_path,
           "-c", str(c["ctx"]), "-ub", str(c["ub"]), "-np", str(c["seq"]),
           "-ngl", str(c["ngl"]),
           "-fa", "on" if c["fa"] else "off",
           "-ctk", c["kv"], "-ctv", c["kv"],
-          "--host", "127.0.0.1", "--port", str(port),
-          "--cache-ram", "0",     # host-side prompt cache; noise for our purposes
-          "-v"]
-    if not c.get("warmup"):
+          "--host", host, "--port", str(port)]
+    if probe:
+        av += ["--cache-ram", "0",   # host-side prompt cache; noise for our purposes
+               "-v"]
+    if probe and not c.get("warmup"):
         # right for an allocation probe - we want the allocation, not a generated
         # token - and wrong for a speed one, where the first generation would
         # otherwise pay for lazily-loaded kernels
@@ -503,6 +513,7 @@ def model_facts(path):
     cfg = extract_config(load_gguf(path))
     return {"arch": cfg.get("arch") or "", "n_layers": cfg.get("n_layers") or 0,
             "n_ctx_train": cfg.get("n_ctx_train") or 0, "is_moe": bool(cfg.get("n_expert")),
+            "n_mtp_layers": cfg.get("n_mtp_layers") or 0,
             "hidden": cfg.get("hidden") or 0}
 
 
@@ -585,7 +596,13 @@ def _key(model, c):
             c["kv"], c.get("ncmoe") or 0,
             c.get("spec") or "none", c.get("spec_n_max") or 0,
             bool(c.get("mmproj")), c.get("mmproj_offload") is not False,
-            c.get("fill") or 0)
+            c.get("fill") or 0,
+            # sampler settings change what a SPECULATIVE row measures - greedy is
+            # speculation's best case - so a row taken under different ones is a
+            # different measurement, not the same one already done
+            float(c.get("temp") or 0), int(c.get("top_k") or 0),
+            float(c.get("top_p") if c.get("top_p") is not None else 1.0),
+            float(c.get("min_p") or 0))
 
 
 def load_rows(path):
@@ -639,6 +656,8 @@ def parse_overrides(specs):
                     vals.append(x)
                 elif k in ("fa", "mmproj_offload", "warmup"):
                     vals.append(x not in ("0", "off", "false"))
+                elif k in ("temp", "top_p", "min_p", "rep_pen", "pres_pen"):
+                    vals.append(float(x))
                 else:
                     vals.append(int(x))
             if vals:

@@ -22,8 +22,8 @@ filter. compute.py has no term for a draft cache, so those megabytes would be
 absorbed into `floor` and `ctx` and quietly corrupt every future plan. Same
 format, same resume discipline, different tree.
 """
-import json, os, re, statistics, time, urllib.error, urllib.request
-from .gpu import gpu_list
+import datetime, json, os, re, statistics, time, urllib.error, urllib.request
+from .gpu import get_gpu_processes, gpu_list
 from .lmstudio import default_models_dir
 from .paths import _data_dir
 from .sweep import (build_argv, discover_models, finish_row, model_facts,
@@ -147,10 +147,29 @@ def build_prompt(url, fill_tokens, timeout=120):
     return best + INSTRUCTION, repeated
 
 
-def generate(url, prompt, n_predict=N_PREDICT, timeout=1800, cache_prompt=False):
+def sampling_of(c):
+    """The sampler settings for one config, defaulting to greedy.
+
+    Greedy is the right DEFAULT because it makes the token stream reproducible
+    across configs, so two rows differ by the setting under test and nothing
+    else. It is the wrong thing to draw conclusions from when the question is
+    speculative decoding: llama.cpp accepts a draft token when the target's own
+    sampled token matches it, and under greedy that comparison is deterministic.
+    Greedy is therefore speculation's best case, and an acceptance rate measured
+    there is an upper bound on the one you will actually see. Sweep the real
+    sampler settings before believing a speculative number."""
+    return {"temperature": float(c.get("temp", 0) or 0),
+            "top_k": int(c.get("top_k", 0) or 0),
+            "top_p": float(c.get("top_p", 1.0) if c.get("top_p") is not None else 1.0),
+            "min_p": float(c.get("min_p", 0) or 0),
+            "repeat_penalty": float(c.get("rep_pen", 1.0) if c.get("rep_pen") is not None else 1.0),
+            "presence_penalty": float(c.get("pres_pen", 0) or 0)}
+
+
+def generate(url, prompt, n_predict=N_PREDICT, timeout=1800, cache_prompt=False,
+             sampling=None, seed=None):
     """One generation.
 
-    temperature 0 makes the token stream reproducible across configs, and
     ignore_eos pins the work at exactly n_predict tokens - without it the model
     stops when it wants to and tok/s ends up measured over a handful of tokens,
     which is noise.
@@ -164,10 +183,14 @@ def generate(url, prompt, n_predict=N_PREDICT, timeout=1800, cache_prompt=False)
     is the only thing that EXPLAINS a speculative result rather than just
     reporting it. Storing the dict whole means we get those whether or not a
     given build populates them."""
-    d = _post(url, "/completion", {
-        "prompt": prompt, "n_predict": int(n_predict), "temperature": 0,
-        "ignore_eos": True, "cache_prompt": bool(cache_prompt), "stream": False},
-        timeout)
+    body = {"prompt": prompt, "n_predict": int(n_predict),
+            "ignore_eos": True, "cache_prompt": bool(cache_prompt), "stream": False}
+    body.update(sampling or {"temperature": 0})
+    if seed is not None:
+        # A fixed seed per repeat makes a sampled run reproducible, so the three
+        # passes vary by nothing at all and the median means something.
+        body["seed"] = int(seed)
+    d = _post(url, "/completion", body, timeout)
     # A sample of what was actually generated. Not decoration: with temperature 0
     # and ignore_eos the model can fall into a repetition loop, and a repetition
     # loop is precisely what n-gram speculation predicts perfectly - so a
@@ -176,6 +199,7 @@ def generate(url, prompt, n_predict=N_PREDICT, timeout=1800, cache_prompt=False)
     # checkable after the fact instead of a suspicion.
     txt = d.get("content") or ""
     return {"timings": d.get("timings") or {},
+            "seed": seed,
             "tokens_predicted": d.get("tokens_predicted"),
             "tokens_evaluated": d.get("tokens_evaluated"),
             "sample": txt[:600],
@@ -226,12 +250,14 @@ def bench_one(backend, model_path, c, port=BENCH_PORT, timeout=420.0,
                 prompt, repeated = build_prompt(srv.url, c.get("fill") or 0)
                 row["prompt_tokens"] = n_tokens(srv.url, prompt)
                 row["corpus_repeated"] = bool(repeated)
+                samp = sampling_of(c)
+                row["sampling"] = samp
                 cold = generate(srv.url, prompt, min(16, n_predict), gen_timeout,
-                                cache_prompt=False)
+                                cache_prompt=False, sampling=samp, seed=1000)
                 row["cold"] = cold
                 runs = [generate(srv.url, prompt, n_predict, gen_timeout,
-                                 cache_prompt=True)
-                        for _ in range(max(1, repeat))]
+                                 cache_prompt=True, sampling=samp, seed=1000 + i)
+                        for i in range(max(1, repeat))]
                 row["runs"] = runs
                 dec = [r["timings"].get("predicted_per_second") for r in runs]
                 dec = [x for x in dec if x]
@@ -287,7 +313,84 @@ SPEED_BASE = {"ctx": 131072, "kv": "q8_0", "fa": True, "seq": 1, "ub": 512,
 # Stage A finds the wall, and the stages after it start from what A found. That
 # ordering is the whole design: an ngl that spills makes every later comparison a
 # comparison of spill behaviour.
-STAGE_A_NGL = [26, 28, 30, 31, 32, 33, 34]
+#
+# The rungs are derived from the planner rather than fixed, because a fixed ladder
+# is only ever right for the model it was written against. planner_ngl() asks
+# plan.analyze() where the layers land for THIS model on THIS card, and the ladder
+# brackets that: a few rungs below it, and enough above to find the real wall,
+# since the planner is deliberately conservative and the measured ceiling is
+# normally higher than it predicts.
+NGL_BELOW, NGL_ABOVE = 2, 6
+
+
+def planner_split(model_path, c):
+    """Where the planner thinks the split falls, for seeding the ladder.
+
+    Returns (n_gpu_layers, n_cpu_moe). The second only means anything on an MoE,
+    and on an MoE it is the one that matters - see ngl_ladder().
+
+    Imported here rather than at module scope only to keep the cost off the path
+    of callers that never build a grid; plan sits above bench in the DAG, so the
+    direction is fine."""
+    from .plan import analyze                      # plan is above bench in the DAG
+    from .gpu import get_gpus, get_ram
+    try:
+        g = (get_gpus() or [{}])[0]
+        ram = get_ram() or {}
+        # TOTAL, not free. The grid is built now and run later, and preflight()
+        # refuses to run it unless the card is essentially empty - so free VRAM at
+        # build time is transient state that has nothing to do with the conditions
+        # the rows will be measured under. Seeding off it produces a garbage ladder
+        # whenever anything happens to be loaded, which is exactly when someone is
+        # most likely to be planning their next sweep.
+        r = analyze(model_path, int(c["ctx"]), c["kv"], int(c["ub"]), bool(c["fa"]),
+                    vram_budget_mib=float(g.get("total_mib") or 0),
+                    ram_budget_mib=float(ram.get("total_mib") or 0),
+                    gpu_reserve_mib=512, compute_override_mib=None, safety_pct=5,
+                    n_seq=int(c.get("seq") or 1),
+                    include_mmproj=(c.get("mmproj_offload") is not False),
+                    mtp_spec=bool(c.get("spec") == "draft-mtp"))
+        pl = r.get("plan") or {}
+        n = pl.get("n_gpu_layers")
+        return (int(n) if n is not None else None,
+                int(pl.get("n_cpu_moe") or 0))
+    except Exception:
+        return None, None
+
+
+def ngl_ladder(model_path, c, n_layers, is_moe=False):
+    """The stage-A ladder, and which axis it walks.
+
+    On a DENSE model the axis is -ngl: whole blocks move together, and the wall is
+    the largest count that fits.
+
+    On an MoE it is --n-cpu-moe, and -ngl is pinned at every block. The two knobs
+    are not interchangeable and the difference is most of the model:
+      * -ngl N       puts the last N blocks on the GPU - attention, KV and experts
+                     together.
+      * --n-cpu-moe M moves only the ROUTED EXPERTS of the first M blocks to the
+                     CPU, leaving their attention and KV in VRAM.
+    Experts are the only weights big enough to be worth moving (92% of the file on
+    Qwen3.6-35B-A3B) and only n_expert_used of n_expert fire per token, so exiling
+    them costs far less per token than exiling whole blocks - while whole-block
+    offload drags KV to the CPU with it, which is the expensive thing to lose.
+    Laddering -ngl on an MoE therefore measures the fallback strategy and never
+    finds the good configuration at all.
+
+    Lower n_cpu_moe means more experts resident, so here the wall is the SMALLEST
+    value that fits and the ladder mostly walks downward from the planner's seed."""
+    seed_ngl, seed_ncm = planner_split(model_path, c)
+    if is_moe:
+        if seed_ncm is None:
+            seed_ncm = max(1, int(n_layers * 0.5))
+        lo = max(0, seed_ncm - NGL_ABOVE)          # fewer on CPU = faster, if it fits
+        hi = min(n_layers, seed_ncm + NGL_BELOW)
+        return list(range(lo, hi + 1)), seed_ncm
+    if seed_ngl is None:
+        seed_ngl = max(1, int(n_layers * 0.4))     # nothing better to go on
+    lo = max(0, seed_ngl - NGL_BELOW)
+    hi = min(n_layers, seed_ngl + NGL_ABOVE)
+    return list(range(lo, hi + 1)), seed_ngl
 
 STAGE_C_UB = [256, 512, 1024, 2048]
 
@@ -296,44 +399,214 @@ STAGE_D_SPEC = [("none", 0), ("draft-mtp", 1), ("draft-mtp", 2), ("draft-mtp", 3
                 ("ngram-simple", 0)]
 
 
-def build_speed_grid(facts, mmproj=None, base=None, stages="abcd"):
-    """The staged grid, one knob at a time from a baseline.
+def grid_context(facts, mmproj=None, base=None, model_path=None, carried=None):
+    """(baseline config, n_layers, is_moe, stage-A ladder) - what every stage needs.
 
-    Deliberately not a cross product - the same reasoning as sweep.build_grid,
-    where a confounded design fitted a coefficient at 9x its prior. Here the cost
-    is worse than a bad fit: a cross product of these axes is hundreds of loads
-    at roughly two minutes each."""
+    Split out of build_speed_grid() so a chained campaign can rebuild it between
+    stages against a baseline it has actually MEASURED, rather than against the
+    planner's opening guess.
+
+    `carried` is such a baseline. When given it supplies the starting config and
+    re-centres the ladder on the split that won, instead of on the planner's seed.
+    That matters most in a second round: with speculation switched on, the draft
+    cache costs VRAM the planner priced under different assumptions, so the wall
+    genuinely moves and the ladder has to move with it."""
     b = dict(base or SPEED_BASE)
     if mmproj:
         b["mmproj"] = mmproj
     nl = facts.get("n_layers") or 65
-    cfgs, seen = [], set()
+    # A context past what the model was trained on is not a config, it is a bad
+    # request - and a staged grid carries a default context belonging to whichever
+    # model it was last used against.
+    trained = facts.get("n_ctx_train") or 0
+    if trained and b.get("ctx", 0) > trained:
+        b["ctx"] = trained
+    is_moe = bool(facts.get("is_moe"))
+    rungs, seed = ngl_ladder(model_path, b, nl, is_moe) if model_path else (
+        [min(v, nl) for v in range(max(1, nl // 3), min(nl, nl // 2 + 4))], None)
+    if is_moe:
+        # Every block on the GPU; the expert split is what varies. Stages C/D then
+        # sit at the planner's n_cpu_moe rather than at some layer count.
+        b["ngl"] = nl
+        if seed is not None:
+            b["ncmoe"] = min(seed, nl)
+    elif seed:
+        b["ngl"] = min(seed, nl)      # stages C/D sit at the planner's split
+    if carried:
+        for k, v in carried.items():
+            if k != "stage":
+                b[k] = v
+        # Same asymmetry as ngl_ladder(): on an MoE the wall is the SMALLEST
+        # n_cpu_moe that fits, so the ladder reaches further down than up.
+        if is_moe:
+            c0 = int(carried.get("ncmoe") or 0)
+            rungs = list(range(max(0, c0 - NGL_ABOVE), min(nl, c0 + NGL_BELOW) + 1))
+        else:
+            n0 = int(carried.get("ngl") or 0)
+            rungs = list(range(max(0, n0 - NGL_BELOW), min(nl, n0 + NGL_ABOVE) + 1))
+    return b, nl, is_moe, rungs
+
+
+def stage_configs(letter, b, nl, is_moe, rungs, mmproj=None, facts=None):
+    """The configs one stage varies, from the baseline it is handed.
+
+    One knob at a time, deliberately - the same reasoning as sweep.build_grid,
+    where a confounded design fitted a coefficient at 9x its prior. Here the cost
+    is worse than a bad fit: a cross product of these axes is hundreds of loads at
+    roughly two minutes each."""
+    facts = facts or {}
+    out = []
 
     def add(**kw):
         c = dict(b)
         c.update(kw)
-        c["ngl"] = min(c["ngl"], nl)
+        c["ngl"] = max(0, min(c["ngl"], nl))
+        out.append(c)
+
+    if letter == "a":
+        for v in rungs:
+            add(ncmoe=v, stage="A") if is_moe else add(ngl=v, stage="A")
+    elif letter == "b" and mmproj:
+        # The projector can sit in system RAM instead. Text decode is unaffected,
+        # so those megabytes come back as GPU blocks without giving up images -
+        # which means the ceiling moves up, so the ladder has to reach higher.
+        if is_moe:
+            # The freed megabytes buy back EXPERTS here, not blocks, so the ladder
+            # walks down from the seed rather than up.
+            for v in range(max(0, rungs[0] - NGL_ABOVE), rungs[-1] + 1):
+                add(ncmoe=v, mmproj_offload=False, stage="B")
+        else:
+            for v in range(rungs[0], min(nl, rungs[-1] + NGL_ABOVE) + 1):
+                add(ngl=v, mmproj_offload=False, stage="B")
+    elif letter == "c":
+        for v in STAGE_C_UB:
+            add(ub=v, stage="C")
+    elif letter == "d":
+        # draft-mtp needs nextn blocks in the file. Without them llama.cpp has
+        # nothing to draft from, so those rows are four wasted loads that all fail
+        # the same way - and the n-gram variants, which need nothing, are the only
+        # speculation such a model can use.
+        has_mtp = bool(facts.get("n_mtp_layers"))
+        for sp, nmax in STAGE_D_SPEC:
+            if sp == "draft-mtp" and not has_mtp:
+                continue
+            add(spec=sp, spec_n_max=nmax, stage="D")
+    return out
+
+
+def _dedupe(cfgs, seen=None):
+    """Drop configs already produced, by full value. `seen` carries across calls."""
+    seen = set() if seen is None else seen
+    out = []
+    for c in cfgs:
         k = tuple(sorted((str(x), str(y)) for x, y in c.items()))
         if k not in seen:
             seen.add(k)
-            cfgs.append(c)
+            out.append(c)
+    return out
 
-    if "a" in stages:
-        for v in STAGE_A_NGL:
-            add(ngl=v, stage="A")
-    if "b" in stages and mmproj:
-        # The projector can sit in system RAM instead. Text decode is unaffected,
-        # so this is 885 MiB of VRAM back - several blocks - without giving up
-        # images. Climb ngl again from where A ended, since the ceiling moved.
-        for v in STAGE_A_NGL[1:] + [35, 36]:
-            add(ngl=v, mmproj_offload=False, stage="B")
-    if "c" in stages:
-        for v in STAGE_C_UB:
-            add(ub=v, stage="C")
-    if "d" in stages:
-        for sp, nmax in STAGE_D_SPEC:
-            add(spec=sp, spec_n_max=nmax, stage="D")
+
+def build_speed_grid(facts, mmproj=None, base=None, stages="abcd", model_path=None):
+    """The whole staged grid, one knob at a time from one fixed baseline.
+
+    Stages C and D are pinned at the planner's ngl rather than at whatever stage A
+    turns out to find, because nothing here can know stage A's result before stage
+    A has run. That is what `chain=True` in speed_sweep() fixes, by building the
+    stages one at a time instead of all at once; this function stays as the
+    unchained grid and as the size the estimate is computed from."""
+    b, nl, is_moe, rungs = grid_context(facts, mmproj, base, model_path)
+    cfgs, seen = [], set()
+    for letter in "abcd":
+        if letter in stages:
+            cfgs.extend(_dedupe(
+                stage_configs(letter, b, nl, is_moe, rungs, mmproj, facts), seen))
     return cfgs
+
+
+# ---------------------------------------------------------------------------
+# Chaining: what one stage hands to the next
+# ---------------------------------------------------------------------------
+# A challenger has to beat the incumbent by more than this to take over as the
+# baseline. tok_s is a median of `repeat` passes, so a 1% lead is jitter, and
+# rebasing on jitter makes the campaign's PATH depend on noise rather than on
+# anything it measured - the same grid would then explore different configs on
+# two runs of the same machine.
+CHAIN_MARGIN = 0.02
+
+# What carries forward. Not ctx / kv / fill / seq / fa: those are frozen by the
+# form and are the campaign's definition rather than any of its results. Not
+# `stage`, which is a label.
+CARRY_KEYS = ("ngl", "ncmoe", "ub", "mmproj_offload", "spec", "spec_n_max")
+
+
+def trustworthy(r):
+    """May a conclusion be drawn from this row?
+
+    A spilled row loaded and reported `ok`: WDDM put part of it in shared system
+    memory instead of failing, so its speed is off a cliff for a reason that has
+    nothing to do with the setting under test. A looping row generated the same
+    eight-word window over and over, which is not work.
+
+    Both still belong in the TABLE - they are evidence about where the wall is -
+    but neither may be the thing a baseline or an effect size is computed from.
+    Carrying a spilled row forward as a chained baseline would bend every stage
+    after it in the same direction, silently."""
+    if r.get("status") != "ok" or not r.get("tok_s"):
+        return False
+    if r.get("spilled"):
+        return False
+    dr = r.get("distinct_ratio")
+    return not (dr is not None and dr < 0.5)
+
+
+def comparable(r, model, base, n_predict=None, repeat=None):
+    """Was this row measured under the same conditions as the campaign?
+
+    Speed is conditional on all of these, so a row taken at another depth or with
+    another KV quant is not a slower config - it is a different experiment, and
+    treating it as a rival would silently rewrite what the campaign is measuring.
+    A 2k-fill row must never set the baseline for a 32k campaign."""
+    if model and r.get("model") != model:
+        return False
+    if n_predict is not None and r.get("n_predict") != n_predict:
+        return False
+    if repeat is not None and r.get("repeat") != repeat:
+        return False
+    c = r.get("config") or {}
+    return (c.get("ctx") == base.get("ctx")
+            and c.get("kv") == base.get("kv")
+            and (c.get("fill") or 0) == (base.get("fill") or 0)
+            and (c.get("seq") or 1) == (base.get("seq") or 1)
+            and bool(c.get("fa")) == bool(base.get("fa")))
+
+
+def best_config(rows, model, base, n_predict=None, repeat=None,
+                incumbent_tok_s=None, margin=CHAIN_MARGIN):
+    """The baseline for the next stage: (config, row) or (None, None).
+
+    Reads rows that are already on DISK, not just the ones this process has in
+    memory, so a campaign stopped after stage A and restarted tomorrow picks its
+    winner back up instead of falling back to the planner's guess."""
+    cand = [r for r in rows
+            if trustworthy(r) and comparable(r, model, base, n_predict, repeat)]
+    if not cand:
+        return None, None
+    win = max(cand, key=lambda r: r["tok_s"])
+    if incumbent_tok_s and win["tok_s"] <= incumbent_tok_s * (1.0 + margin):
+        return None, None
+    c = dict(base)
+    wc = win.get("config") or {}
+    for k in CARRY_KEYS:
+        if k in wc:
+            c[k] = wc[k]
+    c.pop("stage", None)
+    return c, win
+
+
+def _carry_summary(c):
+    return ("ngl %s ncmoe %s ub %s spec %s"
+            % (c.get("ngl"), c.get("ncmoe") or 0, c.get("ub"),
+               c.get("spec") or "none"))
 
 
 # ---------------------------------------------------------------------------
@@ -347,29 +620,80 @@ def find_mmproj_for(model_path):
     return None
 
 
+def preflight_state(need_free_pct=0.85):
+    """Is the card free enough to measure against, and what is holding it?
+
+    Split out from preflight() so the web UI can render the same verdict without
+    capturing printed text - and so it can NAME the offender, which is the part
+    that makes the block actionable rather than annoying."""
+    g = gpu_list(fresh=True)
+    st = {"ok": True, "gpu": "", "free_mib": None, "total_mib": None,
+          "need_free_pct": need_free_pct, "holders": [], "reason": ""}
+    if not g:
+        # No GPU reading is not a reason to refuse: the sweep can still run, and
+        # a missing nvidia-smi is not evidence that something holds the card.
+        return st
+    st["gpu"] = g[0].get("name") or ""
+    free, total = g[0].get("free_mib") or 0, g[0].get("total_mib") or 0
+    st["free_mib"], st["total_mib"] = free, total
+    if not (total and free < total * need_free_pct):
+        return st
+    procs = get_gpu_processes()
+    if isinstance(procs, list):
+        st["holders"] = [{"name": p.get("name") or "?", "pid": p.get("pid"),
+                          "mib": p.get("mib"), "is_engine": bool(p.get("is_engine"))}
+                         for p in sorted(procs, key=lambda p: -(p.get("mib") or 0))]
+    who = ", ".join("%s (%.0f MiB)" % (h["name"], h["mib"] or 0)
+                    for h in st["holders"][:3])
+    st["ok"] = False
+    st["reason"] = ("Only %.0f of %.0f MiB VRAM is free (%.0f%%). Something is holding "
+                    "the card%s. Every row would be measured against a budget that is "
+                    "not yours." % (free, total, 100.0 * free / total,
+                                    " - %s" % who if who else
+                                    " - LM Studio with a model loaded, most likely"))
+    return st
+
+
 def preflight(log=print, need_free_pct=0.85):
     """Refuse to measure against a card someone else is already using.
 
     LM Studio holding a model resident does not make a run fail - it makes every
     row in the campaign wrong in the same direction, which is worse, because the
     numbers still look like numbers."""
-    g = gpu_list(fresh=True)
-    if not g:
-        return True
-    free, total = g[0].get("free_mib") or 0, g[0].get("total_mib") or 0
-    if total and free < total * need_free_pct:
-        log("Only %.0f of %.0f MiB VRAM is free (%.0f%%). Something is holding the "
-            "card - LM Studio with a model loaded, most likely. Every row would be "
-            "measured against a budget that is not yours.\nClose it and re-run."
-            % (free, total, 100.0 * free / total))
-        return False
-    return True
+    st = preflight_state(need_free_pct)
+    if not st["ok"]:
+        log(st["reason"] + "\nClose it and re-run.")
+    return st["ok"]
 
 
 def speed_sweep(models=None, backend=None, dry_run=False, timeout=420.0,
                 port=BENCH_PORT, limit=None, axes=None, stages="abcd", fill=None,
-                n_predict=N_PREDICT, repeat=N_REPEAT, log=print, skip_preflight=False):
-    """Run the speed grid and append one row per config. Resumable like --sweep."""
+                ctx=None, kv=None,
+                n_predict=N_PREDICT, repeat=N_REPEAT, log=print, skip_preflight=False,
+                on_row=None, should_stop=None, on_total=None,
+                chain=False, rounds=1):
+    """Run the speed grid and append one row per config. Resumable like --sweep.
+
+    `on_row` is called with each finished row, `on_total` when the number of
+    configs to run becomes known, and `should_stop` is checked before each config.
+    All three default to None, so the CLI path is unchanged. They exist for the
+    web UI: it needs structured rows as they land rather than a transcript to
+    scrape, and it needs a way to end a two-hour campaign early.
+
+    Stopping is deliberately BETWEEN configs. Killing a server mid-measurement
+    would write a half-row, and there is no need: rows are resume-keyed by config
+    AND by how they were measured, so a stopped campaign restarted later picks up
+    exactly where it left off instead of re-measuring what it already has.
+
+    `chain=True` turns the grid from one fixed plan into coordinate descent: each
+    stage is built after the previous one has run, against the fastest row
+    measured so far rather than against the planner's opening guess. Same number
+    of loads, so the same hours - but stage C then measures ubatch at the layer
+    split that actually won, instead of at one nothing has confirmed.
+
+    `rounds` re-runs the stages from the winner. It is cheap by construction and
+    needs no special case: _key() does not include the stage letter, so every
+    config a later round revisits unchanged is already recorded and is skipped."""
     b = pick_backend(backend)
     if not b:
         log("No llama-server build found under %s" % backends_dir())
@@ -388,7 +712,12 @@ def speed_sweep(models=None, backend=None, dry_run=False, timeout=420.0,
     base = dict(SPEED_BASE)
     if fill is not None:
         base["fill"] = fill
-    cfgs = build_speed_grid(facts, mmproj=mmproj, base=base, stages=stages)
+    if ctx is not None:
+        base["ctx"] = ctx
+    if kv is not None:
+        base["kv"] = kv
+    cfgs = build_speed_grid(facts, mmproj=mmproj, base=base, stages=stages,
+                            model_path=mp)
     if axes:
         # An explicit ladder replaces the staged grid: this is how a stage gets
         # re-run at the ngl the previous stage actually settled on.
@@ -421,40 +750,159 @@ def speed_sweep(models=None, backend=None, dry_run=False, timeout=420.0,
     log("configs : %d to run, %d already recorded" % (len(plan), skipped))
     log("estimate: ~%.1f h  (load + %d warm + %d x %d tokens per config)"
         % (len(plan) * (60.0 + repeat * n_predict / 4.0) / 3600.0, 16, repeat, n_predict))
+    if chain:
+        log("search  : chained - each stage is built against the fastest row measured")
+        log("          so far, not against the planner's guess%s"
+            % ("" if rounds < 2 else
+               ". %d rounds; a round that revisits a config already recorded skips it"
+               % rounds))
     if dry_run:
-        for c in plan:
-            log("  %-2s ngl %-3d ub %-5d fill %-7d spec %-13s nmax %-2d mmproj %s"
-                % (c.get("stage", "-"), c["ngl"], c["ub"], c.get("fill") or 0,
-                   c.get("spec") or "none", c.get("spec_n_max") or 0,
+        # ctx and kv are printed because they are the settings people FREEZE, and a
+        # frozen setting that silently is not what you think is the whole failure
+        # mode this listing exists to prevent.
+        shown = plan
+        if chain:
+            # Only the first stage can be listed honestly. Its successors are
+            # built from a baseline that does not exist yet, so printing values
+            # for them would be a guess dressed as a plan - and the guess it
+            # would print is exactly the frozen one this mode exists to escape.
+            # The COUNTS are still exact: a ladder's length and the stage C/D
+            # lists do not depend on the baseline, only their values do.
+            first = (stages or "a")[0]
+            shown = [c for c in plan if (c.get("stage") or "").lower() == first]
+        for c in shown:
+            log("  %-2s ctx %-7d kv %-5s ngl %-3d ncmoe %-3d ub %-5d fill %-7d "
+                "spec %-13s nmax %-2d mmproj %s"
+                % (c.get("stage", "-"), c["ctx"], c["kv"], c["ngl"],
+                   c.get("ncmoe") or 0, c["ub"],
+                   c.get("fill") or 0, c.get("spec") or "none",
+                   c.get("spec_n_max") or 0,
                    "vram" if c.get("mmproj_offload") is not False else "ram"))
-        return {"planned": len(plan), "path": path, "dry_run": True}
+        sizes = {}
+        for c in plan:
+            k = (c.get("stage") or "-").lower()
+            sizes[k] = sizes.get(k, 0) + 1
+        if chain and len(shown) < len(plan):
+            log("  .. and %d more in later stages, built from what the ones above find"
+                % (len(plan) - len(shown)))
+        # The config list rides along so the UI can show the same preview the CLI
+        # prints, rather than parsing the lines above back out of a log.
+        return {"planned": len(plan), "path": path, "dry_run": True,
+                "configs": shown, "skipped": skipped, "model": os.path.basename(mp),
+                "backend": b["build"], "gpu": gpu, "arch": facts["arch"],
+                "n_layers": facts["n_layers"],
+                "mmproj": os.path.basename(mmproj) if mmproj else None,
+                "chained": bool(chain), "rounds": int(rounds or 1),
+                "provisional": bool(chain) and len(shown) < len(plan),
+                "stage_sizes": sizes,
+                "estimate_h": round(len(plan) * (60.0 + repeat * n_predict / 4.0)
+                                    / 3600.0, 2)}
     if not skip_preflight and not preflight(log=log):
         return None
 
     log("")
-    log("%-2s %-4s %-5s %-8s %-13s %-4s %-6s | %8s %9s %7s %6s"
-        % ("st", "ngl", "ub", "fill", "spec", "nmax", "mmproj",
+    log("%-2s %-4s %-5s %-5s %-8s %-13s %-4s %-6s | %8s %9s %7s %6s"
+        % ("st", "ngl", "ncmoe", "ub", "fill", "spec", "nmax", "mmproj",
            "tok/s", "prefill", "VRAM", "accept"))
-    out = []
+    out, stopped = [], False
+    total = [len(plan)]                 # a list so run_group can revise it
+    if on_total:
+        on_total(total[0])
+    name = os.path.basename(mp)
+
     with open(path, "a", encoding="utf-8") as fh:
-        for i, c in enumerate(plan, 1):
-            row = bench_one(b, mp, c, port=port, timeout=timeout,
-                            n_predict=n_predict, repeat=repeat, log=log)
-            row.update({"arch": facts["arch"], "n_layers": facts["n_layers"],
-                        "when": int(time.time()), "gpu": gpu})
-            fh.write(json.dumps(row) + "\n")
-            fh.flush()
-            os.fsync(fh.fileno())
-            out.append(row)
-            log(_fmt_row(c, row, i, len(plan)))
+
+        def run_group(cfgs):
+            """Measure a list of configs. Returns False if asked to stop."""
+            for c in cfgs:
+                if should_stop and should_stop():
+                    log("stopped after %d of %d configs. The rows already written "
+                        "are keyed, so re-running resumes here."
+                        % (len(out), total[0]))
+                    return False
+                row = bench_one(b, mp, c, port=port, timeout=timeout,
+                                n_predict=n_predict, repeat=repeat, log=log)
+                row.update({"arch": facts["arch"], "n_layers": facts["n_layers"],
+                            "when": int(time.time()), "gpu": gpu})
+                fh.write(json.dumps(row) + "\n")
+                fh.flush()
+                os.fsync(fh.fileno())
+                out.append(row)
+                # Keep `done` current so a later round skips what this one just
+                # measured, the same way a restarted campaign would.
+                if row.get("status") in ("ok", "oom"):
+                    done.add(_key(name, c))
+                log(_fmt_row(c, row, len(out), total[0]))
+                if on_row:
+                    on_row(row)
+            return True
+
+        if not chain:
+            stopped = not run_group(plan)
+        else:
+            # Coordinate descent. `carried` is the config the fastest trustworthy
+            # comparable row used; `best_tok` is what it did, so a challenger has
+            # to beat it by CHAIN_MARGIN rather than by any amount at all.
+            carried, best_tok = None, None
+            budget = limit
+            seen = set()
+            for rd in range(1, max(1, int(rounds or 1)) + 1):
+                for letter in "abcd":
+                    if letter not in stages:
+                        continue
+                    if budget is not None and budget <= 0:
+                        break
+                    gb, gnl, gmoe, grungs = grid_context(
+                        facts, mmproj=mmproj, base=base, model_path=mp,
+                        carried=carried)
+                    todo = [c for c in _dedupe(
+                                stage_configs(letter, gb, gnl, gmoe, grungs,
+                                              mmproj, facts), seen)
+                            if _key(name, c) not in done]
+                    if budget is not None:
+                        todo = todo[:budget]
+                        budget -= len(todo)
+                    tag = "stage %s" % letter.upper() + (
+                        " round %d" % rd if (rounds or 1) > 1 else "")
+                    if not todo:
+                        log("%s: nothing new to measure at this baseline" % tag)
+                        continue
+                    log("%s: %d config%s at %s"
+                        % (tag, len(todo), "" if len(todo) == 1 else "s",
+                           _carry_summary(gb)))
+                    total[0] = len(out) + len(todo)
+                    if on_total:
+                        on_total(total[0])
+                    if not run_group(todo):
+                        stopped = True
+                        break
+                    # Re-read from DISK, not from `out`: a campaign resumed after a
+                    # stop has rows this process never saw, and they are exactly
+                    # the ones that say where the previous stage got to.
+                    nxt, win = best_config(load_rows(path), name, base,
+                                           n_predict=n_predict, repeat=repeat,
+                                           incumbent_tok_s=best_tok)
+                    if nxt is None:
+                        log("  baseline unchanged: nothing beat %s by more than %.0f%%"
+                            % ("%.2f tok/s" % best_tok if best_tok
+                               else "any trustworthy row", 100 * CHAIN_MARGIN))
+                    else:
+                        carried, best_tok = nxt, win["tok_s"]
+                        log("  baseline -> %s   (%.2f tok/s, stage %s)"
+                            % (_carry_summary(carried), best_tok,
+                               (win.get("config") or {}).get("stage", "?")))
+                if stopped or (budget is not None and budget <= 0):
+                    break
     log("")
     log("%d rows -> %s" % (len(out), path))
-    return {"rows": out, "path": path}
+    return {"rows": out, "path": path, "stopped": stopped, "planned": total[0],
+            "chained": bool(chain)}
 
 
 def _fmt_row(c, row, i=None, n=None):
-    head = ("%-2s %-4d %-5d %-8d %-13s %-4d %-6s | "
-            % (c.get("stage", "-"), c["ngl"], c["ub"], c.get("fill") or 0,
+    head = ("%-2s %-4d %-5d %-5d %-8d %-13s %-4d %-6s | "
+            % (c.get("stage", "-"), c["ngl"], c.get("ncmoe") or 0, c["ub"],
+               c.get("fill") or 0,
                c.get("spec") or "none", c.get("spec_n_max") or 0,
                "vram" if c.get("mmproj_offload") is not False else "ram"))
     if row.get("status") != "ok":
@@ -479,24 +927,363 @@ def load_speed_rows(path=None):
          if f.endswith(".jsonl")] if os.path.isdir(bench_dir()) else [])
     rows = []
     for p in paths:
-        rows.extend(load_rows(p))
+        f = os.path.basename(p)
+        for r in load_rows(p):
+            # The backend BUILD lives only in the filename - nothing writes it
+            # into the row - so without this nothing downstream can tell two
+            # llama.cpp versions apart, and an insight would happily average
+            # across them. Read-only: nothing writes these rows back.
+            r["_file"] = f
+            rows.append(r)
     return rows
+
+
+def rank_rows(rows):
+    """Measured rows, fastest first.
+
+    Ordering only - no formatting - so the CLI report and the web UI rank the same
+    way by construction rather than by two people remembering to."""
+    ok = [r for r in rows if r.get("status") == "ok" and r.get("tok_s")]
+    return sorted(ok, key=lambda r: -(r.get("tok_s") or 0))
+
+
+# ---------------------------------------------------------------------------
+# Turning rows into findings
+#
+# A ranked list says which config won. It does not say what the campaign LEARNED,
+# and those are different: "1024 is the fastest ubatch" is worth much less than
+# "ubatch is worth 6% and speculation is worth 41%", because only the second tells
+# you where the next two hours should go.
+#
+# Everything below is pure - no I/O, no subprocess - so --speed-report and the
+# browser reach the same conclusions by construction rather than by two people
+# remembering to keep them in step.
+# ---------------------------------------------------------------------------
+
+# Every config field that identifies WHICH experiment a row belongs to.
+_CONFIG_KEYS = ("ctx", "kv", "fa", "seq", "ub", "ngl", "ncmoe", "spec",
+                "spec_n_max", "mmproj_offload", "fill")
+
+# (name, label, the config keys this axis owns, natural reference value).
+# The reference is the value the question is really asked against: what
+# speculation bought over NOT speculating is the useful number even on the rare
+# grid where "none" is not the slowest. Where no such value exists - a layer
+# count has no natural zero - the slowest measured value is used instead and is
+# reported as such.
+EFFECT_AXES = (
+    ("ngl", "GPU layers", ("ngl",), None),
+    ("ncmoe", "CPU expert layers", ("ncmoe",), None),
+    ("ub", "ubatch", ("ub",), 512),
+    ("spec", "speculation", ("spec", "spec_n_max"), "none"),
+    ("projector", "projector", ("mmproj_offload",), "VRAM"),
+    ("kv", "KV quant", ("kv",), "f16"),
+)
+
+
+def _axis_value(r, axis):
+    c = r.get("config") or {}
+    if axis == "spec":
+        s = c.get("spec") or "none"
+        n = c.get("spec_n_max") or 0
+        return "%s/%d" % (s, n) if s != "none" else "none"
+    if axis == "projector":
+        return "RAM" if c.get("mmproj_offload") is False else "VRAM"
+    if axis in ("ncmoe", "fill"):
+        return c.get(axis) or 0
+    return c.get(axis)
+
+
+def _control(r, owned=()):
+    """Everything held constant for a comparison along the owned axis.
+
+    This is the whole correctness of axis_effects(). A row from another GPU,
+    another llama.cpp build, another context depth or a different n_predict is
+    not a slower configuration - it is a different experiment - and putting the
+    two in one comparison would manufacture an effect out of the difference
+    between the machines. Rows only ever meet inside an identical key."""
+    c = r.get("config") or {}
+    ctl = [("model", r.get("model")), ("gpu", r.get("gpu")),
+           ("file", r.get("_file")), ("n_predict", r.get("n_predict")),
+           ("repeat", r.get("repeat"))]
+    for k in _CONFIG_KEYS:
+        if k in owned:
+            continue
+        if k == "mmproj_offload":
+            ctl.append((k, c.get(k) is not False))
+        elif k == "spec":
+            ctl.append((k, c.get(k) or "none"))
+        elif k == "fa":
+            ctl.append((k, bool(c.get(k))))
+        elif k in ("ncmoe", "spec_n_max", "fill"):
+            ctl.append((k, c.get(k) or 0))
+        else:
+            ctl.append((k, c.get(k)))
+    return tuple(ctl)
+
+
+def _slim(r):
+    """A row cut down to what a finding needs to show or a script needs to run."""
+    return {"model": r.get("model"), "gpu": r.get("gpu"), "file": r.get("_file"),
+            "config": r.get("config"), "tok_s": r.get("tok_s"),
+            "prefill_tok_s": r.get("prefill_tok_s"),
+            "proc_vram_mib": r.get("proc_vram_mib"),
+            "accept_rate": r.get("accept_rate"), "draft_n": r.get("draft_n"),
+            "spilled": r.get("spilled"), "corpus_repeated": r.get("corpus_repeated"),
+            "distinct_ratio": r.get("distinct_ratio"), "when": r.get("when"),
+            "n_predict": r.get("n_predict"), "repeat": r.get("repeat"),
+            "status": r.get("status")}
+
+
+def sweep_index(rows):
+    """One entry per (model, GPU, backend build) - the browsable list of campaigns.
+
+    Split by build as well as by card, because a llama.cpp version bump moves
+    these numbers and merging two builds into one campaign would hide that."""
+    groups = {}
+    for r in rows:
+        k = (r.get("model") or "?", r.get("gpu") or "", r.get("_file") or "")
+        groups.setdefault(k, []).append(r)
+    out = []
+    for (model, gpu, f), rs in groups.items():
+        ok = [r for r in rs if trustworthy(r)]
+        when = [r.get("when") for r in rs if r.get("when")]
+        fills = sorted({(r.get("config") or {}).get("fill") or 0 for r in rs})
+        stages = sorted({(r.get("config") or {}).get("stage") for r in rs
+                         if (r.get("config") or {}).get("stage")})
+        best = max(ok, key=lambda r: r["tok_s"]) if ok else None
+        out.append({
+            "model": model, "gpu": gpu, "file": f,
+            "backend": re.sub(r"\.jsonl$", "", f).split("__")[-1],
+            "n_rows": len(rs), "n_ok": len(ok),
+            "n_failed": sum(1 for r in rs if r.get("status") != "ok"),
+            "n_untrusted": sum(1 for r in rs
+                               if r.get("status") == "ok" and not trustworthy(r)),
+            "first": min(when) if when else None,
+            "last": max(when) if when else None,
+            "fills": fills, "stages": stages,
+            "best_tok_s": best["tok_s"] if best else None,
+            "best": _slim(best) if best else None,
+        })
+    # Most recent first: the campaign you ran this morning is the one you want.
+    return sorted(out, key=lambda g: -(g["last"] or 0))
+
+
+def axis_effects(rows):
+    """What each knob was worth, from controlled comparisons only.
+
+    For every axis, rows are bucketed by everything else; the bucket with the
+    most distinct values of that axis is the comparison the campaign actually
+    ran, and it is the one reported. Other buckets are counted, not merged -
+    averaging across them is exactly the mistake _control() exists to prevent.
+
+    An axis measured at only one value is reported as such rather than dropped,
+    because "we never varied this" is itself the finding most likely to be
+    actionable."""
+    usable = [r for r in rows if trustworthy(r)]
+    dropped = sum(1 for r in rows if r.get("status") == "ok" and not trustworthy(r))
+    out = []
+    for axis, label, owned, ref in EFFECT_AXES:
+        groups = {}
+        for r in usable:
+            if _axis_value(r, axis) is None:
+                continue
+            groups.setdefault(_control(r, owned), []).append(r)
+        if not groups:
+            continue
+        ranked = sorted(groups.values(),
+                        key=lambda g: (len({_axis_value(r, axis) for r in g}), len(g)),
+                        reverse=True)
+        grp = ranked[0]
+        # Best row per distinct value, so a value measured twice is represented
+        # by its better run rather than by whichever came last.
+        by_val = {}
+        for r in grp:
+            v = _axis_value(r, axis)
+            if v not in by_val or r["tok_s"] > by_val[v]["tok_s"]:
+                by_val[v] = r
+        vals = sorted(by_val.items(), key=lambda kv: -kv[1]["tok_s"])
+        if len(vals) < 2:
+            out.append({"axis": axis, "label": label, "n_values": 1,
+                        "values": [{"value": v, "tok_s": r["tok_s"]} for v, r in vals],
+                        "single": True})
+            continue
+        best_v, best_r = vals[0]
+        worst_v, worst_r = vals[-1]
+        base_v, base_r = (ref, by_val[ref]) if ref in by_val else (worst_v, worst_r)
+        # A repeated filler corpus is not a reason to throw the comparison away -
+        # the rows are real - but it is a reason not to quote the number flat.
+        # Speculation drafts from what it has already seen, so text that loops
+        # back on itself is its best case and nothing like a real conversation.
+        # This is the axis that caveat exists for, so it is carried on the axis.
+        repeated = sum(1 for r in grp if r.get("corpus_repeated"))
+        out.append({
+            "axis": axis, "label": label, "single": False,
+            "n_values": len(vals), "n_rows": len(grp),
+            "n_other_groups": len(ranked) - 1,
+            "n_corpus_repeated": repeated,
+            "inflated": bool(repeated) and axis == "spec",
+            "values": [{"value": v, "tok_s": r["tok_s"],
+                        "vram_mib": r.get("proc_vram_mib"),
+                        "config": r.get("config")} for v, r in vals],
+            "best": best_v, "best_tok_s": best_r["tok_s"],
+            "reference": base_v,
+            "reference_tok_s": base_r["tok_s"],
+            "reference_is_natural": ref in by_val,
+            "gain_pct": (100.0 * (best_r["tok_s"] - base_r["tok_s"]) / base_r["tok_s"]
+                         if base_r["tok_s"] else None),
+            "best_config": best_r.get("config"),
+        })
+    # Biggest lever first - that is the order the next campaign should read it in.
+    out.sort(key=lambda e: -(e.get("gain_pct") or -1))
+    return {"effects": out, "n_rows": len(usable), "n_excluded": dropped}
+
+
+def depth_curve(rows):
+    """The same config measured at more than one context depth.
+
+    Decode re-reads the KV cache every token, so speed falls as the context
+    fills. A headline taken at 2k says very little about the 40k conversation it
+    will actually be used in, and this is the only thing in the tool that can
+    show the slope rather than assert it."""
+    usable = [r for r in rows if trustworthy(r)]
+    groups = {}
+    for r in usable:
+        groups.setdefault(_control(r, ("fill",)), []).append(r)
+    out = []
+    for g in groups.values():
+        by_fill = {}
+        for r in g:
+            f = (r.get("config") or {}).get("fill") or 0
+            if f not in by_fill or r["tok_s"] > by_fill[f]["tok_s"]:
+                by_fill[f] = r
+        if len(by_fill) < 2:
+            continue
+        pts = [{"fill": f, "tok_s": r["tok_s"], "prefill_tok_s": r.get("prefill_tok_s")}
+               for f, r in sorted(by_fill.items())]
+        out.append({"points": pts, "config": g[0].get("config"),
+                    "model": g[0].get("model"), "gpu": g[0].get("gpu"),
+                    "drop_pct": (100.0 * (pts[0]["tok_s"] - pts[-1]["tok_s"])
+                                 / pts[0]["tok_s"]) if pts[0]["tok_s"] else None})
+    return sorted(out, key=lambda d: -(d["points"][-1]["fill"]))
+
+
+def pareto(rows):
+    """Rows nothing else beats on BOTH speed and VRAM.
+
+    "Fastest" and "fastest that still leaves the desktop a card to draw on" are
+    different questions, and a ranking by tok/s alone can only answer the first.
+    A row 2% slower for 3 GiB less is often the one worth running."""
+    cand = [r for r in rows if trustworthy(r) and r.get("proc_vram_mib")]
+    out = []
+    for r in cand:
+        beaten = False
+        for o in cand:
+            if o is r:
+                continue
+            if (o["tok_s"] >= r["tok_s"] and o["proc_vram_mib"] <= r["proc_vram_mib"]
+                    and (o["tok_s"] > r["tok_s"]
+                         or o["proc_vram_mib"] < r["proc_vram_mib"])):
+                beaten = True
+                break
+        if not beaten:
+            out.append(r)
+    return sorted(out, key=lambda r: -r["tok_s"])
+
+
+def insights(rows):
+    """Everything derivable from a set of rows, in one payload."""
+    return {"index": sweep_index(rows),
+            "axes": axis_effects(rows),
+            "depth": depth_curve(rows),
+            "pareto": [_slim(r) for r in pareto(rows)],
+            "ranked": [_slim(r) for r in rank_rows(rows)]}
+
+
+def report_insights(path=None, log=print):
+    """The findings behind the ranking: what each knob was worth, and at what depth."""
+    rows = load_speed_rows(path)
+    if not rows:
+        log("No speed rows recorded yet. Run --speed-sweep.")
+        return False
+    log("CAMPAIGNS")
+    for g in sweep_index(rows):
+        span = ""
+        if g["first"] and g["last"]:
+            f = datetime.datetime.fromtimestamp(g["first"]).strftime("%Y-%m-%d")
+            t = datetime.datetime.fromtimestamp(g["last"]).strftime("%Y-%m-%d")
+            span = f if f == t else "%s..%s" % (f, t)
+        log("  %-34s %-24s %-8s %3d rows (%d ok)  best %s  %s"
+            % (g["model"][:34], (g["gpu"] or "?")[:24], g["backend"][-8:],
+               g["n_rows"], g["n_ok"],
+               ("%.2f tok/s" % g["best_tok_s"]) if g["best_tok_s"] else "-", span))
+
+    ax = axis_effects(rows)
+    log("")
+    log("WHAT EACH KNOB WAS WORTH   (controlled comparisons only: rows differing in")
+    log("model, GPU, backend, context, KV quant, depth or pass count never meet)")
+    if ax["n_excluded"]:
+        log("  %d row%s excluded from every conclusion below - spilled into shared "
+            "memory, or looping" % (ax["n_excluded"], "" if ax["n_excluded"] == 1 else "s"))
+    for e in ax["effects"]:
+        if e.get("single"):
+            log("  %-20s only one value ever tried (%s) - nothing to compare"
+                % (e["label"], e["values"][0]["value"]))
+            continue
+        log("  %-20s %+7.1f%%  best %-14s vs %-10s (%d values, %d rows)%s"
+            % (e["label"], e["gain_pct"] or 0.0, str(e["best"]), str(e["reference"]),
+               e["n_values"], e["n_rows"],
+               "" if e["reference_is_natural"] else "  [ref = slowest measured]"))
+        for v in e["values"]:
+            log("      %-16s %7.2f tok/s" % (str(v["value"]), v["tok_s"]))
+        if e.get("inflated"):
+            log("      !! %d of these rows needed the filler corpus to REPEAT to reach"
+                % e["n_corpus_repeated"])
+            log("         that depth. Speculation drafts from what it has already seen,")
+            log("         so repeated text is its best case and this gain is an upper")
+            log("         bound, not what a real conversation will give you.")
+
+    dc = depth_curve(rows)
+    if dc:
+        log("")
+        log("SPEED VS CONTEXT DEPTH   (the same config, measured at more than one fill)")
+        for d in dc:
+            c = d["config"] or {}
+            log("  %-30s ngl %-3s ub %-5s spec %-12s  -%.0f%%"
+                % (d["model"][:30], c.get("ngl"), c.get("ub"),
+                   c.get("spec") or "none", d["drop_pct"] or 0))
+            for p in d["points"]:
+                log("      %9s tokens filled  %7.2f tok/s" % ("{:,}".format(p["fill"]),
+                                                              p["tok_s"]))
+
+    pf = pareto(rows)
+    if pf:
+        log("")
+        log("SPEED VS VRAM   (nothing else is both faster AND smaller than these)")
+        log("  %8s %9s  %-30s" % ("tok/s", "VRAM", "config"))
+        for r in pf:
+            c = r["config"]
+            log("  %8.2f %7.0f M  %-34s %s"
+                % (r["tok_s"], r["proc_vram_mib"] or 0,
+                   "ngl %s ncmoe %s ub %s" % (c.get("ngl"), c.get("ncmoe") or 0,
+                                              c.get("ub")),
+                   r["model"][:24]))
+    return True
 
 
 def report(path=None, log=print):
     """Every measured config, fastest first."""
-    rows = [r for r in load_speed_rows(path) if r.get("status") == "ok" and r.get("tok_s")]
+    rows = rank_rows(load_speed_rows(path))
     if not rows:
         log("No speed rows recorded yet. Run --speed-sweep.")
         return False
-    rows.sort(key=lambda r: -(r.get("tok_s") or 0))
-    log("%-30s %-4s %-5s %-8s %-13s %-4s %-6s %8s %9s %7s %7s"
-        % ("model", "ngl", "ub", "fill", "spec", "nmax", "mmproj", "tok/s",
+    log("%-30s %-4s %-5s %-5s %-8s %-13s %-4s %-6s %8s %9s %7s %7s"
+        % ("model", "ngl", "ncmoe", "ub", "fill", "spec", "nmax", "mmproj", "tok/s",
            "prefill", "VRAM", "accept"))
     for r in rows:
         c = r["config"]
-        log("%-30s %-4d %-5d %-8d %-13s %-4d %-6s %8.2f %9.1f %7.0f %7s%s"
-            % (r["model"][:30], c["ngl"], c["ub"], c.get("fill") or 0,
+        log("%-30s %-4d %-5d %-5d %-8d %-13s %-4d %-6s %8.2f %9.1f %7.0f %7s%s"
+            % (r["model"][:30], c["ngl"], c.get("ncmoe") or 0, c["ub"],
+               c.get("fill") or 0,
                c.get("spec") or "none", c.get("spec_n_max") or 0,
                "vram" if c.get("mmproj_offload") is not False else "ram",
                r["tok_s"], r.get("prefill_tok_s") or 0.0,

@@ -1449,7 +1449,14 @@ def speed_sweep(models=None, backend=None, dry_run=False, timeout=420.0,
 
         def run_group(cfgs):
             """Measure a list of configs. Returns False if asked to stop."""
-            for c in cfgs:
+            queue = list(cfgs)
+            tries = {}
+            i = -1
+            while True:
+                i += 1
+                if i >= len(queue):
+                    return True
+                c = queue[i]
                 if should_stop and should_stop():
                     log("stopped after %d of %d configs. The rows already written "
                         "are keyed, so re-running resumes here."
@@ -1481,7 +1488,33 @@ def speed_sweep(models=None, backend=None, dry_run=False, timeout=420.0,
                 log(_fmt_row(c, row, len(out), total[0]))
                 if on_row:
                     on_row(row)
-            return True
+                # A speculative config that OOMs gets ONE MORE RUNG, repeatedly.
+                #
+                # This is the fix for a stage that could not succeed. Stages A
+                # and B choose the fastest split that FITS, which is by
+                # construction the one with the least headroom left. Stage D
+                # then asks for a draft KV cache that llama.cpp keeps at f16
+                # whatever -ctk says. So the speculative rows OOM, and the
+                # campaign concludes speculation does not work on this model.
+                #
+                # It concluded that twice this week and was wrong both times.
+                # draft-mtp OOMed at ngl 31 and was the best config measured at
+                # ngl 28 (3.95 vs 3.25); it OOMed at ncmoe 29 and was the best
+                # config measured at ncmoe 34 (54.87 vs 47.17). A stage whose
+                # design guarantees the answer "no" is not measuring anything.
+                #
+                # An OOM is cheap - it fails during load, before a single token
+                # - so walking a few rungs costs far less than the finding is
+                # worth. Bounded, because an OOM that is NOT about the draft
+                # cache would otherwise walk the whole ladder.
+                nxt = _spec_retry(c, row, facts, tries)
+                if nxt is not None and _key(name, nxt) not in done:
+                    log("          ^ that OOM is the draft cache, not the model. "
+                        "Retrying one rung freer: %s" % _carry_summary(nxt))
+                    queue.append(nxt)
+                    total[0] = len(out) + (len(queue) - i - 1)
+                    if on_total:
+                        on_total(total[0], planned=max(planned, total[0]))
 
         if not chain:
             stopped = not run_group(plan)
@@ -1558,6 +1591,49 @@ def speed_sweep(models=None, backend=None, dry_run=False, timeout=420.0,
                                 template=(tmpl_f, tmpl_k, rea, rea_p), template_id=tmpl_id)
     return {"rows": out, "path": path, "stopped": stopped, "planned": total[0],
             "chained": bool(chain), "verified": verified}
+
+
+# How far a speculative config may walk looking for room. Four rungs was enough
+# for both models it was needed on - draft-mtp fitted 3 rungs down on a dense
+# model and 5 up on an MoE, the latter found because the ladder was written by
+# hand. Bounded because an OOM that is not about the draft cache would otherwise
+# march the whole ladder proving the model does not fit at all.
+SPEC_RETRY_RUNGS = 5
+
+
+def _spec_retry(c, row, facts, tries):
+    """The next config to try when a speculative one OOMs, or None.
+
+    Only for a draft model. The n-gram speculators build their drafts from the
+    context that is already there and allocate no second cache, so an OOM from
+    one of them is about the model, not about speculation, and walking would
+    only prove it more slowly.
+
+    Direction is per-architecture and they are opposites: on an MoE, raising
+    n_cpu_moe moves more experts to the CPU and FREES VRAM; on a dense model,
+    lowering ngl moves whole blocks off the GPU and frees it. Getting this
+    backwards would walk straight into the wall."""
+    if row.get("status") != "oom":
+        return None
+    spec = (c.get("spec") or "none")
+    if not spec.startswith("draft"):
+        return None
+    k = (spec, c.get("spec_n_max") or 0)
+    n = tries.get(k, 0)
+    if n >= SPEC_RETRY_RUNGS:
+        return None
+    nl = facts.get("n_layers") or 0
+    d = dict(c)
+    if facts.get("is_moe"):
+        d["ncmoe"] = (c.get("ncmoe") or 0) + 1
+        if nl and d["ncmoe"] > nl:
+            return None
+    else:
+        d["ngl"] = (c.get("ngl") or 0) - 1
+        if d["ngl"] < 1:
+            return None
+    tries[k] = n + 1
+    return d
 
 
 def _spec_wall_note(out, todo, base, log):

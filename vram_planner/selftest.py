@@ -1415,6 +1415,44 @@ def _run_suite(require_refs, tmp, skipped_real):
         print("  BENCH busy port falls back instead of dying as EXIT  %s"
               % ("OK" if port_ok else "FAIL"))
 
+        # Stage D could not succeed. A and B pick the fastest split that FITS,
+        # so it is the one with the least headroom; D then asks for a draft KV
+        # cache llama.cpp keeps at f16 whatever -ctk says. It OOMed on both
+        # models tried and speculation was the WINNER on both once given room:
+        # ngl 31 -> 28 (3.95 vs 3.25), ncmoe 29 -> 34 (54.87 vs 47.17).
+        from .bench import _spec_retry, SPEC_RETRY_RUNGS
+        moe, dense = {"is_moe": True, "n_layers": 41}, {"is_moe": False, "n_layers": 65}
+        oom, okrow = {"status": "oom"}, {"status": "ok"}
+
+        def walk(c0, facts, key):
+            t, c, seen = {}, dict(c0), [c0[key]]
+            while True:
+                n = _spec_retry(c, oom, facts, t)
+                if n is None:
+                    return seen
+                c = n; seen.append(c[key])
+        # The directions are OPPOSITE and getting it backwards walks into the
+        # wall: more n_cpu_moe frees VRAM, more ngl consumes it.
+        retry_ok = (
+            34 in walk({"spec": "draft-mtp", "spec_n_max": 2, "ncmoe": 29}, moe, "ncmoe")
+            and 28 in walk({"spec": "draft-mtp", "spec_n_max": 2, "ngl": 31}, dense, "ngl")
+            # a row that LOADED is not retried
+            and _spec_retry({"spec": "draft-mtp", "ncmoe": 29}, okrow, moe, {}) is None
+            # n-gram speculators allocate no second cache, so their OOM is about
+            # the model and walking would only prove it more slowly
+            and _spec_retry({"spec": "ngram-mod", "ncmoe": 29}, oom, moe, {}) is None
+            and _spec_retry({"spec": "none", "ncmoe": 29}, oom, moe, {}) is None
+            # bounded, or an OOM that is not about the draft cache marches the
+            # whole ladder proving the model does not fit at all
+            and len(walk({"spec": "draft-mtp", "ncmoe": 0}, moe, "ncmoe"))
+                == SPEC_RETRY_RUNGS + 1
+            # and it cannot walk off either end
+            and _spec_retry({"spec": "draft-mtp", "ncmoe": 41}, oom, moe, {}) is None
+            and _spec_retry({"spec": "draft-mtp", "ngl": 1}, oom, dense, {}) is None)
+        print("  SPEC  a draft config that OOMs is retried with room, not written off  %s"
+              % ("OK" if retry_ok else "FAIL"))
+        port_ok = port_ok and retry_ok
+
         # A knob that silently does not apply is worse than one that is refused.
         # rounds re-runs the stages from the WINNER, so without chaining there is
         # no winner to re-run them from - it was accepted in that state and did

@@ -332,6 +332,33 @@ class Handler(BaseHTTPRequestHandler):
                 "on_total": default_vram_budget(g, "total", 0),
                 "on_free": default_vram_budget(g, "free", 0)}
 
+    def _speed_delete(self, data):
+        """Forget one campaign's rows.
+
+        Refused outright while a campaign is running: the job appends to these
+        files as it measures, so a rewrite underneath it would silently drop
+        whatever landed between the read and the replace. Waiting is cheap;
+        losing rows measured minutes ago is not.
+        """
+        from .bench import delete_campaign, _ANY
+        from .job import JOB
+        st = JOB.snapshot(since=0) or {}
+        if st.get("status") == "running":
+            return {"ok": False, "error": "A campaign is running and is writing to "
+                                          "these files. Stop it first, then delete."}
+        if not data.get("confirm"):
+            # The browser asks twice. The API refuses to act on a request that
+            # never passed through that, so a stray POST cannot delete two hours
+            # of measurement.
+            return {"ok": False, "error": "delete not confirmed"}
+        # Present-but-empty is a value, absent is "any" - the same rule the
+        # insights query follows, and the reason the sentinel travels this far.
+        pid = data["pid"] if "pid" in data else _ANY
+        tid = data["tid"] if "tid" in data else _ANY
+        return delete_campaign(model=data.get("model"), gpu=data.get("gpu"),
+                               file=data.get("file"), prompt_id=pid,
+                               template_id=tid)
+
     def _recommend(self, data):
         """One config to run, reconciled against whatever has been measured.
 
@@ -529,7 +556,7 @@ class Handler(BaseHTTPRequestHandler):
         u = urlparse(self.path)
         POSTS = ("/api/analyze", "/api/calibrate", "/api/script", "/api/script/save",
                  "/api/speed/plan", "/api/speed/start", "/api/speed/stop",
-                 "/api/recommend")
+                 "/api/speed/delete", "/api/recommend")
         if u.path not in POSTS:
             return self._send(404, {"error": "not found"})
         try:
@@ -543,6 +570,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, self._script(data))
         if u.path == "/api/script/save":
             return self._send(200, self._script_save(data))
+        if u.path == "/api/speed/delete":
+            return self._send(200, self._speed_delete(data))
         if u.path == "/api/recommend":
             return self._send(200, self._recommend(data))
         if u.path == "/api/speed/plan":

@@ -407,13 +407,15 @@ function bar(title, capMib, used, segs){
  * FASTEST ROW MEASURED. Those are different questions. When they give different
  * answers this card names every reason, rather than leaving the user to notice
  * that step 1 said ngl 41 and step 2's best row says ngl 47. */
-let REC = null, REC_FOR = null;
+let REC = null, REC_FOR = null, REC_SEQ = 0;
 
 const REC_KIND = {
   objective: "objective",
   budget:    "budget",
   axis:      "knobs",
   stale:     "conditions",
+  samplers:  "samplers",
+  depth:     "depth",
   untrusted: "no usable rows"
 };
 
@@ -434,19 +436,31 @@ function cfgLine(c){
  *
  *  Guarded on the plan object itself, because render() runs on every tab switch
  *  and the answer cannot change between two clicks of the same plan. Without it
- *  each switch cost a round trip and blanked the card while it flew. */
+ *  each switch cost a round trip and blanked the card while it flew.
+ *
+ *  Sequenced as well as guarded: REC_FOR alone only rejects a REPEAT of the
+ *  plan in flight, so two analyses in quick succession could land out of order
+ *  and leave the card describing plan A beside plan B's deltas. It is also
+ *  cleared to null and refetched for the SAME plan after rows are measured or
+ *  forgotten, where the object identity is unchanged and only the counter can
+ *  tell the two answers apart. Last request asked for wins; everything else is
+ *  dropped rather than drawn. */
 async function loadRecommendation(r){
   if(!r || !r.plan) return;
   if(REC_FOR === r) return;
   REC_FOR = r;
+  const seq = ++REC_SEQ;
   REC = null;
   drawRecommendation();
+  let out;
   try{
-    REC = await (await fetch("/api/recommend", {
+    out = await (await fetch("/api/recommend", {
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ plan: r, model: (currentPath().split(/[\\/]/).pop() || "") })
     })).json();
-  }catch(e){ REC = { ok: false, error: String(e) }; }
+  }catch(e){ out = { ok: false, error: String(e) }; }
+  if(seq !== REC_SEQ) return;          // superseded while in flight
+  REC = out;
   drawRecommendation();
 }
 

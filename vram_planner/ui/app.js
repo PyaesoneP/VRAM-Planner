@@ -399,11 +399,19 @@ function renderVerdict(r){
     : h`All of it (${fmt(p.compute_mib)}) is on the GPU at this split.`;
 
   return h`<section class="card lead">
-    <h2>Verdict</h2>
-    <div class="verdict ${vcls}"><p class="h">${p.headline}</p></div>
+    <h2>Does it fit</h2>
+    <div class="verdict ${vcls}">
+      <p class="vword">${vd.word || "—"}</p>
+      <p class="h">${p.headline}</p>
+    </div>
     ${raw(bar("VRAM", inp.vram_budget_mib, vramUsed, vramSegs))}
     ${raw(ramUsed > 0.5 ? bar("System RAM", inp.ram_budget_mib, ramUsed, ramSegs) : "")}
-    <p class="note">Weights and KV cache are computed exactly from the GGUF tensor table. ${raw(cal)}${raw(split)}</p>
+    <p class="note">This is the <b>largest split that fits</b> — the planner stops at the first
+      config under the budget. It is not a claim about speed, and on a model with recorded
+      measurements it is usually not the fastest config either. Weights and KV are computed
+      exactly from the GGUF tensor table.
+      <details class="why"><summary>how the compute buffer is arrived at</summary>
+        ${raw(cal)}${raw(split)}</details></p>
   </section>`;
 }
 
@@ -861,11 +869,20 @@ function copyCmd(btn){
 let SWEEP = null;
 
 function sweepDefaults(){
-  return { path: "", model: "", preflight: null, rows: [], plan: null,
+  // rowsLoaded distinguishes "no rows recorded" from "the fetch has not landed
+  // yet". Without it the step-2 tab asserted "nothing measured yet" for the
+  // second or two before /api/speed/rows returned - on a model with 65 recorded
+  // rows, which is exactly the claim the tab exists to make and exactly the one
+  // it was getting wrong.
+  return { path: "", model: "", preflight: null, rows: [], rowsLoaded: false, plan: null,
            status: null, since: 0, timer: null, script: null, pickKey: null,
            shell: (SYS && SYS.shell) || "bash", busy: "",
            campaigns: null, insights: null, openCampaign: null,
-           templates: [], speeddir: "" };
+           templates: [], speeddir: "",
+           // Which campaign is being asked about, which is mid-delete, and what
+           // the last delete did. Deleting takes two clicks and the second one
+           // reports what it removed and where it put it.
+           delKey: null, delBusy: null, delNote: "" };
 }
 
 /* Four cards, not one. They are rewritten on different clocks: the grid and the
@@ -943,14 +960,21 @@ function stepNow(){
 function stepSummary(id, r){
   if(id === "fit"){
     if(!r) return "no model analyzed";
-    const v = r.verdict || {};
-    return (v.fits === false ? "does not fit" : "fits")
-      + (r.totals && r.totals.vram_mib ? " · " + fmtG(r.totals.vram_mib) : "");
+    // r.verdict and r.totals never existed on this API. `r.verdict || {}` was
+    // therefore always {}, `{}.fits === false` always false, and this tab said
+    // "fits" for every plan ever analyzed - including the ones that spilled.
+    // The state is computed once, server-side, in plan._verdict().
+    const v = (r.plan && r.plan.verdict) || {};
+    const word = { fits: "fits", tight: "fits, barely",
+                   spills: "spills to shared", no_fit: "does not fit" }[v.state] || "planned";
+    return word + (v.vram_mib ? " · " + fmtG(v.vram_mib) : "");
   }
   if(id === "measure"){
     const st = SWEEP && SWEEP.status;
     if(st && st.status === "running")
       return "measuring " + st.done + "/" + (st.total || "?");
+    // "nothing measured yet" is a claim, so it waits until the rows are in.
+    if(!(SWEEP && SWEEP.rowsLoaded)) return "reading recorded rows…";
     const rows = sweepAllRows ? sweepAllRows() : [];
     const best = rows.find(x => x.tok_s);
     return best ? best.tok_s.toFixed(2) + " tok/s best" : "nothing measured yet";
@@ -1010,8 +1034,15 @@ async function initSweep(r){
     ngl: r.plan.n_gpu_layers, ncmoe: r.plan.n_cpu_moe || 0
   };
   PICKABLE = {};
-  await Promise.all([loadPreflight(), loadSweepRows(), loadHistory(), loadTemplates(),
-                     attachRunningJob()]);
+  // The row and campaign loads refresh the tabs as soon as THEY land, rather
+  // than when the whole batch does. loadPreflight() shells out to nvidia-smi and
+  // enumerates GPU processes, so it is seconds slower than the rest - and step
+  // 2's tab was sitting on "reading recorded rows…" for that whole time with the
+  // rows already in hand.
+  await Promise.all([loadPreflight(),
+                     loadSweepRows().then(drawStepper),
+                     loadHistory().then(drawStepper),
+                     loadTemplates(), attachRunningJob()]);
   // Pre-select this model's campaign, so Past sweeps opens on what was just
   // analyzed instead of on whatever ran most recently.
   // `mine.length === 1` used to be right, because a model had exactly one
@@ -1061,6 +1092,7 @@ async function loadSweepRows(){
                                 encodeURIComponent(SWEEP.model))).json();
     SWEEP.rows = d.rows || [];
   }catch(e){ SWEEP.rows = []; }
+  SWEEP.rowsLoaded = true;
 }
 
 /** Redraw the sweep panes.

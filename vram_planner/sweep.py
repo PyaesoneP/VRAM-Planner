@@ -22,7 +22,7 @@ never started.
 """
 import contextlib, json, os, re, subprocess, sys, time
 from .const import MiB
-from .gguf import load_gguf
+from .gguf import load_gguf, parse_meta_only
 from .model import extract_config
 from .gpu import get_gpu_processes, gpu_list
 from .lmstudio import default_models_dir
@@ -308,10 +308,31 @@ def build_argv(exe, model_path, c, port, probe=True, host="127.0.0.1"):
         # then ignored with a deprecation line, which looks exactly like a
         # setting that had no effect.
         av += ["--spec-type", spec]
-        if c.get("spec_n_max"):
-            av += ["--spec-draft-n-max", str(c["spec_n_max"])]
-        if c.get("spec_n_min"):
-            av += ["--spec-draft-n-min", str(c["spec_n_min"])]
+        if spec == "draft-dflash":
+            # The drafter is a second model file, and there is nothing sensible
+            # to do without it. Resolved here - the single place every flag
+            # comes from - so sweep, bench and launcher agree on the pairing.
+            md = c.get("md") or find_drafter_for(model_path)
+            if not md:
+                raise ValueError("spec draft-dflash needs a DFlash drafter file "
+                                 "next to %s" % model_path)
+            av += ["-md", md]
+            # --spec-draft-n-max is clamped to the trained block size by
+            # llama.cpp; sweeping deeper would spend loads measuring the same
+            # row twice.
+            if c.get("spec_n_max"):
+                bs = _drafter_block_size(md)
+                if bs:
+                    av += ["--spec-draft-n-max", str(min(c["spec_n_max"], bs))]
+                else:
+                    av += ["--spec-draft-n-max", str(c["spec_n_max"])]
+            if c.get("spec_n_min"):
+                av += ["--spec-draft-n-min", str(c["spec_n_min"])]
+        else:
+            if c.get("spec_n_max"):
+                av += ["--spec-draft-n-max", str(c["spec_n_max"])]
+            if c.get("spec_n_min"):
+                av += ["--spec-draft-n-min", str(c["spec_n_min"])]
     return av
 
 
@@ -555,6 +576,64 @@ def model_facts(path):
             "hidden": cfg.get("hidden") or 0}
 
 
+# ---------------------------------------------------------------------------
+# DFlash drafters
+# ---------------------------------------------------------------------------
+# A DFlash drafter is a separate GGUF whose architecture is "dflash" and which
+# sits next to the model it drafts (llama.cpp resolves -md against that pairing;
+# the drafter's metadata names the layers of the TARGET it was trained for). It
+# is a drafter file and not a model, so it must never surface as one - the
+# planning math is for a model that drafts, not for a draft that drafts.
+# Identification is by the architecture in the file's metadata, not by filename:
+# the filename prefix is a convention of the conversion tool, and the architecture
+# is what llama.cpp itself checks.
+
+_ARCH_DFLASH = "dflash"
+
+
+def find_drafter_for(model_path, _cache={}):
+    """The DFlash drafter file next to `model_path`, or None.
+
+    Cheap: only the GGUF header is read (parse_meta_only), so a directory scan
+    costs one small read per candidate. A model cannot draft itself - a hand-
+    typed path to the drafter file returns None, same rule as find_mmproj()."""
+    key = os.path.abspath(model_path or "")
+    if key in _cache:
+        return _cache[key]
+    out = None
+    base = os.path.basename(key)
+    if base.lower().startswith("dflash") or base.lower() == _ARCH_DFLASH + ".gguf":
+        _cache[key] = None
+        return None
+    d = os.path.dirname(key)
+    if os.path.isdir(d):
+        for fn in sorted(os.listdir(d)):
+            if not fn.lower().endswith(".gguf"):
+                continue
+            p = os.path.join(d, fn)
+            try:
+                meta = parse_meta_only(p)
+            except (OSError, ValueError):
+                continue
+            if (meta.get("general.architecture") or "").lower() == _ARCH_DFLASH:
+                out = p
+                break
+    _cache[key] = out
+    return out
+
+
+def _drafter_block_size(drafter_path):
+    """The drafter's trained block size (dflash.block_size), the depth llama.cpp
+    clamps --spec-draft-n-max to. Sweeping past it would spend loads measuring
+    the same row twice: every depth beyond the block is clamped to the block."""
+    try:
+        meta = parse_meta_only(drafter_path)
+    except (OSError, ValueError):
+        return 0
+    v = meta.get("dflash.block_size")
+    return int(v) if isinstance(v, int) and v > 0 else 0
+
+
 def build_grid(facts, base=None, max_ctx=None):
     """Configs for one model: a baseline, each axis swept, then a few corners."""
     b = dict(base or BASE)
@@ -634,6 +713,7 @@ def _key(model, c):
             c["kv"], c.get("ncmoe") or 0,
             c.get("spec") or "none", c.get("spec_n_max") or 0,
             bool(c.get("mmproj")), c.get("mmproj_offload") is not False,
+            os.path.basename(c["md"]) if c.get("md") else "",
             c.get("fill") or 0,
             # sampler settings change what a SPECULATIVE row measures - greedy is
             # speculation's best case - so a row taken under different ones is a
@@ -670,12 +750,16 @@ def load_rows(path):
 
 def discover_models(root=None, names=None):
     """GGUF files to sweep. Projectors are skipped - mmproj-*.gguf is not a model
-    you can load on its own, and sweeping it just produces failed runs."""
+    you can load on its own, and sweeping it just produces failed runs. The same
+    goes for DFlash drafters (dflash-*.gguf): they are not loadable on their own,
+    and a sweep against one measures a draft cache instead of a model."""
     root = root or default_models_dir()
     out = []
     for dp, _dn, fns in os.walk(root or ""):
         for fn in sorted(fns):
-            if not fn.lower().endswith(".gguf") or fn.lower().startswith("mmproj"):
+            if not fn.lower().endswith(".gguf"):
+                continue
+            if fn.lower().startswith("mmproj") or fn.lower().startswith("dflash"):
                 continue
             m = re.match(r"(.+)-(\d{5})-of-(\d{5})\.gguf$", fn)
             if m and m.group(2) != "00001":

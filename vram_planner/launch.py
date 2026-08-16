@@ -39,7 +39,7 @@ web.py can import it freely.
 """
 import datetime, json, os, re
 
-from .sweep import backends_dir, build_argv, find_backends
+from .sweep import backends_dir, build_argv, find_backends, find_drafter_for
 
 SHELLS = ("powershell", "bash")
 
@@ -73,13 +73,13 @@ SAMPLER_FLAGS = (
 # Which argv values become script parameters, keyed by the flag in front of them.
 # Everything not listed is emitted literally.
 _PARAM_BY_FLAG = {
-    "-m": "Model", "--mmproj": "Mmproj", "-ngl": "Ngl", "-c": "Ctx",
+    "-m": "Model", "--mmproj": "Mmproj", "-md": "Draft", "-ngl": "Ngl", "-c": "Ctx",
     "-ub": "Ubatch", "--n-cpu-moe": "NCpuMoe", "--spec-draft-n-max": "DraftMax",
     "--host": "BindHost", "--port": "Port",
 }
-# Model and mmproj are resolved paths, not tunables: they get a variable for
-# readability but no param block entry.
-_NOT_A_PARAM = ("Model", "Mmproj")
+# Model, mmproj and the DFlash drafter are resolved paths, not tunables: they
+# get a variable for readability but no param block entry.
+_NOT_A_PARAM = ("Model", "Mmproj", "Draft")
 
 
 def default_shell():
@@ -407,9 +407,9 @@ def _provenance(model_path, c, measured, backend, tmpl=(None, None),
 # ---------------------------------------------------------------------------
 # The two shells
 # ---------------------------------------------------------------------------
-def _powershell(model_path, c, argv, backend, mmproj, sampling, port, bind_host,
-                load_mode, log_dir, measured, params, tmpl, path_resolved,
-                divergence=""):
+def _powershell(model_path, c, argv, backend, mmproj, draft, sampling, port,
+                bind_host, load_mode, log_dir, measured, params, tmpl,
+                path_resolved, divergence=""):
     exe_name = EXE_BY_SHELL["powershell"]
     # PowerShell is case-insensitive about variables, but $model reading as $Model
     # in one place and not the other just looks like a bug to whoever edits this.
@@ -531,7 +531,10 @@ def _powershell(model_path, c, argv, backend, mmproj, sampling, port, bind_host,
     A("$model  = %s" % ps_quote(model_path))
     if mmproj:
         A("$mmproj = %s" % ps_quote(mmproj))
-    A("foreach ($p in @($model%s)) {" % (", $mmproj" if mmproj else ""))
+    if draft:
+        A("$draft = %s" % ps_quote(draft))
+    A("foreach ($p in @($model%s%s)) {" % (
+        ", $mmproj" if mmproj else "", ", $draft" if draft else ""))
     A("    if (-not (Test-Path $p)) { throw \"Missing: $p\" }")
     A("}")
     A("")
@@ -653,7 +656,7 @@ def _powershell(model_path, c, argv, backend, mmproj, sampling, port, bind_host,
     return "\n".join(L) + "\n"
 
 
-def _bash(model_path, c, argv, backend, mmproj, sampling, port, bind_host,
+def _bash(model_path, c, argv, backend, mmproj, draft, sampling, port, bind_host,
           load_mode, log_dir, measured, params, tmpl, path_resolved,
           divergence=""):
     exe_name = EXE_BY_SHELL["bash"]
@@ -762,7 +765,10 @@ def _bash(model_path, c, argv, backend, mmproj, sampling, port, bind_host,
     A("MODEL=%s" % q(model_path))
     if mmproj:
         A("MMPROJ=%s" % q(mmproj))
-    A('for f in "$MODEL"%s; do' % (' "$MMPROJ"' if mmproj else ""))
+    if draft:
+        A("DRAFT=%s" % q(draft))
+    A('for f in "$MODEL"%s%s; do' % (' "$MMPROJ"' if mmproj else "",
+                                     ' "$DRAFT"' if draft else ""))
     A('  [ -f "$f" ] || { echo "Missing: $f" >&2; exit 1; }')
     A("done")
     A("")
@@ -909,6 +915,20 @@ def launch_script(model_path, c, backend=None, mmproj=None, shell=None,
         c.pop("mmproj", None)
     mmproj = c.get("mmproj")
 
+    # The DFlash drafter, when the config carries one. A row records its path,
+    # which can be stale (the pair moved) or foreign (the row came from another
+    # machine), so an md that does not exist is re-resolved next to the model.
+    # build_argv refuses a draft-dflash command without a drafter, so None here
+    # is only reachable if the config's spec changed between the row and here.
+    draft = None
+    if c.get("spec") == "draft-dflash":
+        md = c.get("md")
+        if not (md and os.path.isfile(md)):
+            md = find_drafter_for(model_path)
+        if md:
+            c["md"] = md
+            draft = md
+
     # probe=False: no -v, no --cache-ram 0, no --no-warmup. Those three make a run
     # measurable and would be wrong in something you use every day.
     argv = build_argv("<exe>", model_path, c, port, probe=False, host=bind_host)[1:]
@@ -921,6 +941,6 @@ def launch_script(model_path, c, backend=None, mmproj=None, shell=None,
     params = _params_used(argv)
     fn = _powershell if shell == "powershell" else _bash
     divergence = _config_divergence(c, measured, sampling)
-    return fn(model_path, c, argv, backend, mmproj, samp, port, bind_host,
+    return fn(model_path, c, argv, backend, mmproj, draft, samp, port, bind_host,
               load_mode, log_dir, measured, params, tmpl, path_resolved,
               divergence)

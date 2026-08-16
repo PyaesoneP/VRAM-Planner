@@ -117,6 +117,43 @@ python -m vram_planner --speed-sweep --models MODEL --speed-fill 32768 \
     --speed-axes "ngl=28 spec=draft-mtp spec_n_max=2 mmproj_offload=0"
 ```
 
+`--speed-fills` makes that part of the campaign instead of a second run: the first value
+is the campaign fill, and each extra value re-measures the **top three stage-A rungs** at
+that depth, right after stage A finds the wall:
+
+```
+python -m vram_planner --speed-sweep --models MODEL --speed-fills 2048 32768 65536
+```
+
+It works because the wall does not move with fill: the allocation is decided by the
+frozen context at load time, and fill only decides how much of it is used. So the deep
+rows skip the wall stage A already paid for — the rungs they use are exactly the ones
+that fit. The rows are keyed on fill, so they never compete for the chained baseline: a
+2k row and a 32k row are different experiments by design (§3.1).
+
+### 3.0 Monotone walls: the grid prunes itself
+
+A hard `oom` is monotone evidence: the config that hit it and the queued configs that
+are *worse* on the same axis, with every other knob equal, fail the same way — loading
+them would re-prove the wall instead of measuring anything. So the grid prunes them
+before they load:
+
+```
+wall    : ngl 42 ncmoe 0 ub 512 spec none OOMs; 5 later configs provably worse, skipped
+```
+
+- **Only `oom` prunes.** A `genfail`, `exit` or timeout says nothing about the next rung;
+  a `spilled` row *loaded* (and ran badly), which is a measurement, not a wall.
+- **Only along monotone axes.** `ngl`, `ub`, `ctx` and draft depth only ever cost more
+  VRAM as they rise; `n_cpu_moe` only ever costs less as it rises (MoE models only). A
+  ladder over `spec` or `temp` has no ordering, so those rows are all measured, exactly
+  as typed — including in `--speed-axes` ladders.
+- **Pruned rows are never recorded**, so a campaign resumed after a card change
+  re-measures them naturally. The OOM row itself stays: it is the wall the ladder is
+  read from.
+- The **dry-run counts are therefore an upper bound** on what a run measures, and the
+  hour estimate is the most pessimistic reading of it.
+
 ---
 
 ## 3.1 Chaining: stop measuring at a baseline nothing confirmed
@@ -242,15 +279,22 @@ thing to lose. **Laddering `-ngl` on an MoE measures the fallback strategy and n
 finds the good configuration at all.**
 
 Stage D also skips `draft-mtp` automatically when the file has no `nextn` blocks — there
-is nothing to draft from, so those rows would be identical failures. Check before you
-plan a campaign around speculation:
+is nothing to draft from, so those rows would be identical failures. `draft-dflash` gets
+the same gate a different way: the scheme lives in a SEPARATE file (`dflash-*.gguf`, whose
+architecture is `dflash`) next to the model, so stage D only adds those rows when that
+file is present — and it sweeps the drafter's **whole trained block size**, ascending
+(from depth 1 to the block), because llama.cpp clamps `--spec-draft-n-max` to it and the
+monotone wall (§3.0) prunes the deeper half of the ladder at the first OOM — the draft
+cache grows with depth, so depth 8 failing at a split proves depths 9–16 do too.
+Check before you plan a campaign around speculation:
 
 ```
 python -c "from vram_planner.gguf import load_gguf; from vram_planner.model import extract_config; \
 c=extract_config(load_gguf(r'PATH.gguf')); print('MTP blocks:', c['n_mtp_layers'])"
 ```
 
-If that prints `0`, only the `ngram-*` variants apply, and they are worth far less.
+If that prints `0`, only the `ngram-*` variants apply (and a DFlash drafter, when one is
+present), and they are worth far less.
 
 ---
 
@@ -266,6 +310,7 @@ If that prints `0`, only the `ngram-*` variants apply, and they are worth far le
 | `--speed-stages abcd` | which stages to run |
 | `--speed-ctx N` / `--speed-kv TYPE` | freeze context / KV quant |
 | `--speed-fill N` | prompt length to measure at |
+| `--speed-fills N N …` | first value = campaign fill; the rest re-measure the top stage-A rungs at deeper fills (§3). Refuses to combine with `--speed-fill` |
 | `--speed-axes "k=v,v …"` | explicit ladder **instead of** the staged grid |
 | `--n-predict N` / `--repeat N` | tokens per measured pass / passes per config |
 | `--limit N` | stop after N configs |
@@ -288,7 +333,7 @@ Values are comma-separated; multiple axes form a cross product, so keep it small
 | `ctx`, `ngl`, `ub`, `seq`, `ncmoe`, `fill` | int | `seq` is `-np` |
 | `kv` | string | `f16`, `q8_0`, … |
 | `fa`, `mmproj_offload`, `warmup` | bool | `0`/`off`/`false` are false |
-| `spec` | string | `none`, `draft-mtp`, `ngram-mod`, `ngram-cache`, `ngram-simple` |
+| `spec` | string | `none`, `draft-mtp`, `draft-dflash`, `ngram-mod`, `ngram-cache`, `ngram-simple` |
 | `spec_n_max`, `spec_n_min` | int | draft depth |
 | `temp`, `top_p`, `min_p`, `rep_pen`, `pres_pen` | float | see §7 |
 | `top_k` | int | |
@@ -459,6 +504,17 @@ If you configured a long context you will *live* at depth, so quote yourself the
 the depth you actually work at. Speculation's advantage decays the same way — +71% at 2k,
 +29% at 32k, level by 120k — because as KV comes to dominate decode, the blocks the draft
 cache displaced start to cost more than speculation saves.
+
+`--speed-fills` collects this slope inside the campaign (see §3): the rows land as stage-A
+rows at the extra fills, next to the ladder that chose their rungs, so a dry-run count of
+stage A is the count of the ladder *and* the depth rows on top of it — and because the
+deep rows are keyed on fill, a rerun at a single fill never pays for them again.
+
+Stage D's draft-depth ladder is measured the same way a hand-run `--speed-axes` ladder
+used to be, and the grid's own monotone rule prunes the redundant half of it: on a
+dflash drafter the depths run **the full trained block, ascending**, and the first depth
+that OOMs at a split proves every deeper one does too (the draft cache grows with depth),
+so the walk skips straight to the split that frees room — see the `wall :` log lines.
 
 ---
 

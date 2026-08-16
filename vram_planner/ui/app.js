@@ -318,6 +318,7 @@ async function run(){
     n_seq: parseInt($("nseq").value) || 1,
     include_mmproj: $("mmproj").checked,
     mtp_spec: $("mtpspec").checked,
+    dflash: $("dflash").checked,
     n_cpu_moe_override: $("ncpumoe").value === "" ? null : parseInt($("ncpumoe").value),
     bw_vram_gbs: parseFloat($("bwv").value) || 0,
     bw_ram_gbs: parseFloat($("bwr").value) || 0,
@@ -558,7 +559,7 @@ function renderVerdict(r){
     { cls:"s-kv",  color:"var(--kv)",   label:"KV cache (GPU)",    mib:p.gpu_kv_mib || 0 },
     { cls:"s-rec", color:"var(--rec)",  label:"recurrent state",   mib:p.gpu_recurrent_mib || 0 },
     { cls:"s-prj", color:"var(--proj)", label:"vision projector",  mib:p.mmproj_mib || 0 },
-    { cls:"s-spc", color:"var(--spec)", label:"MTP draft cache",   mib:p.spec_mib || 0 },
+    { cls:"s-spc", color:"var(--spec)", label: inp.dflash ? "DFlash drafter" : "MTP draft cache", mib:p.spec_mib || 0 },
     { cls:"s-cmp", color:"var(--cmp)",  label:"compute buffer",    mib:p.compute_mib || 0 },
     { cls:"s-rsv", color:"",            label:"driver reserve",    mib:inp.gpu_reserve_mib || 0 }
   ];
@@ -703,6 +704,10 @@ function renderSummary(r){
       ${raw(c.n_mtp_layers
         ? kvItem("multi-token pred.", c.n_mtp_layers + " block" + (c.n_mtp_layers == 1 ? "" : "s") +
             ' <span class="muted">(' + (inp.mtp_spec ? "drafting: KV counted" : "idle: weights only") + ')</span>') : "")}
+      ${raw(r.dflash
+        ? kvItem("dflash drafter", esc(r.dflash.name) +
+            ' <span class="muted">' + fmt(r.dflash.mib) + " &middot; derived &middot; block " +
+            r.dflash.block_size + "</span>") : "")}
       ${raw(kvItem("head dim", (c.head_dim_k || "-") +
         ((r.swa && r.swa.enabled && r.swa.head_dim !== r.swa.head_dim_global)
           ? '  <span class="muted">/ ' + esc(r.swa.head_dim) + ' swa</span>' : "")))}
@@ -804,6 +809,16 @@ function render(r){
   $("mmprojfield").hidden = !r.mmproj;
   $("ncpumoefield").hidden = !r.is_moe;
   $("mtprow").hidden = !c.n_mtp_layers;
+  $("dflashfield").hidden = !r.dflash;
+  if(r.dflash){
+    // The drafter's cost is derived (weights exact; KV and graph from geometry
+    // and the calibration), and the plan says so rather than passing it off as
+    // measured - the speed sweep's stage D exists to replace it with a number.
+    $("dflashhint").innerHTML = h`${esc(r.dflash.name)} drafts blocks for this model &mdash;
+      ${fmt(r.dflash.mib)} of VRAM (weights ${fmt(r.dflash.weights_mib)} + KV ${fmt(
+        r.dflash.kv_mib)} + graph ${fmt(r.dflash.graph_mib)}), block ${r.dflash.block_size
+      }. <b>Derived, not measured</b>: the speed sweep&rsquo;s stage D measures the real cost.`;
+  }
   if(r.mmproj){
     $("mmprojhint").innerHTML = h`${r.mmproj.name} &middot; ${fmt(r.mmproj.mib)
       } of VRAM. LM Studio loads it with the model and includes it in the size it shows.`;
@@ -1415,11 +1430,16 @@ function sweepForm(pf){
       ${raw(sweepStage("a", "A &middot; layer wall", "How many blocks fit before it spills"))}
       ${raw(sweepStage("b", "B &middot; projector", "Vision tower in VRAM or in system RAM"))}
       ${raw(sweepStage("c", "C &middot; ubatch", "Physical batch size"))}
-      ${raw(sweepStage("d", "D &middot; speculation", "MTP draft depths and the n-gram types"))}
+      ${raw(sweepStage("d", "D &middot; speculation", "MTP and DFlash draft depths, plus the n-gram types"))}
     </div>
     <div class="row" style="margin-top:10px">
       <div class="field"><label for="swfill">Context filled (tokens)</label>
         <input type="number" id="swfill" value="2048" step="1024" min="0"></div>
+      <div class="field"><label for="swfills">Depth fills (blank = none)</label>
+        <input type="text" id="swfills" placeholder="e.g. 32768, 65536">
+        <p class="hint">Deeper fills that re-measure the top stage-A rungs once the wall
+          is known &mdash; the depth slope, part of the campaign instead of a second run.
+          The first one listed replaces "Context filled".</p></div>
       <div class="field"><label for="swpred">Tokens per pass</label>
         <input type="number" id="swpred" value="128" step="32" min="16"></div>
       <div class="field"><label for="swrep">Passes (median)</label>
@@ -1586,7 +1606,12 @@ function sweepBody(){
   const chain = $("swchain") ? $("swchain").checked : true;
   const verify = $("swverify") ? $("swverify").checked : false;
   return { path: SWEEP.path, stages: sweepStages(), context: parseInt($("ctx").value),
-           kv_type: $("kv").value, fill: v("swfill"), n_predict: v("swpred"),
+           kv_type: $("kv").value,
+           fill: $("swfills") && $("swfills").value.trim()
+             ? null : v("swfill"),
+           fills: $("swfills") && $("swfills").value.trim()
+             ? $("swfills").value.trim() : null,
+           n_predict: v("swpred"),
            repeat: v("swrep"), limit: v("swlimit"),
            chain: chain, rounds: chain ? (v("swrounds") || 1) : 1,
            verify: verify,
@@ -2434,6 +2459,15 @@ $("ctx").addEventListener("input", markCtx);
 // runs - the controls appearing only after a re-plan reads as the tick not working.
 $("visionplan").addEventListener("change", () => {
   $("visioninputs").hidden = !$("visionplan").checked;
+});
+// A server runs ONE speculative scheme, so DFlash and MTP are exclusive:
+// ticking one switches the other off rather than asking the planner to price
+// both (it would price only the first and warn about the second).
+$("dflash").addEventListener("change", () => {
+  if($("dflash").checked) $("mtpspec").checked = false;
+});
+$("mtpspec").addEventListener("change", () => {
+  if($("mtpspec").checked) $("dflash").checked = false;
 });
 $("model").addEventListener("change", onPick);
 // Switching the basis with a stale number in the budget box is exactly the

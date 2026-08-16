@@ -100,6 +100,13 @@ def main():
                          "b=projector placement, c=ubatch, d=speculation)")
     ap.add_argument("--speed-fill", type=int, default=None, metavar="TOKENS",
                     help="with --speed-sweep: prompt length to measure at")
+    ap.add_argument("--speed-fills", nargs="+", type=int, default=None,
+                    metavar="TOKENS",
+                    help="with --speed-sweep: the first value is the campaign fill, "
+                         "the rest are DEEPER fills that re-measure the top stage-A "
+                         "rungs once the wall is known - the depth slope the docs "
+                         "tell you to measure, part of the campaign instead of a "
+                         "second run. Refuses to combine with --speed-fill")
     ap.add_argument("--speed-ctx", type=int, default=None, metavar="N",
                     help="with --speed-sweep: freeze context length (clamped to the "
                          "model's trained context)")
@@ -256,12 +263,18 @@ def main():
         from .bench import speed_sweep         # deferred: needs subprocess work
         from .sweep import parse_overrides
         axes = parse_overrides(args.speed_axes) if args.speed_axes else None
+        if args.speed_fills and args.speed_fill is not None:
+            print("--speed-fills and --speed-fill are the same question asked two "
+                  "ways; the first --speed-fills value IS the campaign fill. Use "
+                  "one of them.")
+            sys.exit(2)
         overrides = (parse_overrides(args.speed_verify_overrides)
                      if args.speed_verify_overrides else None)
         r = speed_sweep(models=args.models, backend=args.backend,
                         dry_run=args.dry_run, timeout=args.sweep_timeout,
                         limit=args.limit, axes=axes, stages=args.speed_stages,
-                        fill=args.speed_fill, ctx=args.speed_ctx, kv=args.speed_kv,
+                        fill=args.speed_fill, fills=args.speed_fills,
+                        ctx=args.speed_ctx, kv=args.speed_kv,
                         n_predict=args.n_predict, repeat=args.repeat,
                         chain=args.speed_chain, rounds=args.speed_rounds,
                         verify=args.speed_verify, verify_overrides=overrides,

@@ -92,6 +92,13 @@ def main():
                          "fast it GENERATES - speculative decoding and prefill are "
                          "not modelled anywhere in this tool, so they can only be "
                          "measured. Rows go to speed/, never to sweeps/")
+    ap.add_argument("--drafter", default=None, metavar="PATH",
+                    help="with --sweep or --speed-sweep: draft every model with "
+                         "this file. A dflash-*.gguf drafts as DFlash; a model with "
+                         "MTP blocks drafts as draft-mtp; anything else is refused. "
+                         "Absent, the speed sweep discovers dflash-*.gguf next to "
+                         "each model as before, and the fit sweep plans no "
+                         "speculation at all")
     ap.add_argument("--speed-axes", nargs="+", default=None, metavar="AXIS=V,V",
                     help="with --speed-sweep: run an explicit ladder instead of the "
                          "staged grid, e.g. --speed-axes ngl=26,28,30 spec=none")
@@ -281,7 +288,8 @@ def main():
                         chat_template_file=args.chat_template_file,
                         chat_template_kwargs=args.chat_template_kwargs,
                         reasoning=args.reasoning,
-                        reasoning_preserve=args.reasoning_preserve)
+                        reasoning_preserve=args.reasoning_preserve,
+                        drafter=args.drafter)
         sys.exit(0 if r else 1)
     if args.fit:
         from .fit import report
@@ -296,6 +304,7 @@ def main():
     if args.sweep:
         from .sweep import sweep      # deferred: only this path needs subprocess work
         r = sweep(models=args.models, backend=args.backend, dry_run=args.dry_run,
-                  timeout=args.sweep_timeout, limit=args.limit)
+                  timeout=args.sweep_timeout, limit=args.limit,
+                  drafter=args.drafter)
         sys.exit(0 if r else 1)
     serve(args.host, args.port, not args.no_browser)

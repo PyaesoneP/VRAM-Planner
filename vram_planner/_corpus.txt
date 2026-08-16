@@ -1019,8 +1019,9 @@ import datetime, hashlib, json, os, re, socket, statistics, time, urllib.error, 
 from .gpu import get_gpu_processes, gpu_list, gpu_shared_mib
 from .lmstudio import default_models_dir
 from .paths import _data_dir
-from .sweep import (build_argv, discover_models, find_drafter_for, finish_row,
-                    model_facts, pick_backend, backends_dir, serve, sweep_path,
+from .sweep import (build_argv, classify_drafter, discover_models,
+                    find_drafter_for, finish_row, model_facts, pick_backend,
+                    backends_dir, serve, sweep_path,
                     _drafter_block_size, _key, load_rows)
 
 
@@ -1950,13 +1951,32 @@ def stage_configs(letter, b, nl, is_moe, rungs, mmproj=None, facts=None,
         for v in STAGE_C_UB:
             add(ub=v, stage="C", wall=[("ub", "up")])
     elif letter == "d":
-        # draft-mtp needs nextn blocks in the file. Without them llama.cpp has
-        # nothing to draft from, so those rows are four wasted loads that all fail
-        # the same way - and the n-gram variants, which need nothing, are the only
-        # speculation such a model can use.
+        # draft-mtp needs nextn blocks somewhere: in the target file itself, or
+        # in an external drafter the user named (a separate MTP GGUF - e.g. a
+        # Qwen with a standalone *-MTP file). Without either, llama.cpp has
+        # nothing to draft from, so those rows are wasted loads that all fail
+        # the same way - and the n-gram variants, which need nothing, are the
+        # only speculation such a model can use.
         has_mtp = bool(facts.get("n_mtp_layers"))
+        # A drafter without a `kind` is the DFlash drafter by construction - the
+        # pre-picker shape only ever carried {path, block_size}.
+        mtp_drafter = bool(drafter and drafter.get("kind") == "mtp")
+        dmax = int((drafter or {}).get("depth") or 0) or 0
         for sp, nmax in STAGE_D_SPEC:
-            if sp == "draft-mtp" and not has_mtp:
+            if sp == "draft-mtp":
+                if mtp_drafter:
+                    # An external MTP drafter: depths past its trained blocks
+                    # are not configs (llama.cpp clamps them), and the drafter
+                    # rides every row the way DFlash's does.
+                    if dmax and nmax > dmax:
+                        continue
+                    add(spec=sp, spec_n_max=nmax, stage="D",
+                        md=drafter["path"], wall=[("spec_n_max", "up")])
+                elif not has_mtp:
+                    continue
+                else:
+                    add(spec=sp, spec_n_max=nmax, stage="D",
+                        wall=[("spec_n_max", "up")])
                 continue
             add(spec=sp, spec_n_max=nmax, stage="D",
                 wall=[("spec_n_max", "up")])
@@ -1967,7 +1987,7 @@ def stage_configs(letter, b, nl, is_moe, rungs, mmproj=None, facts=None,
         # the whole of it: the draft cache grows with depth, so the first depth
         # that OOMs prunes every deeper one at the same split - the pruned ones
         # are exactly the rows a hand-run --speed-axes ladder used to measure.
-        if drafter:
+        if drafter and drafter.get("kind") != "mtp":
             bs = int(drafter.get("block_size") or 0) or 16
             for nmax in range(1, bs + 1):
                 add(spec="draft-dflash", spec_n_max=nmax, stage="D",
@@ -2325,7 +2345,7 @@ def speed_sweep(models=None, backend=None, dry_run=False, timeout=420.0,
                 chain=False, rounds=1, verify=False, verify_overrides=None,
                 chat_template_file=None, chat_template_kwargs=None,
                 reasoning=None, reasoning_preserve=None, sampling=None,
-                mmproj_offload=None):
+                mmproj_offload=None, drafter=None):
     """Run the speed grid and append one row per config. Resumable like --sweep.
 
     `on_row` is called with each finished row, `on_total` when the number of
@@ -2365,9 +2385,19 @@ def speed_sweep(models=None, backend=None, dry_run=False, timeout=420.0,
     # The DFlash drafter, if the model has one next to it. Stage D then measures
     # the scheme whose cost the planner could only derive, which is the whole
     # point of the stage - and the drafter's block size sets the depth ladder.
+    # `drafter` is the campaign's own: None or "auto" discovers as before,
+    # "none" means no drafter at all (own-MTP and n-gram rows only), and a path
+    # names a specific file - an MTP GGUF, which is the scheme a plan can now
+    # price but no discovery can find on its own.
     dp = find_drafter_for(mp)
-    drafter = ({"path": dp, "block_size": _drafter_block_size(dp) or 16}
-               if dp else None)
+    if drafter in (None, "auto"):
+        drafter = ({"path": dp, "block_size": _drafter_block_size(dp) or 16,
+                    "kind": "dflash"}
+                   if dp else None)
+    elif drafter == "none":
+        drafter = None
+    else:
+        drafter = classify_drafter(drafter)
 
     # Validated before a single server is launched. A bad kwargs string is a
     # four-hour campaign that dies on config one, or worse - a template path with
@@ -2883,13 +2913,19 @@ def _draft_depths(spec, drafter=None):
     """The depth ladder one draft family walks, ascending.
 
     dflash depths come from the drafter's trained block size, the same ladder
-    stage D plans; draft-mtp from the same list STAGE_D_SPEC uses. Both are
-    what llama.cpp accepts - anything deeper is clamped, so a depth beyond the
-    list is not a config, it is the same row twice."""
+    stage D plans; draft-mtp from the same list STAGE_D_SPEC uses, capped at an
+    external drafter's own block count when one was named. Both are what
+    llama.cpp accepts - anything deeper is clamped, so a depth beyond the list
+    is not a config, it is the same row twice."""
     if spec == "draft-dflash":
         bs = int((drafter or {}).get("block_size") or 0) or 16
         return list(range(1, bs + 1))
-    return [n for s, n in STAGE_D_SPEC if s == "draft-mtp"]
+    depths = [n for s, n in STAGE_D_SPEC if s == "draft-mtp"]
+    if drafter and drafter.get("kind") == "mtp":
+        dmax = int(drafter.get("depth") or 0) or 0
+        if dmax:
+            depths = [n for n in depths if n <= dmax]
+    return depths
 
 
 def _draft_probe(c, is_moe, rung, depth):
@@ -4742,6 +4778,13 @@ def main():
                          "fast it GENERATES - speculative decoding and prefill are "
                          "not modelled anywhere in this tool, so they can only be "
                          "measured. Rows go to speed/, never to sweeps/")
+    ap.add_argument("--drafter", default=None, metavar="PATH",
+                    help="with --sweep or --speed-sweep: draft every model with "
+                         "this file. A dflash-*.gguf drafts as DFlash; a model with "
+                         "MTP blocks drafts as draft-mtp; anything else is refused. "
+                         "Absent, the speed sweep discovers dflash-*.gguf next to "
+                         "each model as before, and the fit sweep plans no "
+                         "speculation at all")
     ap.add_argument("--speed-axes", nargs="+", default=None, metavar="AXIS=V,V",
                     help="with --speed-sweep: run an explicit ladder instead of the "
                          "staged grid, e.g. --speed-axes ngl=26,28,30 spec=none")
@@ -4931,7 +4974,8 @@ def main():
                         chat_template_file=args.chat_template_file,
                         chat_template_kwargs=args.chat_template_kwargs,
                         reasoning=args.reasoning,
-                        reasoning_preserve=args.reasoning_preserve)
+                        reasoning_preserve=args.reasoning_preserve,
+                        drafter=args.drafter)
         sys.exit(0 if r else 1)
     if args.fit:
         from .fit import report
@@ -4946,7 +4990,8 @@ def main():
     if args.sweep:
         from .sweep import sweep      # deferred: only this path needs subprocess work
         r = sweep(models=args.models, backend=args.backend, dry_run=args.dry_run,
-                  timeout=args.sweep_timeout, limit=args.limit)
+                  timeout=args.sweep_timeout, limit=args.limit,
+                  drafter=args.drafter)
         sys.exit(0 if r else 1)
     serve(args.host, args.port, not args.no_browser)
 
@@ -10193,6 +10238,58 @@ def _run_suite(require_refs, tmp, skipped_real):
     print("  DFLASH chained stage rebuild keeps the drafter (md in baseline + rows)  %s"
           % ("OK" if chain_ok else "FAIL"))
     ok = ok and chain_ok
+    # ...and an external MTP drafter is the OTHER scheme the picker exists for:
+    # a separate GGUF with nextn blocks, which no discovery can find. The gate
+    # passes on the drafter's blocks instead of the model's facts, the depths
+    # are capped at what the drafter trained, and the drafter rides every row
+    # the way DFlash's does. The model's own blocks (no md) stay distinguishable
+    # from an external drafter (md present) even when both exist.
+    dm = stage_configs("d", dict(b0), 8, False, [1], facts={"n_mtp_layers": 0},
+                       drafter={"path": mtpp, "kind": "mtp", "depth": 2})
+    mtp_rows = [c for c in dm if c["spec"] == "draft-mtp"]
+    mtp_ok = (sorted({c["spec_n_max"] for c in mtp_rows}) == [1, 2]
+              and all(c["md"] == os.path.abspath(mtpp) for c in mtp_rows)
+              and not [c for c in dm if c["spec"] == "draft-dflash"]
+              and any(c["spec"] == "ngram-mod" for c in dm))
+    own_rows = [c for c in stage_configs("d", dict(b0), 8, False, [1],
+                                         facts={"n_mtp_layers": 2})
+                if c["spec"] == "draft-mtp"]
+    own_ok = (sorted({c["spec_n_max"] for c in own_rows}) == [1, 2, 3, 5]
+              and all("md" not in c for c in own_rows))
+    from .bench import _draft_depths
+    capped = _draft_depths("draft-mtp", {"kind": "mtp", "depth": 2}) == [1, 2] \
+        and _draft_depths("draft-mtp") == [1, 2, 3, 5]
+    print("  MTP external drafter: stage D carries -md capped at its blocks  %s"
+          % ("OK" if mtp_ok and own_ok and capped else "FAIL"))
+    ok = ok and mtp_ok and own_ok and capped
+    # The fit sweep gets the same scheme from the same spelling: classify the
+    # named file (dflash / MTP / refuse), then build_grid appends the spec rows
+    # with the drafter's md - the draft cache is real VRAM the plan only derives,
+    # so the allocation sweep measures it too.
+    from .sweep import build_grid, classify_drafter
+    drf_mtp = classify_drafter(mtpp)
+    drf_dfl = classify_drafter(pd)
+    drf_bad = drf_missing = False
+    try:
+        classify_drafter(p1)
+    except ValueError:
+        drf_bad = True
+    try:
+        classify_drafter(os.path.join(nod, "nope.gguf"))
+    except ValueError:
+        drf_missing = True
+    fg = [c for c in build_grid({"n_layers": 8, "n_ctx_train": 8192,
+                                 "is_moe": False}, drafter=drf_mtp)
+          if c.get("spec")]
+    fg_ok = (drf_mtp["kind"] == "mtp" and drf_mtp["depth"] == 1
+             and drf_dfl["kind"] == "dflash" and drf_dfl["block_size"] == 8
+             and drf_bad and drf_missing
+             and {c["spec"] for c in fg} == {"draft-mtp"}
+             and {c["spec_n_max"] for c in fg} == {1}
+             and all(c["md"] == os.path.abspath(mtpp) for c in fg))
+    print("  MTP external drafter: fit grid adds draft-mtp rows with the md  %s"
+          % ("OK" if fg_ok else "FAIL"))
+    ok = ok and fg_ok
 
     # 3b) MONOTONE WALLS: one hard OOM proves every worse rung in the same
     #     family fails the same way, so the queued loads that would re-prove it
@@ -13046,7 +13143,39 @@ def _drafter_block_size(drafter_path):
     return int(v) if isinstance(v, int) and v > 0 else 0
 
 
-def build_grid(facts, base=None, max_ctx=None):
+def classify_drafter(path):
+    """An explicitly named drafter file, classified for the sweep grids.
+
+    The same reading the plan makes: a `dflash-*.gguf` (dflash architecture)
+    drafts as DFlash, its trained block size setting the depth ladder; a full
+    model with MTP blocks (nextn_predict_layers > 0) drafts as MTP, its own
+    block count capping the depths. Anything else is refused rather than
+    measured as something it is not. Cheap like find_drafter_for(): only the
+    GGUF header is read."""
+    p = os.path.abspath(path)
+    if not os.path.isfile(p):
+        raise ValueError("drafter file not found: %s" % path)
+    meta = parse_meta_only(p)
+    if (meta.get("general.architecture") or "").lower() == "dflash":
+        bs = meta.get("dflash.block_size")
+        return {"path": p, "name": os.path.basename(p), "kind": "dflash",
+                "block_size": int(bs) if isinstance(bs, int) and bs > 0 else 16}
+    n = 0
+    for k, v in meta.items():
+        if str(k).endswith(".nextn_predict_layers"):
+            try:
+                n = max(n, int(v) or 0)
+            except (TypeError, ValueError):
+                pass
+    if n > 0:
+        return {"path": p, "name": os.path.basename(p), "kind": "mtp",
+                "depth": n}
+    raise ValueError("%s is neither a DFlash drafter (architecture 'dflash') "
+                     "nor a model with MTP blocks, so it cannot draft this "
+                     "model" % os.path.basename(p))
+
+
+def build_grid(facts, base=None, max_ctx=None, drafter=None):
     """Configs for one model: a baseline, each axis swept, then a few corners."""
     b = dict(base or BASE)
     nl = facts["n_layers"] or 32
@@ -13102,6 +13231,15 @@ def build_grid(facts, base=None, max_ctx=None):
               {"ctx": min(65536, ctx_cap), "kv": "q8_0", "seq": 4},
               {"ctx": min(32768, ctx_cap), "ngl": 0, "ub": 2048}):
         add(**c)
+    # Speculation, when a drafter was named: the draft cache is real VRAM the
+    # plan only derives, so the fit sweep measures it. Depth 1 and the
+    # recommended depth (the drafter's own blocks) are the rows that matter -
+    # the speed sweep walks the full ladder; this grid stays coarse on purpose.
+    if drafter:
+        cap = int(drafter.get("depth") or drafter.get("block_size") or 0) or 1
+        for nmax in (1, cap):
+            add(spec="draft-dflash" if drafter.get("kind") == "dflash"
+                   else "draft-mtp", spec_n_max=nmax, md=drafter["path"])
     return cfgs
 
 
@@ -13263,7 +13401,7 @@ def probe(model, axes, backend=None, timeout=420.0, port=8231, log=print):
 
 
 def sweep(models=None, backend=None, dry_run=False, out_path=None, timeout=420.0,
-          port=8231, limit=None, log=print):
+          port=8231, limit=None, log=print, drafter=None):
     """Run the grid for every model and append rows to the sweep file.
 
     Resumable by construction: the file is JSONL, appended one row at a time and
@@ -13289,13 +13427,14 @@ def sweep(models=None, backend=None, dry_run=False, out_path=None, timeout=420.0
         return None
 
     plan, skipped = [], 0
+    drf = classify_drafter(drafter) if drafter else None
     for mp in paths:
         try:
             facts = model_facts(mp)
         except Exception as e:
             log("  skip %s (%s)" % (os.path.basename(mp), e))
             continue
-        for c in build_grid(facts):
+        for c in build_grid(facts, drafter=drf):
             if _key(os.path.basename(mp), c) in done:
                 skipped += 1
                 continue
@@ -13492,6 +13631,11 @@ class Handler(BaseHTTPRequestHandler):
             # be collapsed with False the way `or None` would.
             "mmproj_offload": (None if data.get("mmproj_offload") is None
                                else bool(data.get("mmproj_offload"))),
+            # "none" means no drafter at all (own-MTP and n-gram rows only);
+            # "auto" is the server's discovery of a dflash-*.gguf next to the
+            # model, the long-standing default; a path names a specific file -
+            # an MTP GGUF, which no discovery can find on its own.
+            "drafter": (data.get("drafter") or "auto"),
             # Same two fields the launch-script card already carries, so a
             # campaign can be MEASURED under the template it will be RUN under.
             # Absent means the GGUF's own metadata template, which is what every
@@ -13522,6 +13666,15 @@ class Handler(BaseHTTPRequestHandler):
         kw = self._speed_args(data)
         if not kw["models"]:
             return {"ok": False, "error": "No such model file: %s" % (data.get("path") or "")}
+        # A named drafter is validated before the job starts, not inside it: a
+        # bad file is a one-line error, while a campaign that dies on config
+        # one costs the hours it took to get there.
+        if kw["drafter"] not in ("auto", "none"):
+            try:
+                from .sweep import classify_drafter
+                classify_drafter(kw["drafter"])
+            except ValueError as e:
+                return {"ok": False, "error": str(e)}
 
         def add_row(row):
             # Keep only what the table renders. A full row carries every measured

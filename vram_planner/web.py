@@ -143,6 +143,11 @@ class Handler(BaseHTTPRequestHandler):
             # be collapsed with False the way `or None` would.
             "mmproj_offload": (None if data.get("mmproj_offload") is None
                                else bool(data.get("mmproj_offload"))),
+            # "none" means no drafter at all (own-MTP and n-gram rows only);
+            # "auto" is the server's discovery of a dflash-*.gguf next to the
+            # model, the long-standing default; a path names a specific file -
+            # an MTP GGUF, which no discovery can find on its own.
+            "drafter": (data.get("drafter") or "auto"),
             # Same two fields the launch-script card already carries, so a
             # campaign can be MEASURED under the template it will be RUN under.
             # Absent means the GGUF's own metadata template, which is what every
@@ -173,6 +178,15 @@ class Handler(BaseHTTPRequestHandler):
         kw = self._speed_args(data)
         if not kw["models"]:
             return {"ok": False, "error": "No such model file: %s" % (data.get("path") or "")}
+        # A named drafter is validated before the job starts, not inside it: a
+        # bad file is a one-line error, while a campaign that dies on config
+        # one costs the hours it took to get there.
+        if kw["drafter"] not in ("auto", "none"):
+            try:
+                from .sweep import classify_drafter
+                classify_drafter(kw["drafter"])
+            except ValueError as e:
+                return {"ok": False, "error": str(e)}
 
         def add_row(row):
             # Keep only what the table renders. A full row carries every measured

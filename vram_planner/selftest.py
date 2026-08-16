@@ -352,6 +352,58 @@ def _run_suite(require_refs, tmp, skipped_real):
     print("  DFLASH chained stage rebuild keeps the drafter (md in baseline + rows)  %s"
           % ("OK" if chain_ok else "FAIL"))
     ok = ok and chain_ok
+    # ...and an external MTP drafter is the OTHER scheme the picker exists for:
+    # a separate GGUF with nextn blocks, which no discovery can find. The gate
+    # passes on the drafter's blocks instead of the model's facts, the depths
+    # are capped at what the drafter trained, and the drafter rides every row
+    # the way DFlash's does. The model's own blocks (no md) stay distinguishable
+    # from an external drafter (md present) even when both exist.
+    dm = stage_configs("d", dict(b0), 8, False, [1], facts={"n_mtp_layers": 0},
+                       drafter={"path": mtpp, "kind": "mtp", "depth": 2})
+    mtp_rows = [c for c in dm if c["spec"] == "draft-mtp"]
+    mtp_ok = (sorted({c["spec_n_max"] for c in mtp_rows}) == [1, 2]
+              and all(c["md"] == os.path.abspath(mtpp) for c in mtp_rows)
+              and not [c for c in dm if c["spec"] == "draft-dflash"]
+              and any(c["spec"] == "ngram-mod" for c in dm))
+    own_rows = [c for c in stage_configs("d", dict(b0), 8, False, [1],
+                                         facts={"n_mtp_layers": 2})
+                if c["spec"] == "draft-mtp"]
+    own_ok = (sorted({c["spec_n_max"] for c in own_rows}) == [1, 2, 3, 5]
+              and all("md" not in c for c in own_rows))
+    from .bench import _draft_depths
+    capped = _draft_depths("draft-mtp", {"kind": "mtp", "depth": 2}) == [1, 2] \
+        and _draft_depths("draft-mtp") == [1, 2, 3, 5]
+    print("  MTP external drafter: stage D carries -md capped at its blocks  %s"
+          % ("OK" if mtp_ok and own_ok and capped else "FAIL"))
+    ok = ok and mtp_ok and own_ok and capped
+    # The fit sweep gets the same scheme from the same spelling: classify the
+    # named file (dflash / MTP / refuse), then build_grid appends the spec rows
+    # with the drafter's md - the draft cache is real VRAM the plan only derives,
+    # so the allocation sweep measures it too.
+    from .sweep import build_grid, classify_drafter
+    drf_mtp = classify_drafter(mtpp)
+    drf_dfl = classify_drafter(pd)
+    drf_bad = drf_missing = False
+    try:
+        classify_drafter(p1)
+    except ValueError:
+        drf_bad = True
+    try:
+        classify_drafter(os.path.join(nod, "nope.gguf"))
+    except ValueError:
+        drf_missing = True
+    fg = [c for c in build_grid({"n_layers": 8, "n_ctx_train": 8192,
+                                 "is_moe": False}, drafter=drf_mtp)
+          if c.get("spec")]
+    fg_ok = (drf_mtp["kind"] == "mtp" and drf_mtp["depth"] == 1
+             and drf_dfl["kind"] == "dflash" and drf_dfl["block_size"] == 8
+             and drf_bad and drf_missing
+             and {c["spec"] for c in fg} == {"draft-mtp"}
+             and {c["spec_n_max"] for c in fg} == {1}
+             and all(c["md"] == os.path.abspath(mtpp) for c in fg))
+    print("  MTP external drafter: fit grid adds draft-mtp rows with the md  %s"
+          % ("OK" if fg_ok else "FAIL"))
+    ok = ok and fg_ok
 
     # 3b) MONOTONE WALLS: one hard OOM proves every worse rung in the same
     #     family fails the same way, so the queued loads that would re-prove it

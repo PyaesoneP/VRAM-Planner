@@ -1175,6 +1175,10 @@ function sweepDefaults(){
            shell: (SYS && SYS.shell) || "bash", busy: "",
            campaigns: null, insights: null, openCampaign: null,
            templates: [], speeddir: "",
+           // The drafter the plan just priced, so the sweep form can ride along
+           // on the same scheme instead of silently re-discovering a different
+           // one. Set by initSweep from the analyze result; null = plan had none.
+           drafterPick: null,
            // Which campaign is being asked about, which is mid-delete, and what
            // the last delete did. Deleting takes two clicks and the second one
            // reports what it removed and where it put it.
@@ -1350,6 +1354,7 @@ async function initSweep(r){
   // matches nothing.
   SWEEP.model = SWEEP.path.split(/[\\/]/).pop();
   SWEEP.mmproj = !!(r && r.mmproj);
+  SWEEP.drafterPick = (r && r.drafter && r.drafter.path) || null;
   // The planner's own answer is the fallback config: a script is useful before
   // anyone has spent two hours measuring, it just has to say that it is a guess.
   if(r && r.plan) SWEEP.predicted = {
@@ -1411,6 +1416,42 @@ async function loadTemplates(){
   }catch(e){ SWEEP.templates = []; }
 }
 
+/** The sweep form's drafter options: every .gguf next to the model, classified
+ *  by what stage D would do with it. Runs when the form renders (it does not
+ *  exist on the page before that), and the plan's own drafter choice rides
+ *  along: a candidate file lands in the select, a file from another folder
+ *  lands in the path box. */
+async function loadSweepDrafters(){
+  const sel = $("swdrafter");
+  if(!sel || !SWEEP.path) return;
+  const keep = sel.value;
+  while(sel.options.length > 2) sel.remove(2);
+  let cand = [];
+  try{
+    const d = await (await fetch("/api/drafters?path=" +
+                                encodeURIComponent(SWEEP.path))).json();
+    cand = (d && d.drafters) || [];
+  }catch(e){}
+  for(const c of cand){
+    const tag = c.kind === "dflash" ? "DFlash drafter"
+             : c.kind === "mtp" ? "MTP draft model" : "model file";
+    const opt = document.createElement("option");
+    opt.value = c.path;
+    opt.textContent = c.name + " — " + tag;
+    sel.appendChild(opt);
+  }
+  if(SWEEP.drafterPick){
+    if(cand.some(c => c.path === SWEEP.drafterPick)){
+      sel.value = SWEEP.drafterPick;
+    }else{
+      const pathBox = $("swdraftpath");
+      if(pathBox && !pathBox.value.trim()) pathBox.value = SWEEP.drafterPick;
+    }
+  }else if(keep && keep !== "__none__" && !cand.some(c => c.path === keep)){
+    sel.value = "";
+  }
+}
+
 async function loadSweepRows(){
   try{
     const d = await (await fetch("/api/speed/rows?model=" +
@@ -1439,6 +1480,8 @@ function drawSweep(what){
       ? sweepRunning(st)
       : sweepIdle() + (st && st.status === "failed"
           ? h`<p class="note" style="color:var(--warn)">Sweep failed: ${st.error}</p>` : "");
+    // The form was just built; its drafter options are not part of the HTML.
+    loadSweepDrafters();
   }
   if(what.results !== false){
     const rr = $("sweepresults");
@@ -1529,6 +1572,19 @@ function sweepForm(pf){
           model, which bought back whole expert layers. Sweeping it is stage B. Before this
           control the only way to pin it was to write
           <span class="mono">mmproj_offload=false</span> into the axes box.</details></p>
+    </div>
+    <div class="field" style="max-width:24em">
+      <label for="swdrafter">Draft model</label>
+      <select id="swdrafter">
+        <option value="">auto &mdash; the DFlash drafter (dflash-*.gguf) next to the model</option>
+        <option value="__none__">none &mdash; the model&rsquo;s own MTP blocks, or n-gram</option>
+      </select>
+      <p class="hint">Stage D measures the draft scheme you plan to run. A
+        <span class="mono">dflash-*.gguf</span> drafts as DFlash; a model file with MTP
+        blocks (a <span class="mono">*-MTP-*.gguf</span>) drafts as draft-mtp with its own
+        blocks; anything else is refused rather than measured.
+        <input type="text" id="swdraftpath" placeholder="or type a path to a drafter .gguf"
+               style="margin-top:6px"></p>
     </div>
     <p class="hint">Measure where you actually work: decode slows as the context fills, so a
       number taken at 2k is not the speed you feel at 40k. A deeper fill costs real time
@@ -1674,6 +1730,8 @@ function sweepBody(){
   const v = id => { const el = $(id); return el && el.value !== "" ? parseInt(el.value) : null; };
   const chain = $("swchain") ? $("swchain").checked : true;
   const verify = $("swverify") ? $("swverify").checked : false;
+  const swd = $("swdrafter") ? $("swdrafter").value : "auto";
+  const swdp = $("swdraftpath") ? $("swdraftpath").value.trim() : "";
   return { path: SWEEP.path, stages: sweepStages(), context: parseInt($("ctx").value),
            kv_type: $("kv").value,
            fill: $("swfills") && $("swfills").value.trim()
@@ -1690,6 +1748,10 @@ function sweepBody(){
            // which is a different thing from absent and has to survive as one.
            mmproj_offload: (($("swmmproj") && $("swmmproj").value) || "") === ""
              ? null : $("swmmproj").value === "ram" ? false : true,
+           // A typed path wins; otherwise the select, where "" is auto (the
+           // server's discovery, the long-standing default) and __none__ is no
+           // drafter at all.
+           drafter: swdp ? swdp : (swd === "__none__" ? "none" : (swd || "auto")),
            ...sweepAskBody() };
 }
 

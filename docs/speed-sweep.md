@@ -464,6 +464,8 @@ cache displaced start to cost more than speculation saves.
 
 ## 8.1 What the campaign found
 
+![A campaign's findings: what each knob was worth, speed vs context depth, and the speed-vs-VRAM frontier](ui-insights.png)
+
 Read from a real 65-row campaign: speculation was worth **+37.1%**, the expert split
 **+16.6%**, and ubatch **+1.3%** — which is the whole argument for measuring effects
 rather than rankings. The same panel also shows the one config measured at two depths

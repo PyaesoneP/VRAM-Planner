@@ -21,6 +21,8 @@ planner's **estimate**, and — when the two disagree — names every reason why
 
 ## Using the interface
 
+![The VRAM Planner interface: model controls, the recommended config, the three steps, and the fit verdict](docs/ui-overview.png)
+
 Four controls and a button get you an answer. Everything else is behind two
 disclosures, and the results column shows **one thing at a time**.
 
@@ -62,6 +64,25 @@ overrides it in both directions.
 Manager showing what the engine actually allocates:
 
 ![The same config running in LM Studio](docs/demo-lmstudio.gif)
+
+### Regenerating the screenshots
+
+`docs/ui-*.png` are captured from the running app rather than drawn, so they cannot
+drift into describing an interface that no longer exists — but they do have to be
+retaken after a UI change. The capture drives headless Chrome over the DevTools
+protocol; Node 22+ ships a WebSocket client, so it needs nothing installed:
+
+1. `python -m vram_planner --port 8140 --no-browser`
+2. `chrome --headless --remote-debugging-port=9222 --user-data-dir=<tmp> about:blank`
+3. connect to `http://127.0.0.1:9222/json`, drive the page with `Runtime.evaluate`,
+   and capture with `Page.captureScreenshot` (`captureBeyondViewport: true` and a clip
+   from `Page.getLayoutMetrics` for a full-page shot).
+
+Two things worth knowing if you write that script. `app.js` is a classic script, so its
+top-level `let` bindings — `LAST`, `SWEEP`, `REC` — live in the global *lexical* scope
+and are reachable as bare identifiers but **never** as `window.LAST`. And wait on what
+is painted, not on the state behind it: the step tabs are redrawn by a later callback
+than the fetch that feeds them, so polling the data captures a loading label.
 
 ## Supported platforms
 
@@ -395,6 +416,8 @@ Three things changed:
    you to notice that step 1 said `ncmoe 32` and step 2's best row said
    `ncmoe 31`.
 
+![The recommendation card: a measured config, and the four reasons it differs from the estimate](docs/ui-recommendation.png)
+
 That is a real reconciliation on a real store — the planner's own answer for this model
 is `ncmoe 32`, the fastest row it can stand behind is `ncmoe 31` with speculation on and
 the projector in system RAM, and every reason for the gap is named.
@@ -695,6 +718,8 @@ perfectly — the ratio is how you tell a real speculative win from an artefact 
 harness.
 
 ### Forgetting a campaign
+
+![The delete confirmation: what goes, what stays, and where the removed rows are kept](docs/ui-forget.png)
 
 Press **✕** on a row in **Past sweeps**, or:
 

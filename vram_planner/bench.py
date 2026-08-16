@@ -26,8 +26,9 @@ import datetime, hashlib, json, os, re, socket, statistics, time, urllib.error, 
 from .gpu import get_gpu_processes, gpu_list, gpu_shared_mib
 from .lmstudio import default_models_dir
 from .paths import _data_dir
-from .sweep import (build_argv, discover_models, finish_row, model_facts,
-                    pick_backend, backends_dir, serve, sweep_path, _key, load_rows)
+from .sweep import (build_argv, discover_models, find_drafter_for, finish_row,
+                    model_facts, pick_backend, backends_dir, serve, sweep_path,
+                    _drafter_block_size, _key, load_rows)
 
 
 BENCH_PORT = 8232          # 8231 is the allocation sweep's; 1234 is LM Studio's
@@ -737,7 +738,8 @@ STAGE_D_SPEC = [("none", 0), ("draft-mtp", 1), ("draft-mtp", 2), ("draft-mtp", 3
                 ("ngram-simple", 0)]
 
 
-def grid_context(facts, mmproj=None, base=None, model_path=None, carried=None):
+def grid_context(facts, mmproj=None, base=None, model_path=None, carried=None,
+                 drafter=None):
     """(baseline config, n_layers, is_moe, stage-A ladder) - what every stage needs.
 
     Split out of build_speed_grid() so a chained campaign can rebuild it between
@@ -748,10 +750,15 @@ def grid_context(facts, mmproj=None, base=None, model_path=None, carried=None):
     re-centres the ladder on the split that won, instead of on the planner's seed.
     That matters most in a second round: with speculation switched on, the draft
     cache costs VRAM the planner priced under different assumptions, so the wall
-    genuinely moves and the ladder has to move with it."""
+    genuinely moves and the ladder has to move with it.
+
+    `drafter` is the DFlash drafter {path, block_size} found next to the model;
+    its path rides the baseline as `md` so the whole grid carries it."""
     b = dict(base or SPEED_BASE)
     if mmproj:
         b["mmproj"] = mmproj
+    if drafter:
+        b["md"] = drafter["path"]
     nl = facts.get("n_layers") or 65
     # A context past what the model was trained on is not a config, it is a bad
     # request - and a staged grid carries a default context belonging to whichever
@@ -785,7 +792,130 @@ def grid_context(facts, mmproj=None, base=None, model_path=None, carried=None):
     return b, nl, is_moe, rungs
 
 
-def stage_configs(letter, b, nl, is_moe, rungs, mmproj=None, facts=None):
+# ---------------------------------------------------------------------------
+# Monotone walls: what one OOM proves about the configs still queued
+# ---------------------------------------------------------------------------
+# VRAM use is monotone in these axes - each block adds weights and its own KV,
+# a bigger ubatch buys a bigger compute buffer, a deeper draft buys a bigger
+# draft cache - so the first hard `oom` at a value proves every worse value
+# fails the same way, and the loads that would re-prove it are waste. Nothing
+# else does that: a genfail or timeout at one rung says nothing about the next,
+# and a `spilled` row loaded and ran (badly), which is a measurement, not a
+# wall. So only `oom` prunes, and only along a TAGGED axis within the SAME
+# family - every other knob equal - because changing any of them can move the
+# wall.
+_MONOTONE_AXES = {"ngl": "up", "ub": "up", "ctx": "up", "spec_n_max": "up"}
+
+# On an MoE the expert split is monotone the other way: more experts on the CPU
+# means less VRAM, so the wall is the SMALLEST n_cpu_moe that fits and worse
+# runs downward. ngl stays monotone-up everywhere - more whole blocks always
+# cost more - which is why it is never architecture-gated.
+_MONOTONE_MOE = {"ncmoe": "down"}
+
+
+def _wall_val(c, axis):
+    """The axis value, normalised the way _key() normalises optional keys."""
+    if axis == "ncmoe":
+        return c.get("ncmoe") or 0
+    if axis == "spec_n_max":
+        return c.get("spec_n_max") or 0
+    return c.get(axis)
+
+
+def _same_family(a, b, axis):
+    """Do two configs differ only on `axis`? An OOM only speaks for configs
+    that share everything else - changing any other knob can move the wall."""
+    for k, v in a.items():
+        if k == axis or k == "_wall":
+            continue
+        if b.get(k) != v:
+            return False
+    for k, v in b.items():
+        if k == axis or k == "_wall":
+            continue
+        if a.get(k) != v:
+            return False
+    return True
+
+
+def _worse(oom_cfg, q, axis, direction):
+    ov, qv = _wall_val(oom_cfg, axis), _wall_val(q, axis)
+    return (qv > ov) if direction == "up" else (qv < ov)
+
+
+def _prune_queue(queue, walls, i, name, oom_cfg):
+    """Drop pending configs whose OOM the row just measured already proves.
+
+    `i` is the index of the OOM row inside `queue`; entries before it have run
+    or are running. `walls` maps each queued config's resume key to the axes it
+    was tagged with when generated. Returns (kept, dropped)."""
+    kept, dropped = queue[:i + 1], []
+    tags = walls.get(_key(name, oom_cfg)) or ()
+    for q in queue[i + 1:]:
+        if any(_same_family(oom_cfg, q, axis) and _worse(oom_cfg, q, axis, d)
+               for axis, d in tags):
+            dropped.append(q)
+        else:
+            kept.append(q)
+    return kept, dropped
+
+
+def _tag_axes(cfgs, axes, is_moe):
+    """Tag an explicit --speed-axes ladder with its monotone axes, in place.
+
+    Only the axes whose VRAM use is provably monotone can prune. A ladder over
+    `spec` or `temp` cannot - the schemes and samplers have no ordering - so
+    those axes stay untagged and their rows are all measured, exactly as typed.
+    Cross-products get one tag per monotone axis; each prunes along its own
+    axis within a family that fixes everything else, so a ngl x spec ladder
+    prunes ngl rows within each spec."""
+    tags = [(a, d) for a, d in _MONOTONE_AXES.items() if a in axes]
+    if is_moe:
+        tags.extend((a, d) for a, d in _MONOTONE_MOE.items() if a in axes)
+    if not tags:
+        return
+    for c in cfgs:
+        c["_wall"] = list(tags)
+
+
+def _depth_extras(out, base, facts, extra_fills, axis, direction):
+    """The configs that re-measure the top stage-A rungs at deeper fills.
+
+    The wall does not move with fill - the allocation is decided by the frozen
+    ctx at load time, and fill only decides how much of it is used - so the
+    rungs the ladder already proved fit are the rungs a deep-fill row can use,
+    without paying for the wall again. Rungs are ranked by the wall axis: the
+    most layers on the GPU is the config worth re-measuring at depth, and the
+    top three are what the docs tell you to run anyway.
+
+    Rows at another fill never compete for the chained baseline - comparable()
+    gates on fill, so these are a separate experiment on purpose: the depth
+    slope §8 keeps telling you to run, made part of the campaign instead of a
+    command line after it."""
+    if not extra_fills:
+        return []
+    got = []
+    for r in out:
+        c = r.get("config") or {}
+        if (r.get("status") == "ok" and c.get("stage") == "A"
+                and (c.get("fill") or 0) == (base.get("fill") or 0)
+                and c.get(axis) is not None):
+            got.append(c)
+    rungs = sorted({c.get(axis) for c in got}, reverse=(direction == "up"))
+    cfgs = []
+    for f in extra_fills:
+        for v in rungs[:3]:
+            c = dict(base)
+            c[axis] = v
+            c["fill"] = f
+            c["stage"] = "A"
+            c["_wall"] = [(axis, direction)]
+            cfgs.append(c)
+    return cfgs
+
+
+def stage_configs(letter, b, nl, is_moe, rungs, mmproj=None, facts=None,
+                  drafter=None):
     """The configs one stage varies, from the baseline it is handed.
 
     One knob at a time, deliberately - the same reasoning as sweep.build_grid,
@@ -795,15 +925,20 @@ def stage_configs(letter, b, nl, is_moe, rungs, mmproj=None, facts=None):
     facts = facts or {}
     out = []
 
-    def add(**kw):
+    def add(wall=(), **kw):
         c = dict(b)
         c.update(kw)
         c["ngl"] = max(0, min(c["ngl"], nl))
+        if wall:
+            c["_wall"] = list(wall)
         out.append(c)
 
     if letter == "a":
         for v in rungs:
-            add(ncmoe=v, stage="A") if is_moe else add(ngl=v, stage="A")
+            if is_moe:
+                add(ncmoe=v, stage="A", wall=[("ncmoe", "down")])
+            else:
+                add(ngl=v, stage="A", wall=[("ngl", "up")])
     elif letter == "b" and mmproj:
         # The projector can sit in system RAM instead. Text decode is unaffected,
         # so those megabytes come back as GPU blocks without giving up images -
@@ -812,13 +947,15 @@ def stage_configs(letter, b, nl, is_moe, rungs, mmproj=None, facts=None):
             # The freed megabytes buy back EXPERTS here, not blocks, so the ladder
             # walks down from the seed rather than up.
             for v in range(max(0, rungs[0] - NGL_ABOVE), rungs[-1] + 1):
-                add(ncmoe=v, mmproj_offload=False, stage="B")
+                add(ncmoe=v, mmproj_offload=False, stage="B",
+                    wall=[("ncmoe", "down")])
         else:
             for v in range(rungs[0], min(nl, rungs[-1] + NGL_ABOVE) + 1):
-                add(ngl=v, mmproj_offload=False, stage="B")
+                add(ngl=v, mmproj_offload=False, stage="B",
+                    wall=[("ngl", "up")])
     elif letter == "c":
         for v in STAGE_C_UB:
-            add(ub=v, stage="C")
+            add(ub=v, stage="C", wall=[("ub", "up")])
     elif letter == "d":
         # draft-mtp needs nextn blocks in the file. Without them llama.cpp has
         # nothing to draft from, so those rows are four wasted loads that all fail
@@ -828,7 +965,20 @@ def stage_configs(letter, b, nl, is_moe, rungs, mmproj=None, facts=None):
         for sp, nmax in STAGE_D_SPEC:
             if sp == "draft-mtp" and not has_mtp:
                 continue
-            add(spec=sp, spec_n_max=nmax, stage="D")
+            add(spec=sp, spec_n_max=nmax, stage="D",
+                wall=[("spec_n_max", "up")])
+        # DFlash is the same gate a different way: the drafter is a SEPARATE file,
+        # so its presence next to the model decides whether the scheme exists -
+        # not a flag on the target, and nothing the model's own facts can say.
+        # Depths come from the drafter's trained block size and the ladder walks
+        # the whole of it: the draft cache grows with depth, so the first depth
+        # that OOMs prunes every deeper one at the same split - the pruned ones
+        # are exactly the rows a hand-run --speed-axes ladder used to measure.
+        if drafter:
+            bs = int(drafter.get("block_size") or 0) or 16
+            for nmax in range(1, bs + 1):
+                add(spec="draft-dflash", spec_n_max=nmax, stage="D",
+                    md=drafter["path"], wall=[("spec_n_max", "up")])
     return out
 
 
@@ -844,7 +994,8 @@ def _dedupe(cfgs, seen=None):
     return out
 
 
-def build_speed_grid(facts, mmproj=None, base=None, stages="abcd", model_path=None):
+def build_speed_grid(facts, mmproj=None, base=None, stages="abcd", model_path=None,
+                     drafter=None):
     """The whole staged grid, one knob at a time from one fixed baseline.
 
     Stages C and D are pinned at the planner's ngl rather than at whatever stage A
@@ -852,12 +1003,14 @@ def build_speed_grid(facts, mmproj=None, base=None, stages="abcd", model_path=No
     A has run. That is what `chain=True` in speed_sweep() fixes, by building the
     stages one at a time instead of all at once; this function stays as the
     unchained grid and as the size the estimate is computed from."""
-    b, nl, is_moe, rungs = grid_context(facts, mmproj, base, model_path)
+    b, nl, is_moe, rungs = grid_context(facts, mmproj, base, model_path,
+                                        drafter=drafter)
     cfgs, seen = [], set()
     for letter in "abcd":
         if letter in stages:
             cfgs.extend(_dedupe(
-                stage_configs(letter, b, nl, is_moe, rungs, mmproj, facts), seen))
+                stage_configs(letter, b, nl, is_moe, rungs, mmproj, facts,
+                              drafter), seen))
     return cfgs
 
 
@@ -880,7 +1033,7 @@ _CONFIG_DEFAULTS = {"ncmoe": 0, "spec_n_max": 0, "fill": 0, "seq": 1,
 # What carries forward. Not ctx / kv / fill / seq / fa: those are frozen by the
 # form and are the campaign's definition rather than any of its results. Not
 # `stage`, which is a label.
-CARRY_KEYS = ("ngl", "ncmoe", "ub", "mmproj_offload", "spec", "spec_n_max")
+CARRY_KEYS = ("ngl", "ncmoe", "ub", "mmproj_offload", "spec", "spec_n_max", "md")
 
 # Below this fraction of unique 8-word windows the output is repetition, not
 # work. One constant because the run-time table and the trustworthy() gate must
@@ -1172,7 +1325,7 @@ def preflight(log=print, need_free_pct=0.85):
 
 def speed_sweep(models=None, backend=None, dry_run=False, timeout=420.0,
                 port=BENCH_PORT, limit=None, axes=None, stages="abcd", fill=None,
-                ctx=None, kv=None,
+                fills=None, ctx=None, kv=None,
                 n_predict=N_PREDICT, repeat=N_REPEAT, log=print, skip_preflight=False,
                 on_row=None, should_stop=None, on_total=None,
                 should_abort=None, on_server=None,
@@ -1216,6 +1369,12 @@ def speed_sweep(models=None, backend=None, dry_run=False, timeout=420.0,
         log("%d models matched; benchmarking %s" % (len(paths), os.path.basename(mp)))
     facts = model_facts(mp)
     mmproj = find_mmproj_for(mp)
+    # The DFlash drafter, if the model has one next to it. Stage D then measures
+    # the scheme whose cost the planner could only derive, which is the whole
+    # point of the stage - and the drafter's block size sets the depth ladder.
+    dp = find_drafter_for(mp)
+    drafter = ({"path": dp, "block_size": _drafter_block_size(dp) or 16}
+               if dp else None)
 
     # Validated before a single server is launched. A bad kwargs string is a
     # four-hour campaign that dies on config one, or worse - a template path with
@@ -1262,6 +1421,22 @@ def speed_sweep(models=None, backend=None, dry_run=False, timeout=420.0,
         base["mmproj_offload"] = bool(mmproj_offload)
     if fill is not None:
         base["fill"] = fill
+    # --speed-fills: the first value is the campaign fill, the rest are DEEPER
+    # fills that re-measure the top stage-A rungs once the wall is known (see
+    # _depth_extras). They are part of the campaign rather than a command line
+    # run afterwards, so the depth slope §8 keeps telling you to measure is
+    # collected while the grid is already loaded - and at rungs chosen by what
+    # actually fit, not by the planner's guess.
+    extra_fills = None
+    if fills:
+        base["fill"] = fills[0]
+        extra_fills = fills[1:]
+        if extra_fills and (axes or "a" not in (stages or "")):
+            log("note    : --speed-fills re-measures the top stage-A rungs at deeper "
+                "fills, but %s, so the extra fills were dropped"
+                % ("an explicit --speed-axes ladder replaces the staged grid"
+                   if axes else "stage A is not in --speed-stages"))
+            extra_fills = None
     if ctx is not None:
         base["ctx"] = ctx
     if kv is not None:
@@ -1276,7 +1451,7 @@ def speed_sweep(models=None, backend=None, dry_run=False, timeout=420.0,
             "IS the projector sweep"
             % ("VRAM" if mmproj_offload else "system RAM"))
     cfgs = build_speed_grid(facts, mmproj=mmproj, base=base, stages=stages,
-                            model_path=mp)
+                            model_path=mp, drafter=drafter)
     if axes:
         # An explicit ladder replaces the staged grid: this is how a stage gets
         # re-run at the ngl the previous stage actually settled on.
@@ -1289,11 +1464,18 @@ def speed_sweep(models=None, backend=None, dry_run=False, timeout=420.0,
         # measures a config nobody asked about, next to stage rows that used 41.
         # It also clamps ctx to what the model was trained on, which the staged
         # path has always done and this one silently did not.
-        gbase = grid_context(facts, mmproj=mmproj, base=base, model_path=mp)[0]
+        gbase = grid_context(facts, mmproj=mmproj, base=base, model_path=mp,
+                             drafter=drafter)[0]
         combos = [dict(gbase, **({"mmproj": mmproj} if mmproj else {}))]
         for k, vals in axes.items():
             combos = [dict(c, **{k: v}) for c in combos for v in vals]
         cfgs = combos
+        # An explicit ladder prunes the same way a staged one does: a hard OOM
+        # at one rung proves every worse rung in the same family fails the same
+        # way, on the monotone axes (see _tag_axes). Ladders over `spec` or
+        # `temp` have no ordering, so their rows are all measured, exactly as
+        # typed.
+        _tag_axes(cfgs, set(axes), bool(facts.get("is_moe")))
     chain, note = resolve_search(axes, chain)
     if note:
         log(note)
@@ -1405,6 +1587,11 @@ def speed_sweep(models=None, backend=None, dry_run=False, timeout=420.0,
         if chain and len(shown) < len(plan):
             log("  .. and %d more in later stages, built from what the ones above find"
                 % (len(plan) - len(shown)))
+        if extra_fills:
+            log("depth   : after stage A, the top rungs are re-measured at fill%s %s "
+                "- not listed here, since they depend on what stage A finds"
+                % ("s" if len(extra_fills) > 1 else "",
+                   " ".join(str(f) for f in extra_fills)))
         if verify:
             log("verify  : after the campaign, the winner is loaded once more at the")
             extra = (" (" + " ".join("%s=%s" % (k, ",".join(map(str, v)))
@@ -1455,16 +1642,54 @@ def speed_sweep(models=None, backend=None, dry_run=False, timeout=420.0,
 
     with open(path, "a", encoding="utf-8") as fh:
 
-        def run_group(cfgs):
-            """Measure a list of configs. Returns False if asked to stop."""
+        def run_group(cfgs, stage=None, extra_fills=None):
+            """Measure a list of configs. Returns False if asked to stop.
+
+            `stage` names the stage for the depth-extras hook (see _depth_extras);
+            `extra_fills` is the list of deeper fills to re-measure the top stage-A
+            rungs at, once the ladder and its wall are done."""
             queue = list(cfgs)
             tries = {}
+            walls = {}
+            extras_done = [False]
             i = -1
             while True:
                 i += 1
                 if i >= len(queue):
+                    # Stage A found the wall and measured the fitting rungs. If
+                    # deeper fills were asked for, the top rungs are re-measured
+                    # at them now: the wall is free to reuse (the allocation is
+                    # decided by ctx at load, not by fill), and rows at another
+                    # fill are a separate experiment that cannot carry the
+                    # chained baseline (comparable() gates on fill).
+                    if (stage == "a" and extra_fills and not extras_done[0]
+                            and limit is None):
+                        extras_done[0] = True
+                        axis = "ncmoe" if facts.get("is_moe") else "ngl"
+                        direction = "down" if facts.get("is_moe") else "up"
+                        # `recorded` supplies the rungs of a RESUMED campaign:
+                        # its stage-A rows live on disk, not in `out`.
+                        ex = [c for c in _depth_extras(
+                                out + list(recorded.values()), base, facts,
+                                extra_fills, axis, direction)
+                              if _key(name, c) not in done]
+                        if ex:
+                            log("depth   : re-measuring the top stage-A rungs at "
+                                "fill%s %s - the wall is already known, so these "
+                                "rows do not pay for it again"
+                                % ("s" if len(extra_fills) > 1 else "",
+                                   " ".join(str(f) for f in extra_fills)))
+                            queue.extend(ex)
+                            total[0] = len(out) + len(queue) - i - 1
+                            if on_total:
+                                on_total(total[0], planned=max(planned, total[0]))
+                            continue
                     return True
                 c = queue[i]
+                # The wall tag rides the config to the queue and is stripped
+                # before the row is measured: it is search bookkeeping, not a
+                # setting, and it must never reach a row, a resume key or disk.
+                walls[_key(name, c)] = c.pop("_wall", None) or ()
                 if should_stop and should_stop():
                     log("stopped after %d of %d configs. The rows already written "
                         "are keyed, so re-running resumes here."
@@ -1496,7 +1721,30 @@ def speed_sweep(models=None, backend=None, dry_run=False, timeout=420.0,
                 log(_fmt_row(c, row, len(out), total[0]))
                 if on_row:
                     on_row(row)
-                # A speculative config that OOMs gets ONE MORE RUNG, repeatedly.
+                # A hard OOM is monotone evidence: it proves every pending config
+                # in the same family that is worse on a tagged axis fails the same
+                # way, so those loads would re-prove the wall instead of measuring
+                # anything. Only `oom` prunes - a genfail, exit or timeout says
+                # nothing about the next rung, and `spilled` means it LOADED (and
+                # ran badly), which is a measurement. The OOM row stays: it is
+                # the wall the ladder is read from. Pruned rows are never
+                # recorded, so a resumed campaign after a card change re-measures
+                # them naturally.
+                if row.get("status") == "oom":
+                    kept, dropped = _prune_queue(queue, walls, i, name, c)
+                    if dropped:
+                        queue = kept
+                        log("wall    : %s OOMs; %d later config%s provably worse, "
+                            "skipped: %s"
+                            % (_carry_summary(c), len(dropped),
+                               "" if len(dropped) == 1 else "s",
+                               ", ".join(_carry_summary(d) for d in dropped)))
+                        total[0] = len(out) + (len(queue) - i - 1)
+                        if on_total:
+                            on_total(total[0], planned=max(planned, total[0]))
+                # A draft family that OOMs walks one rung freer, repeatedly -
+                # the walk is per family, with the depth ladder nested inside
+                # each rung (see _spec_retry).
                 #
                 # This is the fix for a stage that could not succeed. Stages A
                 # and B choose the fastest split that FITS, which is by
@@ -1515,17 +1763,35 @@ def speed_sweep(models=None, backend=None, dry_run=False, timeout=420.0,
                 # - so walking a few rungs costs far less than the finding is
                 # worth. Bounded, because an OOM that is NOT about the draft
                 # cache would otherwise walk the whole ladder.
-                nxt = _spec_retry(c, row, facts, tries)
+                if (c.get("spec") or "none") in ("draft-mtp", "draft-dflash"):
+                    nxt = _spec_retry(c, row, facts, tries, drafter=drafter)
+                else:
+                    nxt = None
                 if nxt is not None and _key(name, nxt) not in done:
-                    log("          ^ that OOM is the draft cache, not the model. "
-                        "Retrying one rung freer: %s" % _carry_summary(nxt))
+                    log("          ^ the draft cache does not fit here. %s: %s"
+                        % (("walking one rung freer" if row.get("status") == "oom"
+                            else "continuing the depth ladder"),
+                           _carry_summary(nxt)))
                     queue.append(nxt)
                     total[0] = len(out) + (len(queue) - i - 1)
                     if on_total:
                         on_total(total[0], planned=max(planned, total[0]))
 
         if not chain:
-            stopped = not run_group(plan)
+            # With deeper fills, stage A's rows run first, then the depth rows
+            # (the hook fires when the stage-A list drains), then the rest of
+            # the plan. Splitting at the stage boundary keeps the depth rows
+            # next to the ladder they were chosen by, instead of at the end of
+            # a mixed list. Without fills this stays the single call it always
+            # was.
+            if extra_fills:
+                part_a = [c for c in plan if (c.get("stage") or "").lower() == "a"]
+                rest = [c for c in plan if (c.get("stage") or "").lower() != "a"]
+                stopped = not run_group(part_a, stage="a", extra_fills=extra_fills)
+                if not stopped and rest:
+                    stopped = not run_group(rest, stage=None, extra_fills=None)
+            else:
+                stopped = not run_group(plan)
         else:
             # Coordinate descent. `carried` is the config the fastest trustworthy
             # comparable row used; `best_tok` is what it did, so a challenger has
@@ -1541,10 +1807,10 @@ def speed_sweep(models=None, backend=None, dry_run=False, timeout=420.0,
                         break
                     gb, gnl, gmoe, grungs = grid_context(
                         facts, mmproj=mmproj, base=base, model_path=mp,
-                        carried=carried)
+                        carried=carried, drafter=drafter)
                     todo = [c for c in _dedupe(
                                 stage_configs(letter, gb, gnl, gmoe, grungs,
-                                              mmproj, facts), seen)
+                                              mmproj, facts, drafter), seen)
                             if _key(name, c) not in done]
                     if budget is not None:
                         todo = todo[:budget]
@@ -1552,6 +1818,15 @@ def speed_sweep(models=None, backend=None, dry_run=False, timeout=420.0,
                     tag = "stage %s" % letter.upper() + (
                         " round %d" % rd if (rounds or 1) > 1 else "")
                     if not todo:
+                        if letter == "a" and extra_fills and limit is None:
+                            # Everything at the campaign fill is recorded, but the
+                            # deeper fills are a SEPARATE experiment (fill is in
+                            # _key), so there may still be depth rows to measure.
+                            # The hook fires off an empty list.
+                            if not run_group([], stage="a",
+                                             extra_fills=extra_fills):
+                                stopped = True
+                                break
                         log("%s: nothing new to measure at this baseline" % tag)
                         continue
                     log("%s: %d config%s at %s"
@@ -1564,7 +1839,9 @@ def speed_sweep(models=None, backend=None, dry_run=False, timeout=420.0,
                     planned = max(planned, total[0])
                     if on_total:
                         on_total(total[0], stage=tag, planned=planned)
-                    if not run_group(todo):
+                    if not run_group(todo, stage=letter,
+                                     extra_fills=extra_fills if letter == "a"
+                                     else None):
                         stopped = True
                         break
                     _spec_wall_note(out, todo, gb, log)
@@ -1601,7 +1878,7 @@ def speed_sweep(models=None, backend=None, dry_run=False, timeout=420.0,
             "chained": bool(chain), "verified": verified}
 
 
-# How far a speculative config may walk looking for room. Four rungs was enough
+# How far a draft family may walk looking for room. Five rungs was enough
 # for both models it was needed on - draft-mtp fitted 3 rungs down on a dense
 # model and 5 up on an MoE, the latter found because the ladder was written by
 # hand. Bounded because an OOM that is not about the draft cache would otherwise
@@ -1609,39 +1886,106 @@ def speed_sweep(models=None, backend=None, dry_run=False, timeout=420.0,
 SPEC_RETRY_RUNGS = 5
 
 
-def _spec_retry(c, row, facts, tries):
-    """The next config to try when a speculative one OOMs, or None.
+def _draft_depths(spec, drafter=None):
+    """The depth ladder one draft family walks, ascending.
 
-    Only for a draft model. The n-gram speculators build their drafts from the
-    context that is already there and allocate no second cache, so an OOM from
-    one of them is about the model, not about speculation, and walking would
-    only prove it more slowly.
+    dflash depths come from the drafter's trained block size, the same ladder
+    stage D plans; draft-mtp from the same list STAGE_D_SPEC uses. Both are
+    what llama.cpp accepts - anything deeper is clamped, so a depth beyond the
+    list is not a config, it is the same row twice."""
+    if spec == "draft-dflash":
+        bs = int((drafter or {}).get("block_size") or 0) or 16
+        return list(range(1, bs + 1))
+    return [n for s, n in STAGE_D_SPEC if s == "draft-mtp"]
 
-    Direction is per-architecture and they are opposites: on an MoE, raising
-    n_cpu_moe moves more experts to the CPU and FREES VRAM; on a dense model,
-    lowering ngl moves whole blocks off the GPU and frees it. Getting this
-    backwards would walk straight into the wall."""
-    if row.get("status") != "oom":
-        return None
-    spec = (c.get("spec") or "none")
-    if not spec.startswith("draft"):
-        return None
-    k = (spec, c.get("spec_n_max") or 0)
-    n = tries.get(k, 0)
-    if n >= SPEC_RETRY_RUNGS:
-        return None
-    nl = facts.get("n_layers") or 0
+
+def _draft_probe(c, is_moe, rung, depth):
+    """One probe of a draft family's wall walk: one rung freer, one depth."""
     d = dict(c)
-    if facts.get("is_moe"):
-        d["ncmoe"] = (c.get("ncmoe") or 0) + 1
-        if nl and d["ncmoe"] > nl:
+    d.pop("_wall", None)
+    d["spec_n_max"] = depth
+    if is_moe:
+        d["ncmoe"] = rung
+    else:
+        d["ngl"] = rung
+    return d
+
+
+def _spec_retry(c, row, facts, tries, drafter=None):
+    """The next config a draft family's wall walk measures, or None.
+
+    A draft model needs its own KV cache and llama.cpp keeps it at f16 whatever
+    the main cache is quantised to, so speculation costs several hundred MiB the
+    split it is being tried at was never chosen to leave room for. Stage D only
+    ever tries it at the split stage A/B settled on - by construction the fastest
+    one that fits, usually the one with the least headroom - so the draft rows
+    OOM and the campaign reads "speculation does not work" when what it measured
+    was "speculation does not fit at this particular split".
+
+    The walk settles which it is. It belongs to the SPEC FAMILY, not to one
+    (spec, depth) pair: one walk per draft scheme, rung by rung in the direction
+    that frees VRAM (lower ngl on a dense model, higher n_cpu_moe on an MoE),
+    with the depth ladder nested inside each rung, ascending:
+
+      * the first depth that OOMs at a rung proves every deeper one does too
+        (the draft cache grows with depth), so the ladder restarts one rung
+        freer at the depth that just failed - the depths below it fit at a
+        stricter rung and are dominated there;
+      * a rung where a depth FITS continues the ladder at that same rung until
+        it OOMs or the ladder is exhausted - the rungs below are dominated,
+        because they carry fewer layers on the GPU and nothing fit there that
+        did not fit higher.
+
+    That makes the walk cheap where the old per-depth walks were wasteful: three
+    dflash depths used to re-prove the same wall three times over, once each."""
+    # Only the two draft schemes walk. The n-gram speculators build their drafts
+    # from the context that is already there and allocate no second cache, so an
+    # OOM from one of them is about the model, not about speculation, and walking
+    # would only prove it more slowly. This is an exact allow-list, not a prefix
+    # match: "draft-gram-l2" is llama.cpp's CLI spelling and must not be walked
+    # as though it were draft-mtp.
+    spec = (c.get("spec") or "none")
+    if spec not in ("draft-mtp", "draft-dflash"):
+        return None
+    if row.get("status") not in ("ok", "oom"):
+        return None
+    depths = _draft_depths(spec, drafter)
+    if not depths:
+        return None
+    is_moe = bool(facts.get("is_moe"))
+    nl = facts.get("n_layers") or 0
+    axis = "ncmoe" if is_moe else "ngl"
+    st = tries.get(spec)
+    if st is None:
+        # The first OOM at the baseline rung starts the walk one rung freer,
+        # resuming the ladder at the depth that just failed.
+        if row.get("status") != "oom":
+            return None          # the plan rows cover the baseline rung's ladder
+        d = int(c.get("spec_n_max") or 0)
+        idx = min(range(len(depths)), key=lambda i: abs(depths[i] - d))
+        st = {"rung": int(c.get(axis) or 0), "idx": idx, "steps": 0}
+        tries[spec] = st
+    if row.get("status") == "ok":
+        # Continue the depth ladder at the rung that fits. Exhausted means the
+        # whole rung fits and the walk is over - nothing is left to find.
+        if st["idx"] + 1 >= len(depths):
+            return None
+        st["idx"] += 1
+        return _draft_probe(c, is_moe, st["rung"], depths[st["idx"]])
+    # OOM: walk one rung freer and resume the ladder at the depth that failed.
+    st["steps"] += 1
+    if st["steps"] > SPEC_RETRY_RUNGS:
+        return None
+    if is_moe:
+        r = st["rung"] + 1
+        if r > nl:
             return None
     else:
-        d["ngl"] = (c.get("ngl") or 0) - 1
-        if d["ngl"] < 1:
+        r = st["rung"] - 1
+        if r < 1:
             return None
-    tries[k] = n + 1
-    return d
+    st["rung"] = r
+    return _draft_probe(c, is_moe, r, depths[st["idx"]])
 
 
 def _spec_wall_note(out, todo, base, log):

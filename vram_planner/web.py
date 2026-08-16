@@ -113,7 +113,12 @@ class Handler(BaseHTTPRequestHandler):
             "models": [path] if path and os.path.exists(path) else None,
             "stages": (data.get("stages") or "abcd").lower(),
             "ctx": as_int("context"), "kv": data.get("kv_type") or None,
-            "fill": as_int("fill"), "limit": as_int("limit"),
+            "fill": as_int("fill") if not data.get("fills") else None,
+            # Deeper fills for the top stage-A rungs, once the wall is known -
+            # the depth slope as part of the campaign instead of a second run.
+            "fills": ([int(v) for v in
+                       str(data.get("fills") or "").replace(",", " ").split()
+                       if v.strip()] or None), "limit": as_int("limit"),
             "n_predict": as_int("n_predict", 128), "repeat": as_int("repeat", 3),
             "timeout": float(data.get("timeout") or 420.0),
             # Chained is the UI's default: it costs the same hours and measures
@@ -597,6 +602,10 @@ class Handler(BaseHTTPRequestHandler):
                 n_seq=int(data.get("n_seq", 1) or 1),
                 include_mmproj=bool(data.get("include_mmproj", True)),
                 mtp_spec=bool(data.get("mtp_spec", True)),
+                # DFlash is a second model file next to the target; the flag is
+                # the request to price it, and its absence leaves the plan on the
+                # model alone (the same default as the MTP checkbox).
+                dflash=(data.get("spec") == "draft-dflash" or bool(data.get("dflash"))),
                 flash_attn=bool(data.get("flash_attn", False)),
                 vram_budget_mib=float(data.get("vram_budget_mib", 0)),
                 ram_budget_mib=float(data.get("ram_budget_mib", 0)),

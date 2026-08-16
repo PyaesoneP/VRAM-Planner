@@ -400,6 +400,10 @@ def scan_models(root):
         for fn in fns:
             if not fn.lower().endswith(".gguf"):
                 continue
+            # Not models: projectors and DFlash drafters cannot load on their
+            # own, and planning one of them answers a question nobody asked.
+            if fn.lower().startswith("mmproj") or fn.lower().startswith("dflash"):
+                continue
             full = os.path.join(dp, fn)
             m = SHARD_RE.match(fn)
             if m:

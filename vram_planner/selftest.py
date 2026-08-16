@@ -179,6 +179,274 @@ def _run_suite(require_refs, tmp, skipped_real):
              r["active_params"]/1e9, r["params_total"]/1e9))
     ok = ok and (r["is_moe"] is True) and (p["kind"] == "moe") and (r["active_params"] < r["params_total"])
 
+    # 3b) DFlash drafter: a SEPARATE file next to the model whose architecture is
+    #     "dflash". It is a drafter, not a model: it must be found for its target,
+    #     priced by the plan, swept by stage D at its own block depth, and handed
+    #     to llama.cpp with -md - and it must never surface as a model itself.
+    dl = 3
+    draft_t = []
+    for i in range(dl):
+        draft_t += [
+            ("blk.%d.attn_q.weight" % i, [hid, hid], 12),
+            ("blk.%d.attn_k.weight" % i, [hid, nkv * hd], 12),
+            ("blk.%d.attn_v.weight" % i, [hid, nkv * hd], 12),
+            ("blk.%d.attn_output.weight" % i, [hid, hid], 12),
+            ("blk.%d.ffn_gate.weight" % i, [hid, 1536], 12),
+            ("blk.%d.ffn_up.weight" % i, [hid, 1536], 12),
+            ("blk.%d.ffn_down.weight" % i, [1536, hid], 12),
+            ("blk.%d.attn_norm.weight" % i, [hid], 0),
+            ("blk.%d.ffn_norm.weight" % i, [hid], 0),
+        ]
+    pd = os.path.join(tmp, "dflash-moe.gguf")
+    _write_gguf(pd, {"dflash.block_count": dl, "dflash.block_size": 8,
+                     "dflash.attention.head_count": nh,
+                     "dflash.attention.head_count_kv": nkv,
+                     "dflash.embedding_length": hid,
+                     "dflash.context_length": 8192,
+                     "dflash.feed_forward_length": 1536,
+                     "dflash.target_layers": [0, 2, 4]},
+                {"general.architecture": "dflash", "general.name": "DraftTest"},
+                draft_t)
+    from .sweep import (build_argv, discover_models, find_drafter_for as sdf)
+    from .plan import find_drafter_for as pdf
+    df_ok = (sdf(p3) == pd and sdf(pd) is None and pdf(p3)["block_size"] == 8
+             and "dflash-moe.gguf" not in
+             [os.path.basename(x) for x in discover_models(tmp)])
+    print("  DFLASH finder pairs model<->drafter, never the drafter itself, and "
+          "discovery skips it  %s" % ("OK" if df_ok else "FAIL"))
+    ok = ok and df_ok
+    rd = analyze(p3, 4096, "q8_0", 512, True, vram_budget_mib=120,
+                 ram_budget_mib=8000, gpu_reserve_mib=32, compute_override_mib=30,
+                 safety_pct=0, dflash=True)
+    d = rd["dflash"] or {}
+    exp_w = _mib(sum(_tensor_bytes(t[1], t[2]) for t in draft_t))
+    plan_ok = (d.get("derived") is True and d.get("block_size") == 8
+               and abs(d.get("weights_mib", 0) - exp_w) < 0.1
+               and rd["inputs"]["dflash"] is True
+               and abs(rd["plan"].get("spec_mib", 0) - d.get("mib", 0)) < 0.1
+               and d.get("mib", 0) > exp_w)
+    print("  DFLASH plan charges drafter exactly (%d MiB weights) + KV + graph  %s"
+          % (exp_w, "OK" if plan_ok else "FAIL"))
+    ok = ok and plan_ok
+    # without the file there is no scheme to price, and that must be said out loud
+    nod = os.path.join(tmp, "nodraft")
+    os.makedirs(nod, exist_ok=True)
+    pn = os.path.join(nod, "m.gguf")
+    with open(p1, "rb") as fi, open(pn, "wb") as fo:
+        fo.write(fi.read())
+    nofile_ok = False
+    try:
+        analyze(pn, 4096, "f16", 512, True, vram_budget_mib=2000,
+                ram_budget_mib=8000, gpu_reserve_mib=0, compute_override_mib=0,
+                safety_pct=0, dflash=True)
+    except ValueError:
+        nofile_ok = True
+    print("  DFLASH analyze without a drafter raises, naming the gap  %s"
+          % ("OK" if nofile_ok else "FAIL"))
+    ok = ok and nofile_ok
+    # stage D sweeps the drafter's OWN depth ladder - every depth the block
+    # allows, ascending - because the draft cache grows with depth and the
+    # monotone wall prunes the deeper half of it once the first depth OOMs
+    # (see the wall tests below).
+    from .bench import stage_configs
+    b0 = {"ctx": 4096, "kv": "f16", "fa": True, "seq": 1, "ub": 512, "ngl": 0}
+    dd = stage_configs("d", dict(b0), 8, False, [1], facts={"n_mtp_layers": 0},
+                       drafter={"path": pd, "block_size": 8})
+    dmax = sorted({c["spec_n_max"] for c in dd if c["spec"] == "draft-dflash"})
+    nd = [c for c in stage_configs("d", dict(b0), 8, False, [1],
+                                   facts={"n_mtp_layers": 0})
+          if c["spec"] == "draft-dflash"]
+    av = build_argv("EXE", p3, dict(b0, spec="draft-dflash", spec_n_max=99),
+                    8231, probe=False)
+    clamped = ("-md" in av and "--spec-draft-n-max" in av
+               and av[av.index("--spec-draft-n-max") + 1] == "8")
+    nofile2 = False
+    try:
+        build_argv("EXE", pn, dict(b0, spec="draft-dflash", spec_n_max=8),
+                   8231, probe=False)
+    except ValueError:
+        nofile2 = True
+    grid_ok = (dmax == list(range(1, 9)) and not nd and clamped and nofile2)
+    print("  DFLASH stage D depths %s; argv clamps 99 -> %s; no drafter -> refused  %s"
+          % (dmax, av[av.index("--spec-draft-n-max") + 1] if clamped else "?",
+             "OK" if grid_ok else "FAIL"))
+    ok = ok and grid_ok
+    # ...and the CHAINED rebuild - what the web campaign actually runs - must
+    # carry the drafter too, or stage D silently loses its dflash rows mid-
+    # campaign while the ngram rows still appear, which reads exactly like a
+    # model that has no drafter.
+    from .bench import grid_context
+    gb, gnl, gmoe, grungs = grid_context(
+        {"n_layers": 8}, base=dict(b0), model_path=p3, drafter={"path": pd,
+                                                                "block_size": 8})
+    chained = [c for c in stage_configs("d", gb, gnl, gmoe, grungs,
+                                        facts={"n_mtp_layers": 0},
+                                        drafter={"path": pd, "block_size": 8})
+               if c["spec"] == "draft-dflash"]
+    chain_ok = bool(chained) and "md" in chained[0] and "md" in gb
+    print("  DFLASH chained stage rebuild keeps the drafter (md in baseline + rows)  %s"
+          % ("OK" if chain_ok else "FAIL"))
+    ok = ok and chain_ok
+
+    # 3b) MONOTONE WALLS: one hard OOM proves every worse rung in the same
+    #     family fails the same way, so the queued loads that would re-prove it
+    #     are pruned. Only `oom` prunes; genfail/exit/timeout say nothing about
+    #     the next rung; a `spilled` row LOADED, which is a measurement, not a
+    #     wall. Family = every knob equal except the tagged axis.
+    from .bench import _same_family, _worse, _prune_queue, _tag_axes, \
+        _depth_extras, _spec_retry, _draft_depths
+    from .sweep import _key
+    wa = dict(ctx=4096, kv="f16", fa=True, seq=1, ub=512, ngl=20, fill=2048)
+    wall_ok = True
+    wall_ok = wall_ok and _same_family(dict(wa, ngl=22), dict(wa, ngl=30), "ngl") \
+        and not _same_family(dict(wa, ngl=22), dict(wa, ngl=30, ub=1024), "ngl") \
+        and not _same_family(dict(wa, ngl=22, spec="draft-mtp"),
+                             dict(wa, ngl=30), "ngl")
+    wall_ok = wall_ok and _worse(dict(wa, ngl=22), dict(wa, ngl=30), "ngl", "up") \
+        and not _worse(dict(wa, ngl=22), dict(wa, ngl=30), "ngl", "down")
+    # ncmoe normalises like _key does: absent means 0, so an absent-vs-0 pair is
+    # the same config, and on the MoE axis worse means SMALLER.
+    wall_ok = wall_ok and _worse(dict(wa, ncmoe=6), dict(wa, ncmoe=2),
+                                 "ncmoe", "down") \
+        and not _worse(dict(wa, ncmoe=6), dict(wa, ncmoe=2), "ncmoe", "up")
+    print("  WALL same-family / worse-direction  %s"
+          % ("OK" if wall_ok else "FAIL"))
+    ok = ok and wall_ok
+    # The queue prune: an OOM at ngl 24 drops the pending ngl 28/32 in the same
+    # family, keeps an ub=1024 sibling (different family), keeps everything
+    # BEFORE the OOM (already run or running), and drops nothing on a failure
+    # that proves nothing (the oom-only gate lives in run_group: a genfail,
+    # exit or timeout row never calls _prune_queue).
+    wq = [dict(wa, ngl=20, _wall=[("ngl", "up")]),
+          dict(wa, ngl=24, _wall=[("ngl", "up")]),
+          dict(wa, ngl=28, _wall=[("ngl", "up")]),
+          dict(wa, ngl=32, _wall=[("ngl", "up")]),
+          dict(wa, ngl=28, ub=1024, _wall=[("ngl", "up")])]
+    wwalls = {_key("m", c): c.get("_wall") for c in wq}
+    keep, drop = _prune_queue([dict(c) for c in wq], wwalls, 1, "m", dict(wa, ngl=24))
+    drop_keys = [_key("m", c) for c in drop]
+    wall_ok = ([c["ngl"] for c in keep] == [20, 24, 28]
+               and keep[2]["ub"] == 1024               # different family: kept
+               and sorted(c["ngl"] for c in drop) == [28, 32]
+               and all(c["ub"] == 512 for c in drop)
+               and _key("m", keep[2]) not in drop_keys
+               and len(keep) == 3)
+    print("  WALL queue prune on oom only, family-isolated  %s"
+          % ("OK" if wall_ok else "FAIL"))
+    ok = ok and wall_ok
+    # --speed-axes ladders get tagged by the same table: every monotone axis
+    # named in the ladder tags every row of it (family = everything else equal,
+    # so a cross-product prunes along each axis within each value of the
+    # others); ncmoe only on an MoE; un-orderable axes stay untagged, so those
+    # rows are all measured exactly as typed.
+    tagged = [dict(wa, ngl=20), dict(wa, ngl=28), dict(wa, ub=1024)]
+    _tag_axes(tagged, {"ngl", "ub", "temp"}, is_moe=False)
+    wall_ok = (all(c.get("_wall") == [("ngl", "up"), ("ub", "up")] for c in tagged))
+    tag1 = [dict(wa, ngl=20), dict(wa, ngl=28)]
+    _tag_axes(tag1, {"ngl"}, is_moe=False)
+    wall_ok = wall_ok and all(c.get("_wall") == [("ngl", "up")] for c in tag1)
+    tag2 = [dict(wa, ncmoe=6), dict(wa, ngl=20, ncmoe=6)]
+    _tag_axes(tag2, {"ncmoe"}, is_moe=True)
+    wall_ok = wall_ok and tag2[0].get("_wall") == [("ncmoe", "down")]
+    tag3 = [dict(wa, temp=1.0), dict(wa, spec="ngram-mod")]
+    _tag_axes(tag3, {"temp", "spec"}, is_moe=False)
+    wall_ok = wall_ok and "_wall" not in tag3[0] and "_wall" not in tag3[1]
+    print("  WALL --speed-axes tagging (monotone only, ncmoe MoE-only)  %s"
+          % ("OK" if wall_ok else "FAIL"))
+    ok = ok and wall_ok
+    # Stage configs carry their tags out of the grid: A/B dense = ngl up, A/B
+    # MoE = ncmoe down, C = ub up, D = spec_n_max up within the draft family.
+    from .bench import _MONOTONE_AXES, _MONOTONE_MOE
+    sa = [c for c in stage_configs("a", dict(wa, fill=2048), 32, False, [20, 24, 28])]
+    sb = [c for c in stage_configs("c", dict(wa), 32, False, [1])]
+    wall_ok = (all(c.get("_wall") == [("ngl", "up")] for c in sa)
+               and all(c.get("_wall") == [("ub", "up")] for c in sb)
+               and _MONOTONE_AXES == {"ngl": "up", "ub": "up",
+                                      "ctx": "up", "spec_n_max": "up"}
+               and _MONOTONE_MOE == {"ncmoe": "down"})
+    print("  WALL stage grid tags (dense ngl-up, ub-up, MoE ncmoe-down)  %s"
+          % ("OK" if wall_ok else "FAIL"))
+    ok = ok and wall_ok
+    # Depth extras: the top three fitting rungs from a stage-A ladder, at each
+    # extra fill, ranked by the wall axis - and only from rows that actually
+    # fit (status ok), so an OOM-only ladder yields nothing.
+    rows = [{"status": "ok", "config": dict(wa, ngl=24, fill=2048, stage="A")},
+            {"status": "ok", "config": dict(wa, ngl=28, fill=2048, stage="A")},
+            {"status": "ok", "config": dict(wa, ngl=20, fill=2048, stage="A")},
+            {"status": "oom", "config": dict(wa, ngl=32, fill=2048, stage="A")},
+            {"status": "ok", "config": dict(wa, ngl=24, fill=2048, stage="C")}]
+    ex = _depth_extras(rows, dict(wa, fill=2048), {"is_moe": False},
+                       [8192, 16384], "ngl", "up")
+    wall_ok = (len(ex) == 6 and _key("m", ex[0]) != _key("m", ex[3])
+               and ex[0]["ngl"] == 28 and ex[0]["fill"] == 8192
+               and ex[3]["ngl"] == 28 and ex[3]["fill"] == 16384
+               and {c["ngl"] for c in ex} == {24, 28, 20}
+               and all(c["stage"] == "A" and c.get("_wall") == [("ngl", "up")]
+                       for c in ex))
+    exo = _depth_extras(rows, dict(wa, fill=2048), {"is_moe": False},
+                        [8192], "ngl", "up")
+    wall_ok = wall_ok and _key("m", exo[0]) in [_key("m", c) for c in ex]
+    exn = _depth_extras([{"status": "oom",
+                          "config": dict(wa, ngl=32, fill=2048, stage="A")}],
+                        dict(wa, fill=2048), {"is_moe": False}, [8192], "ngl", "up")
+    wall_ok = wall_ok and not exn
+    print("  WALL depth extras: top-3 fitting rungs x extra fills  %s"
+          % ("OK" if wall_ok else "FAIL"))
+    ok = ok and wall_ok
+    # The draft wall walk: one walk per FAMILY, rung by rung, depth ladder
+    # nested inside. First OOM starts the walk one rung freer at the failed
+    # depth; a fit continues the ladder at that rung; an OOM advances the rung
+    # and resumes at the depth that just failed; n-gram schemes never walk.
+    tr = {}
+    dw = dict(wa, ngl=24, spec="draft-dflash", spec_n_max=3)
+    facts8 = {"is_moe": False, "n_layers": 8}
+    drf = {"path": pd, "block_size": 4}
+    wall_ok = _draft_depths("draft-dflash", drf) == [1, 2, 3, 4]
+    n1 = _spec_retry(dict(dw), {"status": "oom"}, facts8, tr, drafter=drf)
+    wall_ok = wall_ok and n1 is not None and n1["ngl"] == 23 \
+        and n1["spec_n_max"] == 3 and tr.get("draft-dflash")
+    n2 = _spec_retry(n1, {"status": "ok"}, facts8, tr, drafter=drf)
+    wall_ok = wall_ok and n2 is not None and n2["ngl"] == 23 \
+        and n2["spec_n_max"] == 4
+    n3 = _spec_retry(n2, {"status": "ok"}, facts8, tr, drafter=drf)
+    wall_ok = wall_ok and n3 is None            # ladder exhausted at this rung
+    # ...and a probe that OOMs at depth 4 walks one rung freer, resuming at the
+    # depth that failed, not at the bottom of the ladder.
+    tr2 = {}
+    q1 = _spec_retry(dict(dw), {"status": "oom"}, facts8, tr2, drafter=drf)
+    q2 = _spec_retry(q1, {"status": "oom"}, facts8, tr2, drafter=drf)
+    wall_ok = wall_ok and q2 is not None and q2["ngl"] == 22 \
+        and q2["spec_n_max"] == 3
+    # On an MoE the walk goes UP, and a genfail row never walks at all.
+    tr3 = {}
+    dwm = dict(wa, ncmoe=6, ngl=0, spec="draft-mtp", spec_n_max=2)
+    m1 = _spec_retry(dict(dwm), {"status": "oom"}, {"is_moe": True, "n_layers": 8},
+                     tr3)
+    wall_ok = wall_ok and m1 is not None and m1["ncmoe"] == 7 \
+        and m1["spec_n_max"] == 2
+    m2 = _spec_retry(m1, {"status": "ok"}, {"is_moe": True, "n_layers": 8}, tr3)
+    wall_ok = wall_ok and m2 is not None and m2["ncmoe"] == 7 \
+        and m2["spec_n_max"] == 3
+    wall_ok = wall_ok and _spec_retry(dict(wa, spec="ngram-mod"),
+                                      {"status": "oom"}, facts8, {}) is None \
+        and _spec_retry(dict(wa, spec="draft-gram-l2"),
+                        {"status": "oom"}, facts8, {}) is None \
+        and _spec_retry(dict(wa, spec="draft-dflash", spec_n_max=2),
+                        {"status": "genfail"}, facts8, {}, drafter=drf) is None
+    print("  WALL draft walk: per-family rungs, nested depth ladder  %s"
+          % ("OK" if wall_ok else "FAIL"))
+    ok = ok and wall_ok
+    # the launcher carries the drafter as a checked path variable, in both shells
+    from .launch import command_lines, launch_script
+    csh = dict(b0, spec="draft-dflash", spec_n_max=8, md=pd)
+    shb = "\n".join(command_lines(launch_script(p3, csh, shell="bash")))
+    shp = "\n".join(command_lines(launch_script(p3, csh, shell="powershell")))
+    launch_ok = ('-md "$DRAFT"' in shb and 'for f in "$MODEL" "$DRAFT"' in shb
+                 and "-md $draft" in shp and "@($model, $draft)" in shp)
+    print("  DFLASH launcher passes -md with a checked path, both shells  %s"
+          % ("OK" if launch_ok else "FAIL"))
+    ok = ok and launch_ok
+
     # 4) hybrid attention/SSM: only every Nth block may carry a KV cache
     hyb_t = [("token_embd.weight", [hid, 4000], 12)]
     for i in range(nL):

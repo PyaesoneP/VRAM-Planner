@@ -1,4 +1,14 @@
+<p align="center">
+  <img src="docs/logo.svg" alt="VRAM Planner" width="120">
+</p>
+
 # VRAM Planner
+
+![Python 3.9+](https://img.shields.io/badge/Python-3.9%2B-3776AB?style=flat-square&logo=python&logoColor=white)
+![Zero dependencies](https://img.shields.io/badge/dependencies-none-2dd4bf?style=flat-square)
+![GGUF parsed directly](https://img.shields.io/badge/GGUF-parsed%20directly-2dd4bf?style=flat-square)
+![License](https://img.shields.io/github/license/PyaesoneP/VRAM-Planner?style=flat-square)
+![Platforms](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey?style=flat-square)
 
 A self-contained Python package (standard library only). It parses any GGUF
 **directly** (reads the real byte size of every tensor — the same info as
@@ -386,6 +396,9 @@ does not:
   can run;
 - MTP's draft cache costs VRAM the plan was not asked to price, and on one model
   moved the OOM wall a whole `-ngl` rung;
+- a DFlash drafter (a `dflash-*.gguf` next to the model) is a second set of
+  weights in the same process — the plan prices it when you tick DFlash, and the
+  difference can be several `-ngl` rungs on a 16 GB card;
 - `ubatch` and speculation move tokens/second without moving any number the
   planner computes at all.
 

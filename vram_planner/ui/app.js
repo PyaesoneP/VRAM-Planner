@@ -133,14 +133,59 @@ function renderPlatform(p){
       <div>${p.reason}</div></div>`;
 }
 
+/** The VRAM budget the plan is built against.
+ *
+ *  Server-side now, and deliberately: this page used to prefill from FREE VRAM
+ *  with a zero reserve while the speed sweep seeded its ladder from TOTAL minus
+ *  512. Neither number was wrong; having two of them meant the planner and the
+ *  campaign recommended different splits with nothing on the page to say why.
+ *  /api/system computes both bases and names which one the sweep uses. */
+function budgetFor(basis){
+  const b = (SYS && SYS.vram_budget) || null;
+  if(!b) return null;
+  const v = basis === "free" ? b.on_free : b.on_total;
+  return (v == null) ? null : Math.round(v);
+}
+
 function prefillBudgets(s){
-  let vfree = 0;
-  if(Array.isArray(s.gpus) && s.gpus.length) vfree = s.gpus[0].free_mib;
-  if(vfree && !$("vram").value) $("vram").value = Math.round(vfree);
+  const b = s.vram_budget || {};
+  const sel = $("vrambasis");
+  if(sel && b.basis) sel.value = b.basis;
+  if(!$("vram").value && b.default != null) $("vram").value = Math.round(b.default);
+  if($("reserve").value === "" && b.reserve != null) $("reserve").value = b.reserve;
   // RAM budget defaults to TOTAL installed (minus a small OS reserve): a model can load
   // into standby/paged memory, so "free right now" understates what will actually load.
   if(s.ram && s.ram.total_mib && !$("ram").value)
     $("ram").value = Math.max(1024, Math.round(s.ram.total_mib - 2048));
+  markBasis();
+}
+
+/** Refill the budget from whichever basis is selected, and say what changed.
+ *  Switching the basis with a stale number in the box is the divergence this
+ *  whole control exists to remove, so it always rewrites the field. */
+function setBasis(){
+  const v = budgetFor($("vrambasis").value);
+  if(v != null) $("vram").value = v;
+  markBasis();
+}
+
+function markBasis(){
+  const b = (SYS && SYS.vram_budget) || {};
+  const el = $("basishint");
+  if(!el || b.on_total == null) return;
+  const basis = $("vrambasis").value;
+  const off = basis !== (b.basis || "total");
+  el.innerHTML = h`<b>${fmt(budgetFor(basis))}</b> of ${fmt(b.on_total)} on the card${
+      b.on_free != null ? h` · ${fmt(b.on_free)} free right now` : ""}. ` +
+    (off
+      ? h`<span style="color:var(--warn)">Speed campaigns are planned against <b>card total</b>,
+          so a measured row and this plan are now priced differently — the card at the top will
+          say so.</span> `
+      : "Speed campaigns are planned against this same basis. ") +
+    h`<details class="why"><summary>why total is the default</summary>
+      A speed campaign refuses to start unless the card is essentially empty, so free VRAM at
+      planning time is transient state the measurements will never be taken under. Planning
+      against it produces a split no recorded row can match.</details>`;
 }
 
 function meter(name, freeMib, totalMib){
@@ -176,11 +221,13 @@ async function loadBandwidth(){
 }
 
 async function refreshSys(){
-  const s = await (await fetch("/api/system")).json();
+  const s = await (await fetch("/api/system?fresh=1")).json();
   SYS = s;
   renderSys(s);
-  if(Array.isArray(s.gpus) && s.gpus.length) $("vram").value = Math.round(s.gpus[0].free_mib);
+  const v = budgetFor($("vrambasis").value);
+  if(v != null) $("vram").value = v;
   if(s.ram) $("ram").value = Math.max(1024, Math.round(s.ram.total_mib - 2048));
+  markBasis();
 }
 
 /* ------------------------------------------------------------- ctx presets */
@@ -615,6 +662,16 @@ function render(r){
   // an audio-only mmproj has no patch grid to size.
   $("visionrow").hidden = !(r.vision && r.vision.config);
   $("visioninputs").hidden = !$("visionplan").checked;
+  // The projector controls live in Tune, which is closed by default. A model
+  // that ships one has a real decision to make there and would otherwise have
+  // no sign of it, so the tier says what it is holding rather than springing
+  // open and undoing whatever the user had set.
+  const tn = $("tuneNote");
+  if(tn){
+    tn.textContent = r.mmproj ? "batch, sequences, vision projector"
+                              : "batch, sequences";
+    tn.classList.toggle("flagged", !!r.mmproj);
+  }
   const step = stepNow();
   let panel;
   if(step === "fit"){
@@ -1193,45 +1250,52 @@ function sweepForm(pf){
         <option value="vram">keep in VRAM</option>
         <option value="ram">move to system RAM</option>
       </select>
-      <p class="hint">Where the projector lives is a real axis &mdash; it was worth ~900 MiB of
-        VRAM on one model, which bought back whole expert layers. Sweeping it is stage B. Pin it
-        instead when you already know where you want it and you are sweeping something else:
-        otherwise the only way to say so was to write
-        <span class="mono">mmproj_offload=false</span> into the axes box.</p>
+      <p class="hint">Pin it when you already know where you want it and are sweeping something else.
+        <details class="why"><summary>why it is worth an axis</summary>
+          Where the projector lives is a real axis &mdash; it was worth ~900 MiB of VRAM on one
+          model, which bought back whole expert layers. Sweeping it is stage B. Before this
+          control the only way to pin it was to write
+          <span class="mono">mmproj_offload=false</span> into the axes box.</details></p>
     </div>
-    <p class="hint" style="margin-top:-4px">Measure where you actually work: decode slows as
-      the context fills, so a number taken at 2k is not the speed you feel at 40k. A deeper
-      fill costs real time though &mdash; the prompt has to be processed once per config.</p>
+    <p class="hint">Measure where you actually work: decode slows as the context fills, so a
+      number taken at 2k is not the speed you feel at 40k. A deeper fill costs real time
+      &mdash; the prompt is processed once per config.</p>
     <div class="field">
       <label class="check"><input type="checkbox" id="swchain" checked> Chain the stages
-        &mdash; measure each knob at the split that won, not at the planner&rsquo;s guess</label>
-      <p class="hint">Off, every stage runs from one fixed baseline, so ubatch and speculation
-        are measured at a layer count <i>stage A has not confirmed</i>. On, each stage is built
-        after the last one finishes, from the fastest trustworthy row so far. <b>Same number of
-        loads, so the same hours.</b> A row that spilled into shared memory or that caught the
-        model looping is never carried forward &mdash; it would bend every later stage the same
-        way, silently. A new baseline also has to win by more than 2%, because tok/s is a median
-        of a few passes and rebasing on jitter would make the campaign&rsquo;s path depend on noise.</p>
+        &mdash; measure each knob at the split that won</label>
+      <p class="hint">Same number of loads, so the same hours.
+        <details class="why"><summary>what chaining changes</summary>
+          Off, every stage runs from one fixed baseline, so ubatch and speculation
+          are measured at a layer count <i>stage A has not confirmed</i>. On, each stage is built
+          after the last one finishes, from the fastest trustworthy row so far. A row that
+          spilled into shared memory or that caught the model looping is never carried forward
+          &mdash; it would bend every later stage the same way, silently. A new baseline also has
+          to win by more than 2%, because tok/s is a median of a few passes and rebasing on
+          jitter would make the campaign&rsquo;s path depend on noise.</details></p>
       <div class="field" id="swroundsfield" style="max-width:22em">
         <label for="swrounds">Rounds</label>
         <input type="number" id="swrounds" value="1" min="1" max="4" step="1">
-        <p class="hint">Runs A&ndash;D again from the winner. The point is that A and B choose
-          the memory split <i>before</i> D turns speculation on, and speculation costs VRAM
-          &mdash; so the wall A found has moved by the time D is done. A second round re-walks
-          the split with the speculation that won already switched on.
-          <b>The preview cannot price it</b>: which configs a later round adds depends on what
-          this one finds. It is cheap by construction though &mdash; anything a round revisits
-          unchanged is already recorded and is skipped, so only new combinations cost time.</p>
+        <p class="hint">Runs A&ndash;D again from the winner. Cheap: anything unchanged is skipped.
+          <details class="why"><summary>why a second round finds anything</summary>
+            A and B choose the memory split <i>before</i> D turns speculation on, and speculation
+            costs VRAM &mdash; so the wall A found has moved by the time D is done. A second round
+            re-walks the split with the speculation that won already switched on.
+            <b>The preview cannot price it</b>: which configs a later round adds depends on what
+            this one finds. It is bounded by construction though &mdash; anything a round revisits
+            unchanged is already recorded and is skipped, so only new combinations cost
+            time.</details></p>
       </div>
     </div>
     <div class="field">
       <label class="check"><input type="checkbox" id="swverify"> Verify the winner with
         the production config</label>
-      <p class="hint">One extra load after the sweep: the winning config plus the knobs
-        below, e.g. <span class="mono">spec=draft-mtp spec_n_max=2</span>. The row that
-        wins is often not the row you run &mdash; MTP&rsquo;s draft cache alone moved the
-        OOM wall one <span class="mono">ngl</span> rung on one model &mdash; so this
-        measures what you would actually launch, and says if it is trustworthy.</p>
+      <p class="hint">One extra load: the winning config plus the knobs below.
+        <details class="why"><summary>why the winner is not the config you run</summary>
+          The row that wins is often not the row you run &mdash; MTP&rsquo;s draft cache alone
+          moved the OOM wall one <span class="mono">ngl</span> rung on one model &mdash; so this
+          measures what you would actually launch, e.g.
+          <span class="mono">spec=draft-mtp spec_n_max=2</span>, and says if it is
+          trustworthy.</details></p>
       <div class="field" id="swverifyfield" style="max-width:28em">
         <label for="swverifyoverrides">Overrides (same grammar as axes)</label>
         <input type="text" id="swverifyoverrides" placeholder="spec=draft-mtp spec_n_max=2">
@@ -1282,10 +1346,9 @@ function sweepAskSection(){
     <input type="number" id="${id}" step="0.01" placeholder="${ph}"></div>`;
   return h`<details class="adv" id="swaskbox"><summary>How the model is asked while measuring
       &mdash; template, thinking, samplers</summary>
-    <p class="hint">Frozen for the campaign, not swept &mdash; the same standing as context and
-      KV quant. Set these to <b>what you will actually run</b>. A row measured under other
-      settings is a different experiment: rows are keyed on the template&rsquo;s content hash
-      and on the samplers, so changing anything here re-measures rather than resuming.</p>
+    <p class="hint">Frozen for the campaign, not swept. Set these to <b>what you will actually
+      run</b> &mdash; rows are keyed on the template&rsquo;s content hash and on the samplers, so
+      changing anything here re-measures rather than resuming.</p>
     <div class="field">
       <label for="swtmplfile">Chat template file</label>
       <input type="text" id="swtmplfile" list="tmpllist2"
@@ -1309,12 +1372,14 @@ function sweepAskSection(){
           <option value="on">on</option><option value="off">off</option></select></div>
     </div>
     <p class="sublabel" style="margin-top:14px">SAMPLERS</p>
-    <p class="hint" style="margin-top:-4px">Blank means <b>greedy</b> (temp 0), which is the
-      right default for comparing configs &mdash; it makes the token stream reproducible, so two
-      rows differ by the knob under test and nothing else. It is the wrong thing to draw a
-      <b>speculation</b> conclusion from: llama.cpp accepts a draft token when the target&rsquo;s
-      own sampled token matches it, and under greedy that comparison is deterministic. Greedy is
-      speculation&rsquo;s best case, so fill these in before believing an acceptance rate.</p>
+    <p class="hint">Blank means <b>greedy</b> (temp 0) &mdash; the right default for comparing
+      configs, and the wrong one for believing an acceptance rate.
+      <details class="why"><summary>why greedy flatters speculation</summary>
+        Greedy makes the token stream reproducible, so two rows differ by the knob under test and
+        nothing else. But llama.cpp accepts a draft token when the target&rsquo;s own sampled
+        token matches it, and under greedy that comparison is deterministic &mdash; greedy is
+        speculation&rsquo;s best case. Fill these in before drawing a speculation
+        conclusion.</details></p>
     <div class="row">${raw(num("swtemp", "temp", "0 (greedy)") + num("swtopk", "top-k", "0")
       + num("swtopp", "top-p", "1.0") + num("swminp", "min-p", "0"))}</div>
     <div class="row">${raw(num("swreppen", "repeat-penalty", "1.0")
@@ -1728,16 +1793,18 @@ function sweepScript(){
         <select id="swload">${raw(modes)}</select>
         <p class="hint"><span class="mono">none</span> reads each tensor straight to its final
           home. Avoid <span class="mono">mmap+mlock</span> under heavy GPU offload: mlock pins
-          the whole mapped file, including the blocks already resident in VRAM.</p></div>
+          the whole mapped file, including blocks already resident in VRAM.</p></div>
     </div>
     <details class="adv" ${raw(fopen(0))}><summary>Chat template (optional)</summary>
-      <p class="hint">Overrides the template baked into the GGUF. Useful when the conversion
-        predates a fixed template, or when the model card ships a patched one for tool calls.
-        A path that does not exist is <b>not</b> an error to llama-server &mdash; it falls back
-        to the built-in template without saying so &mdash; so the generated script checks it and
-        refuses to start. It also passes <span class="mono">--jinja</span> <i>before</i> the
-        template flags, because without it a build accepts only its built-in template
-        <i>names</i> and rejects a path outright.</p>
+      <p class="hint">Overrides the template baked into the GGUF.
+        <details class="why"><summary>what the script does about a bad path</summary>
+          Useful when the conversion predates a fixed template, or when the model card ships a
+          patched one for tool calls. A path that does not exist is <b>not</b> an error to
+          llama-server &mdash; it falls back to the built-in template without saying so &mdash; so
+          the generated script checks it and refuses to start. It also passes
+          <span class="mono">--jinja</span> <i>before</i> the template flags, because without it a
+          build accepts only its built-in template <i>names</i> and rejects a path
+          outright.</details></p>
       <div class="field">
         <label for="sm_tmplfile">Template file</label>
         <input type="text" id="sm_tmplfile" list="tmpllist" value="${fv("sm_tmplfile")}"
@@ -1752,12 +1819,12 @@ function sweepScript(){
         <label for="sm_tmplkw">Template keyword arguments (JSON object)</label>
         <input type="text" id="sm_tmplkw" value="${fv('sm_tmplkw')}"
                placeholder='{"enable_thinking": false}'>
-        <p class="hint">The key names belong to <b>the template</b>, not to llama.cpp:
-          <span class="mono">enable_thinking</span> is Qwen3&rsquo;s spelling and is
-          <i>ignored, not rejected</i>, by a model that does not use that variable &mdash; so a
-          typo here is silent. Checked for valid JSON before the script is written. These are
-          <b>server defaults</b>: a client that sends its own
-          <span class="mono">chat_template_kwargs</span> wins for that request.</p>
+        <p class="hint">Checked for valid JSON before the script is written. Server defaults &mdash;
+          a client sending its own wins for that request.
+          <details class="why"><summary>why a typo here is silent</summary>
+            The key names belong to <b>the template</b>, not to llama.cpp:
+            <span class="mono">enable_thinking</span> is Qwen3&rsquo;s spelling and is
+            <i>ignored, not rejected</i>, by a model that does not use that variable.</details></p>
       </div>
       <div class="row">
         <div class="field">
@@ -1780,21 +1847,22 @@ function sweepScript(){
             <option value="off"${fv('sm_reasonpre') === 'off' ? " selected" : ""}>off</option>
           </select>
           <p class="hint">Keeps the reasoning trace for the <b>whole</b> history, not just the
-            last assistant message. This one <b>cannot</b> be set from the kwargs above even
-            when the template has a variable for it (Qwen3 spells it
-            <span class="mono">preserve_thinking</span>): llama-server strips
-            <span class="mono">&lt;think&gt;</span> out of the history <i>before</i> rendering,
-            so by the time the template reads the variable there is nothing left to preserve.
-            Only shows from the second turn on &mdash; which is how it survives a benchmark and
-            then quietly loses the trace in daily use.</p>
+            last assistant message.
+            <details class="why"><summary>why the kwargs above cannot do this</summary>
+              This one <b>cannot</b> be set from the kwargs even when the template has a variable
+              for it (Qwen3 spells it <span class="mono">preserve_thinking</span>): llama-server
+              strips <span class="mono">&lt;think&gt;</span> out of the history <i>before</i>
+              rendering, so by the time the template reads the variable there is nothing left to
+              preserve. Only shows from the second turn on &mdash; which is how it survives a
+              benchmark and then quietly loses the trace in daily use.</details></p>
         </div>
       </div>
     </details>
     <details class="adv" ${raw(fopen(1))}><summary>Sampling (optional)</summary>
-      <p class="hint">Left blank, no sampler flags are written at all &mdash; a made-up default
-        is worse than none. llama.cpp&rsquo;s own defaults are temp 0.80, top-k 40, min-p 0.05,
-        which several model cards do <i>not</i> want, so fill these in from yours. These become
-        <b>server defaults</b>: any client that sends its own values overrides them per request.</p>
+      <p class="hint">Left blank, no sampler flags are written at all &mdash; a made-up default is
+        worse than none. llama.cpp&rsquo;s own are temp 0.80, top-k 40, min-p 0.05, which several
+        model cards do <i>not</i> want, so fill these in from yours. Server defaults: a client
+        sending its own overrides them per request.</p>
       <div class="row">
         ${raw(SAMPLERS
           .map(k => h`<div class="field"><label for="sm_${k}">${k.replace(/_/g, " ")}</label>
@@ -2102,6 +2170,9 @@ $("visionplan").addEventListener("change", () => {
   $("visioninputs").hidden = !$("visionplan").checked;
 });
 $("model").addEventListener("change", onPick);
+// Switching the basis with a stale number in the budget box is exactly the
+// divergence the control exists to remove, so it rewrites the field.
+$("vrambasis").addEventListener("change", setBasis);
 $("dir").addEventListener("keydown", ev => { if(ev.key === "Enter"){ ev.preventDefault(); scanModels(); } });
 
 boot();

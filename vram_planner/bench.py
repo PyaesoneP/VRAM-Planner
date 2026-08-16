@@ -653,6 +653,15 @@ SPEED_BASE = {"ctx": 131072, "kv": "q8_0", "fa": True, "seq": 1, "ub": 512,
 NGL_BELOW, NGL_ABOVE = 2, 6
 
 
+# The basis every campaign is planned against, named once so the browser can be
+# handed the same three numbers instead of picking its own. analyze() takes the
+# budget and the reserve separately and subtracts one from the other, so the
+# helper is asked for a raw total here and the reserve is passed on below.
+PLAN_BASIS = "total"
+PLAN_RESERVE_MIB = 512
+PLAN_SAFETY_PCT = 5
+
+
 def planner_split(model_path, c):
     """Where the planner thinks the split falls, for seeding the ladder.
 
@@ -662,21 +671,20 @@ def planner_split(model_path, c):
     Imported here rather than at module scope only to keep the cost off the path
     of callers that never build a grid; plan sits above bench in the DAG, so the
     direction is fine."""
-    from .plan import analyze                      # plan is above bench in the DAG
+    from .plan import analyze, default_vram_budget  # plan is above bench in the DAG
     from .gpu import get_gpus, get_ram
     try:
         g = (get_gpus() or [{}])[0]
         ram = get_ram() or {}
-        # TOTAL, not free. The grid is built now and run later, and preflight()
-        # refuses to run it unless the card is essentially empty - so free VRAM at
-        # build time is transient state that has nothing to do with the conditions
-        # the rows will be measured under. Seeding off it produces a garbage ladder
-        # whenever anything happens to be loaded, which is exactly when someone is
-        # most likely to be planning their next sweep.
+        # TOTAL, not free - and via the shared helper, because the browser used to
+        # answer this same question its own way (free VRAM, 0 reserve) and so
+        # planned a different config than the one the ladder was centred on. See
+        # default_vram_budget() for why total is the right basis here.
         r = analyze(model_path, int(c["ctx"]), c["kv"], int(c["ub"]), bool(c["fa"]),
-                    vram_budget_mib=float(g.get("total_mib") or 0),
+                    vram_budget_mib=default_vram_budget(g, PLAN_BASIS, 0),
                     ram_budget_mib=float(ram.get("total_mib") or 0),
-                    gpu_reserve_mib=512, compute_override_mib=None, safety_pct=5,
+                    gpu_reserve_mib=PLAN_RESERVE_MIB,
+                    compute_override_mib=None, safety_pct=PLAN_SAFETY_PCT,
                     n_seq=int(c.get("seq") or 1),
                     include_mmproj=(c.get("mmproj_offload") is not False),
                     mtp_spec=bool(c.get("spec") == "draft-mtp"))

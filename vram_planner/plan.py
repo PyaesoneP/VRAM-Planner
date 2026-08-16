@@ -11,6 +11,36 @@ from .calib import calibration_status
 from .cards import load_card, remember_card
 
 
+def default_vram_budget(gpu, basis="total", reserve_mib=512):
+    """The VRAM a plan should be built against. One rule, two callers.
+
+    This function exists because there used to be two rules. The browser
+    prefilled its budget from free VRAM at page load and sent a 0 reserve; the
+    speed sweep seeded its stage-A ladder from TOTAL VRAM with a 512 MiB
+    reserve. Both are defensible and running both is not: on a 16 GiB card with
+    11.5 GiB free they differ by several -ngl rungs, so the planner and the
+    sweep recommended different configs for no reason either of them stated.
+
+    `basis="total"` is the default and is what the sweep measures under.
+    preflight() refuses to run a campaign unless the card is essentially empty,
+    so free VRAM at planning time is transient state that the rows will never
+    be measured under - seeding off it produces a garbage ladder exactly when
+    something happens to be loaded, which is when someone is most likely to be
+    planning.
+
+    `basis="free"` answers the different question - "will this load right now,
+    next to what I already have open" - and is the user's to choose. It is a
+    real question; it is just not the one a campaign answers.
+
+    Returns MiB, never negative.
+    """
+    gpu = gpu or {}
+    total = float(gpu.get("total_mib") or 0)
+    free = float(gpu.get("free_mib") or 0)
+    have = free if basis == "free" else total
+    return max(0.0, have - max(0.0, float(reserve_mib or 0)))
+
+
 def find_mmproj(model_path):
     """A multimodal model ships a separate vision/audio projector next to the
     weights (mmproj-*.gguf). LM Studio loads it with the model and puts it on the
@@ -379,6 +409,8 @@ def analyze(path, ctx, kv_type, n_ubatch, flash_attn,
         plan["vram_used_mib"] = plan.get("vram_used_mib", 0.0) + held_out
         if plan.get("vram_budget_mib") is not None:
             plan["vram_budget_mib"] = plan["vram_budget_mib"] + held_out
+    # Recorded on the plan so the verdict and the UI read one budget rather than
+    # each reaching for a different field.
     result["plan"] = plan
 
     # ---- speed roofline ----------------------------------------------------

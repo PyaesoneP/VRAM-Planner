@@ -334,7 +334,10 @@ async function loadDrafters(){
   $("dflashhint").textContent = cand.length
     ? cand.length + " candidate drafter file(s) next to the model"
     : "no drafter candidates next to this model — DFlash auto-discovery will find none either";
-  $("dflashfield").hidden = cand.length === 0 && !$("draftpath").value.trim();
+  // The field is reachable whenever a model is on the table: the manual path
+  // input lives INSIDE it, so a field that hides on "no candidates" or after a
+  // plan without a drafter is one the user can never open again.
+  $("dflashfield").hidden = !currentPath();
 }
 
 /* -------------------------------------------------------------- analysis */
@@ -861,7 +864,9 @@ function render(r){
   $("mmprojfield").hidden = !r.mmproj;
   $("ncpumoefield").hidden = !r.is_moe;
   $("mtprow").hidden = !c.n_mtp_layers;
-  $("dflashfield").hidden = !r.drafter;
+  // Never hide the drafter field on a plan without one - the picker is how the
+  // user asks for one, and its manual path input cannot be reached while hidden.
+  $("dflashfield").hidden = !currentPath();
   if(r.drafter){
     // The drafter's cost is derived (weights exact; cache and graph from
     // geometry and the calibration), and the plan says so rather than passing
@@ -2538,6 +2543,18 @@ $("mtpspec").addEventListener("change", () => {
     $("draftpick").value = "__none__";
 });
 $("model").addEventListener("change", onPick);
+// Typing a path is the same event as picking a model: the picker repopulates
+// from the typed file's folder. Debounced - the input fires per keystroke and
+// each repopulation reads the folder.
+let _draftTimer = 0;
+$("path").addEventListener("input", () => {
+  clearTimeout(_draftTimer);
+  _draftTimer = setTimeout(() => {
+    $("draftpick").value = "__none__";
+    $("draftpath").value = "";
+    loadDrafters();
+  }, 250);
+});
 // Switching the basis with a stale number in the budget box is exactly the
 // divergence the control exists to remove, so it rewrites the field.
 $("vrambasis").addEventListener("change", setBasis);

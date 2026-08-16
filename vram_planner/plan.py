@@ -310,44 +310,64 @@ def analyze(path, ctx, kv_type, n_ubatch, flash_attn,
     # stage-D rows exist to replace the derivation with reality.
     dflash_info = None
     if dflash:
-        if mtp_spec:
-            warnings.append("DFlash and MTP are both on - llama.cpp runs one "
-                            "speculative scheme per server, so this plan prices "
-                            "the DFlash drafter only.")
         dflash_info = find_drafter_for(path)
         if not dflash_info:
-            raise ValueError(
-                "no DFlash drafter next to %s - the scheme needs a separate "
-                "dflash-*.gguf whose architecture is 'dflash' in the same "
-                "directory. Run the plan without DFlash to split the model on "
-                "its own." % os.path.basename(path))
-        dc = dflash_info.get("cfg") or {}
-        block = dflash_info["block_size"]
-        weights_d = _mib(dflash_info["tensor_bytes"])
-        # The draft KV cache is the drafter's own KV - f16, like the MTP draft
-        # cache, whatever the target's KV quant - held at the trained block depth
-        # times a fixed slack for the cells llama.cpp keeps around each block
-        # (its draft cache in the reference log carried ~7 blocks per cell row).
-        try:
-            draft_kv_mib = _mib(kv_bytes_per_token(dc, "f16")
-                                * block * DRAFT_KV_BLOCK_SLACK)
-        except Exception:
-            draft_kv_mib = 0.0
-        # Draft-graph buffers at the block depth, through the same calibrated
-        # coefficients the target's graph is priced with - the drafter's own
-        # geometry, so its attention and logits buffers are not the target's.
-        try:
-            draft_graph_mib = compute_buffer_terms(dc, block, n_ubatch,
-                                                   flash_attn, n_seq,
-                                                   kv_type)["graph"]
-        except Exception:
-            draft_graph_mib = 0.0
-        spec_mib = weights_d + draft_kv_mib + draft_graph_mib
-        warnings.append(
-            "The DFlash drafter's working set is derived: drafter weights "
-            "(exact bytes), its KV cache and draft graph (from the drafter's "
-            "geometry and this machine's calibration). The campaign's stage-D "
-            "rows measure the real cost.")
+            # No drafter to price. If the model can draft itself, the plan can
+            # still be complete - llama.cpp runs one scheme per server, so the
+            # model's own MTP cache is what it would actually use - but only
+            # with the substitution said out loud. A model with neither is a
+            # request that cannot be honored at all, and refusing beats
+            # guessing (this is the deliberate ValueError the UI and selftest
+            # rely on).
+            if cfg.get("mtp_kv_per_token"):
+                if not mtp_spec:
+                    spec_mib = (_mib(cfg["mtp_kv_per_token"] * ctx)
+                                + MTP_SPEC_CONST_MIB
+                                + MTP_SPEC_PER_SEQ_MIB * max(1, n_seq))
+                warnings.append(
+                    "no DFlash drafter next to %s - the model drafts itself, so "
+                    "this plan prices its MTP draft cache instead. llama.cpp "
+                    "runs one speculative scheme per server."
+                    % os.path.basename(path))
+            else:
+                raise ValueError(
+                    "no DFlash drafter next to %s - the scheme needs a separate "
+                    "dflash-*.gguf whose architecture is 'dflash' in the same "
+                    "directory, and this model has no MTP blocks of its own to "
+                    "price instead. Run the plan without DFlash to split the "
+                    "model on its own." % os.path.basename(path))
+        else:
+            if mtp_spec:
+                warnings.append("DFlash and MTP are both on - llama.cpp runs one "
+                                "speculative scheme per server, so this plan prices "
+                                "the DFlash drafter only.")
+            dc = dflash_info.get("cfg") or {}
+            block = dflash_info["block_size"]
+            weights_d = _mib(dflash_info["tensor_bytes"])
+            # The draft KV cache is the drafter's own KV - f16, like the MTP draft
+            # cache, whatever the target's KV quant - held at the trained block depth
+            # times a fixed slack for the cells llama.cpp keeps around each block
+            # (its draft cache in the reference log carried ~7 blocks per cell row).
+            try:
+                draft_kv_mib = _mib(kv_bytes_per_token(dc, "f16")
+                                    * block * DRAFT_KV_BLOCK_SLACK)
+            except Exception:
+                draft_kv_mib = 0.0
+            # Draft-graph buffers at the block depth, through the same calibrated
+            # coefficients the target's graph is priced with - the drafter's own
+            # geometry, so its attention and logits buffers are not the target's.
+            try:
+                draft_graph_mib = compute_buffer_terms(dc, block, n_ubatch,
+                                                       flash_attn, n_seq,
+                                                       kv_type)["graph"]
+            except Exception:
+                draft_graph_mib = 0.0
+            spec_mib = weights_d + draft_kv_mib + draft_graph_mib
+            warnings.append(
+                "The DFlash drafter's working set is derived: drafter weights "
+                "(exact bytes), its KV cache and draft graph (from the drafter's "
+                "geometry and this machine's calibration). The campaign's stage-D "
+                "rows measure the real cost.")
 
     # vision/audio projector: loaded to the GPU alongside the model, so it comes
     # off the top of the budget before any layer split is planned

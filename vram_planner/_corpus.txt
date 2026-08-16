@@ -1,4 +1,14 @@
+<p align="center">
+  <img src="docs/logo.svg" alt="VRAM Planner" width="120">
+</p>
+
 # VRAM Planner
+
+![Python 3.9+](https://img.shields.io/badge/Python-3.9%2B-3776AB?style=flat-square&logo=python&logoColor=white)
+![Zero dependencies](https://img.shields.io/badge/dependencies-none-2dd4bf?style=flat-square)
+![GGUF parsed directly](https://img.shields.io/badge/GGUF-parsed%20directly-2dd4bf?style=flat-square)
+![License](https://img.shields.io/github/license/PyaesoneP/VRAM-Planner?style=flat-square)
+![Platforms](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey?style=flat-square)
 
 A self-contained Python package (standard library only). It parses any GGUF
 **directly** (reads the real byte size of every tensor — the same info as
@@ -8659,44 +8669,64 @@ def analyze(path, ctx, kv_type, n_ubatch, flash_attn,
     # stage-D rows exist to replace the derivation with reality.
     dflash_info = None
     if dflash:
-        if mtp_spec:
-            warnings.append("DFlash and MTP are both on - llama.cpp runs one "
-                            "speculative scheme per server, so this plan prices "
-                            "the DFlash drafter only.")
         dflash_info = find_drafter_for(path)
         if not dflash_info:
-            raise ValueError(
-                "no DFlash drafter next to %s - the scheme needs a separate "
-                "dflash-*.gguf whose architecture is 'dflash' in the same "
-                "directory. Run the plan without DFlash to split the model on "
-                "its own." % os.path.basename(path))
-        dc = dflash_info.get("cfg") or {}
-        block = dflash_info["block_size"]
-        weights_d = _mib(dflash_info["tensor_bytes"])
-        # The draft KV cache is the drafter's own KV - f16, like the MTP draft
-        # cache, whatever the target's KV quant - held at the trained block depth
-        # times a fixed slack for the cells llama.cpp keeps around each block
-        # (its draft cache in the reference log carried ~7 blocks per cell row).
-        try:
-            draft_kv_mib = _mib(kv_bytes_per_token(dc, "f16")
-                                * block * DRAFT_KV_BLOCK_SLACK)
-        except Exception:
-            draft_kv_mib = 0.0
-        # Draft-graph buffers at the block depth, through the same calibrated
-        # coefficients the target's graph is priced with - the drafter's own
-        # geometry, so its attention and logits buffers are not the target's.
-        try:
-            draft_graph_mib = compute_buffer_terms(dc, block, n_ubatch,
-                                                   flash_attn, n_seq,
-                                                   kv_type)["graph"]
-        except Exception:
-            draft_graph_mib = 0.0
-        spec_mib = weights_d + draft_kv_mib + draft_graph_mib
-        warnings.append(
-            "The DFlash drafter's working set is derived: drafter weights "
-            "(exact bytes), its KV cache and draft graph (from the drafter's "
-            "geometry and this machine's calibration). The campaign's stage-D "
-            "rows measure the real cost.")
+            # No drafter to price. If the model can draft itself, the plan can
+            # still be complete - llama.cpp runs one scheme per server, so the
+            # model's own MTP cache is what it would actually use - but only
+            # with the substitution said out loud. A model with neither is a
+            # request that cannot be honored at all, and refusing beats
+            # guessing (this is the deliberate ValueError the UI and selftest
+            # rely on).
+            if cfg.get("mtp_kv_per_token"):
+                if not mtp_spec:
+                    spec_mib = (_mib(cfg["mtp_kv_per_token"] * ctx)
+                                + MTP_SPEC_CONST_MIB
+                                + MTP_SPEC_PER_SEQ_MIB * max(1, n_seq))
+                warnings.append(
+                    "no DFlash drafter next to %s - the model drafts itself, so "
+                    "this plan prices its MTP draft cache instead. llama.cpp "
+                    "runs one speculative scheme per server."
+                    % os.path.basename(path))
+            else:
+                raise ValueError(
+                    "no DFlash drafter next to %s - the scheme needs a separate "
+                    "dflash-*.gguf whose architecture is 'dflash' in the same "
+                    "directory, and this model has no MTP blocks of its own to "
+                    "price instead. Run the plan without DFlash to split the "
+                    "model on its own." % os.path.basename(path))
+        else:
+            if mtp_spec:
+                warnings.append("DFlash and MTP are both on - llama.cpp runs one "
+                                "speculative scheme per server, so this plan prices "
+                                "the DFlash drafter only.")
+            dc = dflash_info.get("cfg") or {}
+            block = dflash_info["block_size"]
+            weights_d = _mib(dflash_info["tensor_bytes"])
+            # The draft KV cache is the drafter's own KV - f16, like the MTP draft
+            # cache, whatever the target's KV quant - held at the trained block depth
+            # times a fixed slack for the cells llama.cpp keeps around each block
+            # (its draft cache in the reference log carried ~7 blocks per cell row).
+            try:
+                draft_kv_mib = _mib(kv_bytes_per_token(dc, "f16")
+                                    * block * DRAFT_KV_BLOCK_SLACK)
+            except Exception:
+                draft_kv_mib = 0.0
+            # Draft-graph buffers at the block depth, through the same calibrated
+            # coefficients the target's graph is priced with - the drafter's own
+            # geometry, so its attention and logits buffers are not the target's.
+            try:
+                draft_graph_mib = compute_buffer_terms(dc, block, n_ubatch,
+                                                       flash_attn, n_seq,
+                                                       kv_type)["graph"]
+            except Exception:
+                draft_graph_mib = 0.0
+            spec_mib = weights_d + draft_kv_mib + draft_graph_mib
+            warnings.append(
+                "The DFlash drafter's working set is derived: drafter weights "
+                "(exact bytes), its KV cache and draft graph (from the drafter's "
+                "geometry and this machine's calibration). The campaign's stage-D "
+                "rows measure the real cost.")
 
     # vision/audio projector: loaded to the GPU alongside the model, so it comes
     # off the top of the budget before any layer split is planned
@@ -9958,6 +9988,27 @@ def _run_suite(require_refs, tmp, skipped_real):
     print("  DFLASH analyze without a drafter raises, naming the gap  %s"
           % ("OK" if nofile_ok else "FAIL"))
     ok = ok and nofile_ok
+    # ...but a model with MTP blocks of its own is not stuck: llama.cpp runs one
+    # scheme per server, so the plan prices the model's own MTP cache instead
+    # and says so out loud, rather than failing a plan that can still be
+    # complete. (The stale-checkbox path the UI now prevents entirely.)
+    mtpp = os.path.join(nod, "mtp.gguf")
+    _write_gguf(mtpp, {"llama.block_count": nL, "llama.attention.head_count": nh,
+                       "llama.attention.head_count_kv": nkv,
+                       "llama.embedding_length": hid, "llama.context_length": 8192,
+                       "llama.feed_forward_length": 1536,
+                       "llama.nextn_predict_layers": 1},
+                {"general.architecture": "llama", "general.name": "MTPTest"},
+                dense_t)
+    fb = analyze(mtpp, 4096, "f16", 512, True, vram_budget_mib=2000,
+                 ram_budget_mib=8000, gpu_reserve_mib=0, compute_override_mib=0,
+                 safety_pct=0, dflash=True)
+    fb_ok = (fb["dflash"] is None and fb["inputs"]["dflash"] is True
+             and fb["plan"].get("spec_mib", 0) > 0
+             and any("MTP" in w for w in (fb.get("warnings") or [])))
+    print("  DFLASH analyze without a drafter falls back to MTP, warning said  %s"
+          % ("OK" if fb_ok else "FAIL"))
+    ok = ok and fb_ok
     # stage D sweeps the drafter's OWN depth ladder - every depth the block
     # allows, ascending - because the draft cache grows with depth and the
     # monotone wall prunes the deeper half of it once the first depth OOMs

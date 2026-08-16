@@ -244,6 +244,27 @@ def _run_suite(require_refs, tmp, skipped_real):
     print("  DFLASH analyze without a drafter raises, naming the gap  %s"
           % ("OK" if nofile_ok else "FAIL"))
     ok = ok and nofile_ok
+    # ...but a model with MTP blocks of its own is not stuck: llama.cpp runs one
+    # scheme per server, so the plan prices the model's own MTP cache instead
+    # and says so out loud, rather than failing a plan that can still be
+    # complete. (The stale-checkbox path the UI now prevents entirely.)
+    mtpp = os.path.join(nod, "mtp.gguf")
+    _write_gguf(mtpp, {"llama.block_count": nL, "llama.attention.head_count": nh,
+                       "llama.attention.head_count_kv": nkv,
+                       "llama.embedding_length": hid, "llama.context_length": 8192,
+                       "llama.feed_forward_length": 1536,
+                       "llama.nextn_predict_layers": 1},
+                {"general.architecture": "llama", "general.name": "MTPTest"},
+                dense_t)
+    fb = analyze(mtpp, 4096, "f16", 512, True, vram_budget_mib=2000,
+                 ram_budget_mib=8000, gpu_reserve_mib=0, compute_override_mib=0,
+                 safety_pct=0, dflash=True)
+    fb_ok = (fb["dflash"] is None and fb["inputs"]["dflash"] is True
+             and fb["plan"].get("spec_mib", 0) > 0
+             and any("MTP" in w for w in (fb.get("warnings") or [])))
+    print("  DFLASH analyze without a drafter falls back to MTP, warning said  %s"
+          % ("OK" if fb_ok else "FAIL"))
+    ok = ok and fb_ok
     # stage D sweeps the drafter's OWN depth ladder - every depth the block
     # allows, ascending - because the draft cache grows with depth and the
     # monotone wall prunes the deeper half of it once the first depth OOMs

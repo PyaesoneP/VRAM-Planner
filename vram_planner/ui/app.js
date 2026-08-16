@@ -297,6 +297,12 @@ function onPick(){
   if(!m) return;
   $("path").value = "";
   if(m.n_ctx_train) setCtxMax(m.n_ctx_train);
+  // Speculation is per-model: the previous model's DFlash request must not ride
+  // along to one with no drafter next to it - a stale check is a plan that fails
+  // for no reason. The field is re-shown only by a plan that actually priced a
+  // drafter.
+  $("dflash").checked = false;
+  $("dflashfield").hidden = true;
 }
 
 /* -------------------------------------------------------------- analysis */
@@ -318,7 +324,7 @@ async function run(){
     n_seq: parseInt($("nseq").value) || 1,
     include_mmproj: $("mmproj").checked,
     mtp_spec: $("mtpspec").checked,
-    dflash: $("dflash").checked,
+    dflash: $("dflash").checked && !$("dflashfield").hidden,
     n_cpu_moe_override: $("ncpumoe").value === "" ? null : parseInt($("ncpumoe").value),
     bw_vram_gbs: parseFloat($("bwv").value) || 0,
     bw_ram_gbs: parseFloat($("bwr").value) || 0,
@@ -559,7 +565,7 @@ function renderVerdict(r){
     { cls:"s-kv",  color:"var(--kv)",   label:"KV cache (GPU)",    mib:p.gpu_kv_mib || 0 },
     { cls:"s-rec", color:"var(--rec)",  label:"recurrent state",   mib:p.gpu_recurrent_mib || 0 },
     { cls:"s-prj", color:"var(--proj)", label:"vision projector",  mib:p.mmproj_mib || 0 },
-    { cls:"s-spc", color:"var(--spec)", label: inp.dflash ? "DFlash drafter" : "MTP draft cache", mib:p.spec_mib || 0 },
+    { cls:"s-spc", color:"var(--spec)", label: r.dflash ? "DFlash drafter" : "MTP draft cache", mib:p.spec_mib || 0 },
     { cls:"s-cmp", color:"var(--cmp)",  label:"compute buffer",    mib:p.compute_mib || 0 },
     { cls:"s-rsv", color:"",            label:"driver reserve",    mib:inp.gpu_reserve_mib || 0 }
   ];

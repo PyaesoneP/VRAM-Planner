@@ -2160,6 +2160,7 @@ function campaignRow(g){
   const span = (g.first && g.last && when(g.first) !== when(g.last))
     ? when(g.first) + " → " + when(g.last) : when(g.last);
   return h`<div class="camp ${open ? "open" : ""}">
+    <div class="camphead">
     <button class="camprow" type="button" data-action="sweep-open" data-id="${id}">
       <span class="mono">${g.model}</span>
       <span class="muted small">${g.gpu || "?"} &middot; ${g.backend} &middot; ${span}
@@ -2175,7 +2176,71 @@ function campaignRow(g){
       <span class="campbest">${g.best_tok_s ? g.best_tok_s.toFixed(2) + " tok/s" : "—"}</span>
       <span class="campcaret">${open ? "▾" : "▸"}</span>
     </button>
+    <button class="ghost campdel" type="button" data-action="sweep-del" data-id="${id}"
+            title="Forget this campaign" aria-label="Forget this campaign">&#10005;</button>
+    </div>
+    ${raw(SWEEP.delKey === id ? campaignConfirm(g) : "")}
     ${raw(open ? campaignBody() : "")}</div>`;
+}
+
+/** The second click. Deleting is the one action here that destroys hours of GPU
+ *  time, so it says exactly what goes and where it goes first. A campaign is
+ *  not recoverable by re-running it cheaply - it IS the two hours. */
+function campaignConfirm(g){
+  const busy = SWEEP.delBusy === campaignId(g);
+  return h`<div class="campconfirm">
+    <p><b>Forget ${g.n_rows} row${g.n_rows === 1 ? "" : "s"}</b> measured for
+      <span class="mono">${g.model}</span> on ${g.gpu || "?"} ${g.backend}${
+      g.best_tok_s ? h`, best ${g.best_tok_s.toFixed(2)} tok/s` : ""}?</p>
+    <p class="note">Only this campaign goes. <span class="mono">${g.file}</span> is one GPU
+      and one llama.cpp build and holds every other campaign measured on that pair — those
+      stay. The removed rows are written to <span class="mono">speed/deleted/</span> first,
+      so this is undone by moving one file back.</p>
+    <div class="actions">
+      <button class="ghost danger" type="button" data-action="sweep-del-yes" data-id="${
+        campaignId(g)}" ${busy ? "disabled" : ""}>${busy ? "deleting…" : "Forget it"}</button>
+      <button class="ghost" type="button" data-action="sweep-del-no">Cancel</button>
+    </div>
+  </div>`;
+}
+
+function askDelete(id){
+  SWEEP.delKey = (SWEEP.delKey === id) ? null : id;
+  drawSweep({ grid: false, results: false, history: true });
+}
+
+async function doDelete(id){
+  const g = (SWEEP.campaigns || []).find(x => campaignId(x) === id);
+  if(!g) return;
+  SWEEP.delBusy = id;
+  drawSweep({ grid: false, results: false, history: true });
+  let d;
+  try{
+    d = await (await fetch("/api/speed/delete", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ confirm: true, model: g.model, gpu: g.gpu, file: g.file,
+                             pid: g.prompt_id || "", tid: g.template_id || "" })
+    })).json();
+  }catch(e){ d = { ok: false, error: String(e) }; }
+  SWEEP.delBusy = null;
+  SWEEP.delKey = null;
+  SWEEP.delNote = d.ok
+    ? h`Forgot ${d.removed} row${d.removed === 1 ? "" : "s"} from <span class="mono">${
+        d.file}</span>${d.backup ? h` — saved to <span class="mono">${d.backup}</span>` : ""}.`
+    : h`<span style="color:var(--warn)">Could not delete: ${d.error || "unknown"}</span>`;
+  if(d.ok){
+    // The campaign that was open may be the one just removed, and a row picked
+    // out of it is no longer backed by anything on disk.
+    if(SWEEP.openCampaign === id){ SWEEP.openCampaign = null; SWEEP.insights = null; }
+    SWEEP.pickKey = null;
+    SWEEP.script = null;
+    await Promise.all([loadHistory(), loadSweepRows()]);
+    // Fewer rows can change which config is recommended - including back to the
+    // planner's estimate, if what just went was the only trustworthy campaign.
+    REC_FOR = null;
+    if(LAST) loadRecommendation(LAST);
+  }
+  drawSweep({ grid: false, results: true, script: true, history: true });
 }
 
 function campaignBody(){
@@ -2269,16 +2334,20 @@ function campaignRows(ranked){
 
 function sweepHistory(){
   const cs = SWEEP.campaigns;
+  const note = SWEEP.delNote
+    ? h`<p class="note delnote">${raw(SWEEP.delNote)}</p>` : "";
   if(cs == null) return '<p class="muted small">reading recorded campaigns…</p>';
   if(!cs.length){
-    return h`<p class="note">No campaigns recorded yet. Analyze a model and press
+    return note + h`<p class="note">No campaigns recorded yet. Analyze a model and press
       <b>Start measuring</b> above, or run
       <span class="mono">python -m vram_planner --speed-sweep</span>.</p>`;
   }
-  return h`<div class="camps">${raw(cs.map(campaignRow).join(""))}</div>
+  return note + h`<div class="camps">${raw(cs.map(campaignRow).join(""))}</div>
     <p class="note">Rows in <span class="mono">${SWEEP.speeddir || "speed/"}</span>, one file
       per GPU and llama.cpp build. They are split that way on purpose: a version bump moves
-      these numbers, and merging two builds into one campaign would hide it.</p>`;
+      these numbers, and merging two builds into one campaign would hide it. <b>&#10005;</b>
+      forgets a campaign — its rows are moved to <span class="mono">speed/deleted/</span>
+      rather than dropped, so it is undone by moving one file back.</p>`;
 }
 
 function sweepDownload(){
@@ -2323,12 +2392,17 @@ const ACTIONS = {
                          drawSweep({ grid: false, script: true, history: true }); },
   "set-step":    el => setStep(el.dataset.step),
   "sweep-open":  el => openCampaign(el.dataset.id),
+  "sweep-del":     el => askDelete(el.dataset.id),
+  "sweep-del-yes": el => doDelete(el.dataset.id),
+  "sweep-del-no":  () => { SWEEP.delKey = null;
+                           drawSweep({ grid: false, results: false, history: true }); },
   "sweep-shell": el => { SWEEP.shell = el.value; SWEEP.script = null;
                          drawSweep({ grid: false, results: false, script: true }); },
   "sweep-gen":   () => sweepGen(false),
   "sweep-save":  () => sweepGen(true),
   "sweep-copy":  el => sweepCopy(el),
-  "sweep-dl":    () => sweepDownload()
+  "sweep-dl":    () => sweepDownload(),
+  "rec-script":  () => recToScript()
 };
 
 document.addEventListener("click", ev => {

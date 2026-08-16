@@ -329,6 +329,12 @@ def build_argv(exe, model_path, c, port, probe=True, host="127.0.0.1"):
             if c.get("spec_n_min"):
                 av += ["--spec-draft-n-min", str(c["spec_n_min"])]
         else:
+            if spec == "draft-mtp" and c.get("md"):
+                # An external MTP draft model: the MTP blocks live in the
+                # drafter, so it must ride the command the way DFlash's does.
+                # Without an md, draft-mtp uses the model's own blocks and no
+                # extra file is passed - the distinction is the md's presence.
+                av += ["-md", c["md"]]
             if c.get("spec_n_max"):
                 av += ["--spec-draft-n-max", str(c["spec_n_max"])]
             if c.get("spec_n_min"):

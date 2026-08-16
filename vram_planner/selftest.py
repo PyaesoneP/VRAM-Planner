@@ -265,6 +265,50 @@ def _run_suite(require_refs, tmp, skipped_real):
     print("  DFLASH analyze without a drafter falls back to MTP, warning said  %s"
           % ("OK" if fb_ok else "FAIL"))
     ok = ok and fb_ok
+    # 3c) EXPLICIT drafter pick: the user names the file, so discovery plays no
+    #     part - the plan prices exactly that file. A dflash-*.gguf drafts as
+    #     DFlash; a model with MTP blocks drafts as an MTP draft model (-md +
+    #     --spec-type draft-mtp); anything else is refused rather than guessed.
+    #     p2 sits NEXT TO a dflash drafter, so an explicit MTP pick that still
+    #     prices the MTP file proves the pick overrides discovery.
+    em = analyze(p2, 4096, "f16", 512, True, vram_budget_mib=2000,
+                 ram_budget_mib=8000, gpu_reserve_mib=0, compute_override_mib=0,
+                 safety_pct=0, drafter=mtpp)
+    em_ok = (em["drafter"] and em["drafter"]["kind"] == "mtp"
+             and em["drafter"]["name"] == "mtp.gguf"
+             and em["drafter"]["mib"] > 0 and em["drafter"]["depth"] == 1
+             and em["dflash"] is None and em["plan"].get("spec_mib", 0) > 0
+             and em["inputs"]["drafter"] == os.path.abspath(mtpp)
+             and em["inputs"]["drafter_kind"] == "mtp"
+             and any("draft model" in w for w in (em.get("warnings") or [])))
+    print("  DRAFTER explicit MTP model drafts as MTP, overrides discovery  %s"
+          % ("OK" if em_ok else "FAIL"))
+    ok = ok and em_ok
+    ed = analyze(p3, 4096, "f16", 512, True, vram_budget_mib=2000,
+                 ram_budget_mib=8000, gpu_reserve_mib=0, compute_override_mib=0,
+                 safety_pct=0, drafter=pd)
+    ed_ok = (ed["drafter"] and ed["drafter"]["kind"] == "dflash"
+             and ed["drafter"]["depth"] == 8 and ed["dflash"] is not None
+             and ed["inputs"]["drafter_kind"] == "dflash")
+    print("  DRAFTER explicit dflash-*.gguf drafts as DFlash  %s"
+          % ("OK" if ed_ok else "FAIL"))
+    ok = ok and ed_ok
+    refused = missing = False
+    try:
+        analyze(p2, 4096, "f16", 512, True, vram_budget_mib=2000,
+                ram_budget_mib=8000, gpu_reserve_mib=0, compute_override_mib=0,
+                safety_pct=0, drafter=p1)
+    except ValueError:
+        refused = True
+    try:
+        analyze(p2, 4096, "f16", 512, True, vram_budget_mib=2000,
+                ram_budget_mib=8000, gpu_reserve_mib=0, compute_override_mib=0,
+                safety_pct=0, drafter=os.path.join(nod, "nope.gguf"))
+    except ValueError:
+        missing = True
+    print("  DRAFTER a plain model file is refused, a missing one too  %s"
+          % ("OK" if refused and missing else "FAIL"))
+    ok = ok and refused and missing
     # stage D sweeps the drafter's OWN depth ladder - every depth the block
     # allows, ascending - because the draft cache grows with depth and the
     # monotone wall prunes the deeper half of it once the first depth OOMs
@@ -467,6 +511,22 @@ def _run_suite(require_refs, tmp, skipped_real):
     print("  DFLASH launcher passes -md with a checked path, both shells  %s"
           % ("OK" if launch_ok else "FAIL"))
     ok = ok and launch_ok
+    # an external MTP drafter rides the same checked-path machinery, and the
+    # model's own MTP (draft-mtp without an md) must NOT collect a drafter
+    # from the folder - the re-resolve only ever looks for dflash files, and
+    # draft-mtp only enters it when a file was named.
+    csm = dict(b0, spec="draft-mtp", spec_n_max=2, md=mtpp)
+    shb2 = "\n".join(command_lines(launch_script(p3, csm, shell="bash")))
+    shp2 = "\n".join(command_lines(launch_script(p3, csm, shell="powershell")))
+    mav = build_argv("EXE", p2, dict(b0, spec="draft-mtp", spec_n_max=2, md=mtpp),
+                     8231, probe=False)
+    oav = build_argv("EXE", p2, dict(b0, spec="draft-mtp", spec_n_max=2),
+                     8231, probe=False)
+    mtpmd_ok = ('-md "$DRAFT"' in shb2 and "-md $draft" in shp2
+                and "-md" in mav and "-md" not in oav)
+    print("  DFLASH external MTP drafter rides -md in argv and both launchers  %s"
+          % ("OK" if mtpmd_ok else "FAIL"))
+    ok = ok and mtpmd_ok
 
     # 4) hybrid attention/SSM: only every Nth block may carry a KV cache
     hyb_t = [("token_embd.weight", [hid, 4000], 12)]
@@ -2230,6 +2290,21 @@ def _run_suite(require_refs, tmp, skipped_real):
         # the plan's own config survives the trip into a row's vocabulary
         pc = plan_config(pr)
         rec_ok = rec_ok and pc["ngl"] == 41 and pc["ncmoe"] == 18 and pc["kv"] == "q8_0"
+        # ...and so does the speculation it priced: an external MTP drafter
+        # becomes spec draft-mtp + md, the model's own MTP blocks become a
+        # scheme without a file, and a plan with neither invents neither.
+        pc_dr = plan_config(em)
+        rec_ok = rec_ok and pc_dr["spec"] == "draft-mtp" \
+            and pc_dr["spec_n_max"] == 1 and pc_dr["md"] == em["inputs"]["drafter"]
+        own_inp = {k: v for k, v in em["inputs"].items()
+                   if k not in ("drafter", "drafter_kind", "drafter_depth")}
+        pc_own = plan_config({"plan": em["plan"],
+                              "inputs": dict(own_inp, mtp_depth=2)})
+        rec_ok = rec_ok and pc_own["spec"] == "draft-mtp" \
+            and pc_own["spec_n_max"] == 2 and "md" not in pc_own
+        pc_dd = plan_config(ed)
+        rec_ok = rec_ok and pc_dd["spec"] == "draft-dflash" \
+            and pc_dd["spec_n_max"] == 8 and pc_dd["md"] == ed["inputs"]["drafter"]
         print("  RECOMM measured wins, spilled never does, every delta named    %s"
               % ("OK" if rec_ok else "FAIL"))
         rec_all = budget_ok and verdict_ok and rec_ok

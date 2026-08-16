@@ -152,8 +152,17 @@
         </div>
 
         <div class="field" id="dflashfield" hidden>
-          <label class="check"><input type="checkbox" id="dflash"> DFlash speculative decoding</label>
+          <label for="draftpick">Draft model <span class="unit">optional</span></label>
+          <select id="draftpick">
+            <option value="__none__">none &mdash; the model alone</option>
+            <option value="">auto &mdash; the DFlash drafter (dflash-*.gguf) next to the model</option>
+          </select>
           <p class="hint" id="dflashhint"></p>
+          <p class="hint">A <span class="mono">dflash-*.gguf</span> drafts as DFlash; a model file
+            with MTP blocks (a <span class="mono">*-MTP-*.gguf</span>) drafts the target with its
+            own multi-token prediction, like <span class="mono">-md &lt;file&gt; --spec-type draft-mtp</span>.
+            Anything else is refused rather than guessed. Or type a path to a drafter file
+            <input type="text" id="draftpath" placeholder="path to a drafter .gguf" style="margin-top:6px"></p>
         </div>
 
         <div class="field">

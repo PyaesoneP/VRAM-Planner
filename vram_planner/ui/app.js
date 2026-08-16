@@ -297,12 +297,44 @@ function onPick(){
   if(!m) return;
   $("path").value = "";
   if(m.n_ctx_train) setCtxMax(m.n_ctx_train);
-  // Speculation is per-model: the previous model's DFlash request must not ride
-  // along to one with no drafter next to it - a stale check is a plan that fails
-  // for no reason. The field is re-shown only by a plan that actually priced a
-  // drafter.
-  $("dflash").checked = false;
+  // Speculation is per-model: the previous model's drafter choice must not ride
+  // along to one with no drafter next to it - a stale pick is a plan that fails
+  // for no reason. The picker is repopulated from the new model's directory and
+  // reset to "none", and the field is re-shown only by a plan that actually
+  // priced a drafter.
+  $("draftpick").value = "__none__";
+  $("draftpath").value = "";
   $("dflashfield").hidden = true;
+  loadDrafters();
+}
+
+/** The drafter picker's options: every .gguf next to the model, classified by
+ *  what the plan would do with it. The server does the reading; the dropdown
+ *  only shapes the choice, and the plan refuses a file it cannot draft with. */
+async function loadDrafters(){
+  const path = currentPath();
+  if(!path) return;
+  const sel = $("draftpick");
+  const keep = sel.value;
+  while(sel.options.length > 2) sel.remove(2);
+  let cand = [];
+  try{
+    const d = await (await fetch("/api/drafters?path=" + encodeURIComponent(path))).json();
+    cand = (d && d.drafters) || [];
+  }catch(e){}
+  for(const c of cand){
+    const tag = c.kind === "dflash" ? "DFlash drafter"
+             : c.kind === "mtp" ? "MTP draft model" : "model file";
+    const opt = document.createElement("option");
+    opt.value = c.path;
+    opt.textContent = c.name + " — " + tag;
+    sel.appendChild(opt);
+  }
+  sel.value = cand.some(c => c.path === keep) ? keep : "__none__";
+  $("dflashhint").textContent = cand.length
+    ? cand.length + " candidate drafter file(s) next to the model"
+    : "no drafter candidates next to this model — DFlash auto-discovery will find none either";
+  $("dflashfield").hidden = cand.length === 0 && !$("draftpath").value.trim();
 }
 
 /* -------------------------------------------------------------- analysis */
@@ -324,7 +356,16 @@ async function run(){
     n_seq: parseInt($("nseq").value) || 1,
     include_mmproj: $("mmproj").checked,
     mtp_spec: $("mtpspec").checked,
-    dflash: $("dflash").checked && !$("dflashfield").hidden,
+    // The drafter picker: "auto" (empty value) asks the server for the DFlash
+    // drafter next to the model, "__none__" or a hidden field sends nothing,
+    // and a chosen file or typed path goes through verbatim.
+    dflash: !$("dflashfield").hidden
+      && ($("draftpick").value === "") && !$("draftpath").value.trim(),
+    drafter: (!$("dflashfield").hidden && $("draftpick").value
+              && $("draftpick").value !== "__none__")
+      ? $("draftpick").value
+      : (!$("dflashfield").hidden && $("draftpath").value.trim()
+         ? $("draftpath").value.trim() : ""),
     n_cpu_moe_override: $("ncpumoe").value === "" ? null : parseInt($("ncpumoe").value),
     bw_vram_gbs: parseFloat($("bwv").value) || 0,
     bw_ram_gbs: parseFloat($("bwr").value) || 0,
@@ -565,7 +606,9 @@ function renderVerdict(r){
     { cls:"s-kv",  color:"var(--kv)",   label:"KV cache (GPU)",    mib:p.gpu_kv_mib || 0 },
     { cls:"s-rec", color:"var(--rec)",  label:"recurrent state",   mib:p.gpu_recurrent_mib || 0 },
     { cls:"s-prj", color:"var(--proj)", label:"vision projector",  mib:p.mmproj_mib || 0 },
-    { cls:"s-spc", color:"var(--spec)", label: r.dflash ? "DFlash drafter" : "MTP draft cache", mib:p.spec_mib || 0 },
+    { cls:"s-spc", color:"var(--spec)", label: r.drafter
+    ? (r.drafter.kind === "mtp" ? "MTP draft model" : "DFlash drafter")
+    : "MTP draft cache", mib:p.spec_mib || 0 },
     { cls:"s-cmp", color:"var(--cmp)",  label:"compute buffer",    mib:p.compute_mib || 0 },
     { cls:"s-rsv", color:"",            label:"driver reserve",    mib:inp.gpu_reserve_mib || 0 }
   ];
@@ -710,10 +753,13 @@ function renderSummary(r){
       ${raw(c.n_mtp_layers
         ? kvItem("multi-token pred.", c.n_mtp_layers + " block" + (c.n_mtp_layers == 1 ? "" : "s") +
             ' <span class="muted">(' + (inp.mtp_spec ? "drafting: KV counted" : "idle: weights only") + ')</span>') : "")}
-      ${raw(r.dflash
-        ? kvItem("dflash drafter", esc(r.dflash.name) +
-            ' <span class="muted">' + fmt(r.dflash.mib) + " &middot; derived &middot; block " +
-            r.dflash.block_size + "</span>") : "")}
+      ${raw(r.drafter
+        ? kvItem(r.drafter.kind === "mtp" ? "MTP draft model" : "dflash drafter",
+            esc(r.drafter.name) +
+            ' <span class="muted">' + fmt(r.drafter.mib) + " &middot; derived &middot; " +
+            (r.drafter.kind === "mtp"
+              ? r.drafter.depth + " MTP block" + (r.drafter.depth === 1 ? "" : "s")
+              : "block " + r.drafter.depth) + "</span>") : "")}
       ${raw(kvItem("head dim", (c.head_dim_k || "-") +
         ((r.swa && r.swa.enabled && r.swa.head_dim !== r.swa.head_dim_global)
           ? '  <span class="muted">/ ' + esc(r.swa.head_dim) + ' swa</span>' : "")))}
@@ -815,15 +861,27 @@ function render(r){
   $("mmprojfield").hidden = !r.mmproj;
   $("ncpumoefield").hidden = !r.is_moe;
   $("mtprow").hidden = !c.n_mtp_layers;
-  $("dflashfield").hidden = !r.dflash;
-  if(r.dflash){
-    // The drafter's cost is derived (weights exact; KV and graph from geometry
-    // and the calibration), and the plan says so rather than passing it off as
-    // measured - the speed sweep's stage D exists to replace it with a number.
-    $("dflashhint").innerHTML = h`${esc(r.dflash.name)} drafts blocks for this model &mdash;
-      ${fmt(r.dflash.mib)} of VRAM (weights ${fmt(r.dflash.weights_mib)} + KV ${fmt(
-        r.dflash.kv_mib)} + graph ${fmt(r.dflash.graph_mib)}), block ${r.dflash.block_size
-      }. <b>Derived, not measured</b>: the speed sweep&rsquo;s stage D measures the real cost.`;
+  $("dflashfield").hidden = !r.drafter;
+  if(r.drafter){
+    // The drafter's cost is derived (weights exact; cache and graph from
+    // geometry and the calibration), and the plan says so rather than passing
+    // it off as measured - the speed sweep's stage D exists to replace it with
+    // a number. The picker lands on the file the plan used, so a re-run prices
+    // the same pair; anything else the dropdown holds stays as it was.
+    if(r.drafter.kind === "mtp"){
+      $("dflashhint").innerHTML = h`${esc(r.drafter.name)} drafts this model with its MTP
+        blocks &mdash; ${fmt(r.drafter.mib)} of VRAM (weights ${fmt(r.drafter.weights_mib)}
+        + MTP draft cache ${fmt(r.drafter.cache_mib)}), ${r.drafter.depth} MTP block${
+        r.drafter.depth === 1 ? "" : "s"}. <b>Derived, not measured</b>.`;
+    }else{
+      $("dflashhint").innerHTML = h`${esc(r.drafter.name)} drafts blocks for this model &mdash;
+        ${fmt(r.drafter.mib)} of VRAM (weights ${fmt(r.drafter.weights_mib)} + KV ${fmt(
+        r.drafter.cache_mib)}), block ${r.drafter.depth
+        }. <b>Derived, not measured</b>: the speed sweep&rsquo;s stage D measures the real cost.`;
+    }
+    const sel = $("draftpick");
+    if(sel && r.drafter.path && Array.from(sel.options).some(o => o.value === r.drafter.path))
+      sel.value = r.drafter.path;
   }
   if(r.mmproj){
     $("mmprojhint").innerHTML = h`${r.mmproj.name} &middot; ${fmt(r.mmproj.mib)
@@ -2466,14 +2524,18 @@ $("ctx").addEventListener("input", markCtx);
 $("visionplan").addEventListener("change", () => {
   $("visioninputs").hidden = !$("visionplan").checked;
 });
-// A server runs ONE speculative scheme, so DFlash and MTP are exclusive:
-// ticking one switches the other off rather than asking the planner to price
-// both (it would price only the first and warn about the second).
-$("dflash").addEventListener("change", () => {
-  if($("dflash").checked) $("mtpspec").checked = false;
+// A server runs ONE speculative scheme, so a chosen drafter and MTP are
+// exclusive: picking a drafter switches the model's own MTP off, and ticking
+// MTP clears the drafter pick. "auto" counts as a pick - it resolves to a
+// DFlash drafter, which would then argue with the MTP check.
+$("draftpick").addEventListener("change", () => {
+  if($("draftpick").value && $("draftpick").value !== "__none__")
+    $("mtpspec").checked = false;
 });
 $("mtpspec").addEventListener("change", () => {
-  if($("mtpspec").checked) $("dflash").checked = false;
+  if($("mtpspec").checked && $("draftpick").value
+     && $("draftpick").value !== "__none__")
+    $("draftpick").value = "__none__";
 });
 $("model").addEventListener("change", onPick);
 // Switching the basis with a stale number in the budget box is exactly the

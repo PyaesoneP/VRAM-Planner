@@ -915,16 +915,19 @@ def launch_script(model_path, c, backend=None, mmproj=None, shell=None,
         c.pop("mmproj", None)
     mmproj = c.get("mmproj")
 
-    # The DFlash drafter, when the config carries one. A row records its path,
-    # which can be stale (the pair moved) or foreign (the row came from another
+    # The drafter, when the config carries one. A row records its path, which
+    # can be stale (the pair moved) or foreign (the row came from another
     # machine), so an md that does not exist is re-resolved next to the model.
     # build_argv refuses a draft-dflash command without a drafter, so None here
     # is only reachable if the config's spec changed between the row and here.
+    # draft-mtp enters only when it NAMES a file: without an md the model's own
+    # MTP blocks draft, and the re-resolve below (which looks for dflash files)
+    # must not bolt a DFlash drafter onto that.
     draft = None
-    if c.get("spec") == "draft-dflash":
+    if c.get("spec") == "draft-dflash" or (c.get("spec") == "draft-mtp" and c.get("md")):
         md = c.get("md")
         if not (md and os.path.isfile(md)):
-            md = find_drafter_for(model_path)
+            md = find_drafter_for(model_path) if c.get("spec") == "draft-dflash" else None
         if md:
             c["md"] = md
             draft = md

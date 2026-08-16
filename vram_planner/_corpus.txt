@@ -7499,16 +7499,19 @@ def launch_script(model_path, c, backend=None, mmproj=None, shell=None,
         c.pop("mmproj", None)
     mmproj = c.get("mmproj")
 
-    # The DFlash drafter, when the config carries one. A row records its path,
-    # which can be stale (the pair moved) or foreign (the row came from another
+    # The drafter, when the config carries one. A row records its path, which
+    # can be stale (the pair moved) or foreign (the row came from another
     # machine), so an md that does not exist is re-resolved next to the model.
     # build_argv refuses a draft-dflash command without a drafter, so None here
     # is only reachable if the config's spec changed between the row and here.
+    # draft-mtp enters only when it NAMES a file: without an md the model's own
+    # MTP blocks draft, and the re-resolve below (which looks for dflash files)
+    # must not bolt a DFlash drafter onto that.
     draft = None
-    if c.get("spec") == "draft-dflash":
+    if c.get("spec") == "draft-dflash" or (c.get("spec") == "draft-mtp" and c.get("md")):
         md = c.get("md")
         if not (md and os.path.isfile(md)):
-            md = find_drafter_for(model_path)
+            md = find_drafter_for(model_path) if c.get("spec") == "draft-dflash" else None
         if md:
             c["md"] = md
             draft = md
@@ -8545,14 +8548,40 @@ def find_drafter_for(model_path):
     return None
 
 
+def load_drafter(path):
+    """Full detail on an explicitly picked drafter file, whatever it is.
+
+    Unlike find_drafter_for() - which only ever returns a DFlash drafter found
+    next to a model - this takes the file the user chose: a `dflash-*.gguf`, or
+    a full model carrying MTP blocks, which llama.cpp will happily draft with
+    (-md + --spec-type draft-mtp). Returns {path, name, bytes, tensor_bytes,
+    cfg, meta} or raises ValueError when the file is not readable. The caller
+    decides what the file IS; this only says what it costs."""
+    p = os.path.abspath(path)
+    if not os.path.isfile(p):
+        raise ValueError("drafter file not found: %s" % path)
+    meta = parse_meta_only(p)
+    try:
+        g = load_gguf(p)
+        tb = sum(t["n_bytes"] for t in g["tensors"])
+        try:
+            cfg = extract_config(g)
+        except Exception:
+            cfg = {}
+    except (OSError, ValueError) as e:
+        raise ValueError("could not read drafter %s: %s" % (path, e))
+    return {"path": p, "name": os.path.basename(p), "bytes": os.path.getsize(p),
+            "tensor_bytes": tb, "cfg": cfg, "meta": meta}
+
+
 def analyze(path, ctx, kv_type, n_ubatch, flash_attn,
             vram_budget_mib, ram_budget_mib, gpu_reserve_mib,
             compute_override_mib, safety_pct, kv_on_gpu=False,
             gpu_layers_override=None, ram_free_mib=None, n_seq=1,
             include_mmproj=True, n_cpu_moe_override=None,
             bw_vram_gbs=None, bw_ram_gbs=None, ram_eff=None, ctx_fill=None,
-            bw_note="", mtp_spec=False, dflash=False, image_px=None,
-            vision_flash_attn=True):
+            bw_note="", mtp_spec=False, dflash=False, drafter=None,
+            image_px=None, vision_flash_attn=True):
     # The file is authoritative when it is here; the stored card stands in when it
     # is not. Reading a real file also refreshes the card, so the library builds
     # up as a side effect of ordinary use rather than needing to be curated.
@@ -8668,7 +8697,26 @@ def analyze(path, ctx, kv_type, n_ubatch, flash_attn,
     # calibrated graph coefficients - so the result says so, and a campaign's
     # stage-D rows exist to replace the derivation with reality.
     dflash_info = None
-    if dflash:
+    drafter_mtp = None     # an explicit drafter pick that is a model with MTP blocks
+    mtp_fallback = False   # dflash asked, no drafter found, priced the model's own MTP
+    if drafter:
+        # An explicit pick overrides discovery entirely: the user named the
+        # file, so the plan prices exactly that file and must not silently
+        # swap in something found next to the model instead.
+        det = load_drafter(drafter)
+        if (det["meta"].get("general.architecture") or "").lower() == "dflash":
+            bs = det["meta"].get("dflash.block_size")
+            dflash_info = dict(det,
+                               block_size=int(bs) if isinstance(bs, int) and bs > 0 else 16)
+        elif det["cfg"].get("n_mtp_layers"):
+            drafter_mtp = det
+        else:
+            raise ValueError(
+                "%s is neither a DFlash drafter (architecture 'dflash') nor a "
+                "model with MTP blocks of its own, so it cannot draft this "
+                "model. Pick a dflash-*.gguf or a model whose name carries MTP."
+                % det["name"])
+    elif dflash:
         dflash_info = find_drafter_for(path)
         if not dflash_info:
             # No drafter to price. If the model can draft itself, the plan can
@@ -8679,6 +8727,7 @@ def analyze(path, ctx, kv_type, n_ubatch, flash_attn,
             # guessing (this is the deliberate ValueError the UI and selftest
             # rely on).
             if cfg.get("mtp_kv_per_token"):
+                mtp_fallback = True
                 if not mtp_spec:
                     spec_mib = (_mib(cfg["mtp_kv_per_token"] * ctx)
                                 + MTP_SPEC_CONST_MIB
@@ -8695,38 +8744,52 @@ def analyze(path, ctx, kv_type, n_ubatch, flash_attn,
                     "directory, and this model has no MTP blocks of its own to "
                     "price instead. Run the plan without DFlash to split the "
                     "model on its own." % os.path.basename(path))
-        else:
-            if mtp_spec:
-                warnings.append("DFlash and MTP are both on - llama.cpp runs one "
-                                "speculative scheme per server, so this plan prices "
-                                "the DFlash drafter only.")
-            dc = dflash_info.get("cfg") or {}
-            block = dflash_info["block_size"]
-            weights_d = _mib(dflash_info["tensor_bytes"])
-            # The draft KV cache is the drafter's own KV - f16, like the MTP draft
-            # cache, whatever the target's KV quant - held at the trained block depth
-            # times a fixed slack for the cells llama.cpp keeps around each block
-            # (its draft cache in the reference log carried ~7 blocks per cell row).
-            try:
-                draft_kv_mib = _mib(kv_bytes_per_token(dc, "f16")
-                                    * block * DRAFT_KV_BLOCK_SLACK)
-            except Exception:
-                draft_kv_mib = 0.0
-            # Draft-graph buffers at the block depth, through the same calibrated
-            # coefficients the target's graph is priced with - the drafter's own
-            # geometry, so its attention and logits buffers are not the target's.
-            try:
-                draft_graph_mib = compute_buffer_terms(dc, block, n_ubatch,
-                                                       flash_attn, n_seq,
-                                                       kv_type)["graph"]
-            except Exception:
-                draft_graph_mib = 0.0
-            spec_mib = weights_d + draft_kv_mib + draft_graph_mib
-            warnings.append(
-                "The DFlash drafter's working set is derived: drafter weights "
-                "(exact bytes), its KV cache and draft graph (from the drafter's "
-                "geometry and this machine's calibration). The campaign's stage-D "
-                "rows measure the real cost.")
+    if dflash_info:
+        if mtp_spec:
+            warnings.append("DFlash and MTP are both on - llama.cpp runs one "
+                            "speculative scheme per server, so this plan prices "
+                            "the DFlash drafter only.")
+        dc = dflash_info.get("cfg") or {}
+        block = dflash_info["block_size"]
+        weights_d = _mib(dflash_info["tensor_bytes"])
+        # The draft KV cache is the drafter's own KV - f16, like the MTP draft
+        # cache, whatever the target's KV quant - held at the trained block depth
+        # times a fixed slack for the cells llama.cpp keeps around each block
+        # (its draft cache in the reference log carried ~7 blocks per cell row).
+        try:
+            draft_kv_mib = _mib(kv_bytes_per_token(dc, "f16")
+                                * block * DRAFT_KV_BLOCK_SLACK)
+        except Exception:
+            draft_kv_mib = 0.0
+        # Draft-graph buffers at the block depth, through the same calibrated
+        # coefficients the target's graph is priced with - the drafter's own
+        # geometry, so its attention and logits buffers are not the target's.
+        try:
+            draft_graph_mib = compute_buffer_terms(dc, block, n_ubatch,
+                                                   flash_attn, n_seq,
+                                                   kv_type)["graph"]
+        except Exception:
+            draft_graph_mib = 0.0
+        spec_mib = weights_d + draft_kv_mib + draft_graph_mib
+        warnings.append(
+            "The DFlash drafter's working set is derived: drafter weights "
+            "(exact bytes), its KV cache and draft graph (from the drafter's "
+            "geometry and this machine's calibration). The campaign's stage-D "
+            "rows measure the real cost.")
+    elif drafter_mtp:
+        if mtp_spec:
+            warnings.append("MTP drafting with an external draft model - the "
+                            "model's own MTP blocks stay idle, so this plan "
+                            "prices the drafter's MTP cache only.")
+        drafter_mib = _mib(drafter_mtp["tensor_bytes"])
+        drafter_cache_mib = (_mib(drafter_mtp["cfg"]["mtp_kv_per_token"] * ctx)
+                             + MTP_SPEC_CONST_MIB
+                             + MTP_SPEC_PER_SEQ_MIB * max(1, n_seq))
+        spec_mib = drafter_mib + drafter_cache_mib
+        warnings.append(
+            "The %s draft model's cost is derived: its weights (exact bytes) "
+            "and its MTP draft cache (from the drafter's geometry and this "
+            "machine's calibration)." % drafter_mtp["name"])
 
     # vision/audio projector: loaded to the GPU alongside the model, so it comes
     # off the top of the budget before any layer split is planned
@@ -8788,6 +8851,19 @@ def analyze(path, ctx, kv_type, n_ubatch, flash_attn,
                     "graph_mib": draft_graph_mib, "block_size": block,
                     "file_mib": _mib(dflash_info["bytes"]), "derived": True}
                    if dflash_info else None),
+        "drafter": (
+            {"kind": "mtp", "name": drafter_mtp["name"], "path": drafter_mtp["path"],
+             "mib": spec_mib, "weights_mib": drafter_mib,
+             "cache_mib": drafter_cache_mib,
+             "file_mib": _mib(drafter_mtp["bytes"]), "derived": True,
+             "depth": int(drafter_mtp["cfg"]["n_mtp_layers"] or 0)}
+            if drafter_mtp else
+            ({"kind": "dflash", "name": dflash_info["name"], "path": dflash_info["path"],
+              "mib": spec_mib, "weights_mib": weights_d,
+              "cache_mib": draft_kv_mib + draft_graph_mib,
+              "file_mib": _mib(dflash_info["bytes"]), "derived": True,
+              "depth": block}
+             if dflash_info else None)),
         "mmproj": ({"name": mmproj["name"], "mib": _mib(mmproj["tensor_bytes"]),
                     "file_mib": _mib(mmproj["bytes"]), "included": bool(include_mmproj)}
                    if mmproj else None),
@@ -8817,6 +8893,15 @@ def analyze(path, ctx, kv_type, n_ubatch, flash_attn,
         "inputs": {
             "context": ctx, "kv_type": kv_type, "n_ubatch": n_ubatch, "n_seq": n_seq,
             "mtp_spec": bool(mtp_spec), "dflash": bool(dflash),
+            "mtp_depth": (int(cfg.get("n_mtp_layers") or 0)
+                          if (mtp_spec or mtp_fallback) else None),
+            "drafter": (os.path.abspath(drafter) if drafter
+                        else (dflash_info["path"] if dflash_info else None)),
+            "drafter_kind": ("mtp" if drafter_mtp else "dflash")
+                            if (drafter_mtp or dflash_info) else None,
+            "drafter_depth": (int(drafter_mtp["cfg"]["n_mtp_layers"] or 0)
+                              if drafter_mtp else
+                              (block if dflash_info else None)),
             "flash_attn": flash_attn, "vram_budget_mib": vram_budget_mib,
             "ram_budget_mib": ram_budget_mib, "gpu_reserve_mib": gpu_reserve_mib,
             "eff_vram_mib": eff_vram, "safety_pct": safety_pct,
@@ -9489,6 +9574,18 @@ def plan_config(plan_result):
         c["seq"] = inp["n_seq"]
     if inp.get("flash_attn") is not None:
         c["fa"] = bool(inp["flash_attn"])
+    # Speculation the plan actually priced must survive into the launch script.
+    # An external drafter names the file (md) and the scheme follows its kind;
+    # the model's own MTP blocks are a scheme without a file. Absent either,
+    # spec stays absent - a plan without speculation must not invent one.
+    if inp.get("drafter"):
+        c["spec"] = "draft-mtp" if inp.get("drafter_kind") == "mtp" else "draft-dflash"
+        if inp.get("drafter_depth"):
+            c["spec_n_max"] = inp["drafter_depth"]
+        c["md"] = inp["drafter"]
+    elif inp.get("mtp_depth"):
+        c["spec"] = "draft-mtp"
+        c["spec_n_max"] = inp["mtp_depth"]
     return c
 
 
@@ -10009,6 +10106,50 @@ def _run_suite(require_refs, tmp, skipped_real):
     print("  DFLASH analyze without a drafter falls back to MTP, warning said  %s"
           % ("OK" if fb_ok else "FAIL"))
     ok = ok and fb_ok
+    # 3c) EXPLICIT drafter pick: the user names the file, so discovery plays no
+    #     part - the plan prices exactly that file. A dflash-*.gguf drafts as
+    #     DFlash; a model with MTP blocks drafts as an MTP draft model (-md +
+    #     --spec-type draft-mtp); anything else is refused rather than guessed.
+    #     p2 sits NEXT TO a dflash drafter, so an explicit MTP pick that still
+    #     prices the MTP file proves the pick overrides discovery.
+    em = analyze(p2, 4096, "f16", 512, True, vram_budget_mib=2000,
+                 ram_budget_mib=8000, gpu_reserve_mib=0, compute_override_mib=0,
+                 safety_pct=0, drafter=mtpp)
+    em_ok = (em["drafter"] and em["drafter"]["kind"] == "mtp"
+             and em["drafter"]["name"] == "mtp.gguf"
+             and em["drafter"]["mib"] > 0 and em["drafter"]["depth"] == 1
+             and em["dflash"] is None and em["plan"].get("spec_mib", 0) > 0
+             and em["inputs"]["drafter"] == os.path.abspath(mtpp)
+             and em["inputs"]["drafter_kind"] == "mtp"
+             and any("draft model" in w for w in (em.get("warnings") or [])))
+    print("  DRAFTER explicit MTP model drafts as MTP, overrides discovery  %s"
+          % ("OK" if em_ok else "FAIL"))
+    ok = ok and em_ok
+    ed = analyze(p3, 4096, "f16", 512, True, vram_budget_mib=2000,
+                 ram_budget_mib=8000, gpu_reserve_mib=0, compute_override_mib=0,
+                 safety_pct=0, drafter=pd)
+    ed_ok = (ed["drafter"] and ed["drafter"]["kind"] == "dflash"
+             and ed["drafter"]["depth"] == 8 and ed["dflash"] is not None
+             and ed["inputs"]["drafter_kind"] == "dflash")
+    print("  DRAFTER explicit dflash-*.gguf drafts as DFlash  %s"
+          % ("OK" if ed_ok else "FAIL"))
+    ok = ok and ed_ok
+    refused = missing = False
+    try:
+        analyze(p2, 4096, "f16", 512, True, vram_budget_mib=2000,
+                ram_budget_mib=8000, gpu_reserve_mib=0, compute_override_mib=0,
+                safety_pct=0, drafter=p1)
+    except ValueError:
+        refused = True
+    try:
+        analyze(p2, 4096, "f16", 512, True, vram_budget_mib=2000,
+                ram_budget_mib=8000, gpu_reserve_mib=0, compute_override_mib=0,
+                safety_pct=0, drafter=os.path.join(nod, "nope.gguf"))
+    except ValueError:
+        missing = True
+    print("  DRAFTER a plain model file is refused, a missing one too  %s"
+          % ("OK" if refused and missing else "FAIL"))
+    ok = ok and refused and missing
     # stage D sweeps the drafter's OWN depth ladder - every depth the block
     # allows, ascending - because the draft cache grows with depth and the
     # monotone wall prunes the deeper half of it once the first depth OOMs
@@ -10211,6 +10352,22 @@ def _run_suite(require_refs, tmp, skipped_real):
     print("  DFLASH launcher passes -md with a checked path, both shells  %s"
           % ("OK" if launch_ok else "FAIL"))
     ok = ok and launch_ok
+    # an external MTP drafter rides the same checked-path machinery, and the
+    # model's own MTP (draft-mtp without an md) must NOT collect a drafter
+    # from the folder - the re-resolve only ever looks for dflash files, and
+    # draft-mtp only enters it when a file was named.
+    csm = dict(b0, spec="draft-mtp", spec_n_max=2, md=mtpp)
+    shb2 = "\n".join(command_lines(launch_script(p3, csm, shell="bash")))
+    shp2 = "\n".join(command_lines(launch_script(p3, csm, shell="powershell")))
+    mav = build_argv("EXE", p2, dict(b0, spec="draft-mtp", spec_n_max=2, md=mtpp),
+                     8231, probe=False)
+    oav = build_argv("EXE", p2, dict(b0, spec="draft-mtp", spec_n_max=2),
+                     8231, probe=False)
+    mtpmd_ok = ('-md "$DRAFT"' in shb2 and "-md $draft" in shp2
+                and "-md" in mav and "-md" not in oav)
+    print("  DFLASH external MTP drafter rides -md in argv and both launchers  %s"
+          % ("OK" if mtpmd_ok else "FAIL"))
+    ok = ok and mtpmd_ok
 
     # 4) hybrid attention/SSM: only every Nth block may carry a KV cache
     hyb_t = [("token_embd.weight", [hid, 4000], 12)]
@@ -11974,6 +12131,21 @@ def _run_suite(require_refs, tmp, skipped_real):
         # the plan's own config survives the trip into a row's vocabulary
         pc = plan_config(pr)
         rec_ok = rec_ok and pc["ngl"] == 41 and pc["ncmoe"] == 18 and pc["kv"] == "q8_0"
+        # ...and so does the speculation it priced: an external MTP drafter
+        # becomes spec draft-mtp + md, the model's own MTP blocks become a
+        # scheme without a file, and a plan with neither invents neither.
+        pc_dr = plan_config(em)
+        rec_ok = rec_ok and pc_dr["spec"] == "draft-mtp" \
+            and pc_dr["spec_n_max"] == 1 and pc_dr["md"] == em["inputs"]["drafter"]
+        own_inp = {k: v for k, v in em["inputs"].items()
+                   if k not in ("drafter", "drafter_kind", "drafter_depth")}
+        pc_own = plan_config({"plan": em["plan"],
+                              "inputs": dict(own_inp, mtp_depth=2)})
+        rec_ok = rec_ok and pc_own["spec"] == "draft-mtp" \
+            and pc_own["spec_n_max"] == 2 and "md" not in pc_own
+        pc_dd = plan_config(ed)
+        rec_ok = rec_ok and pc_dd["spec"] == "draft-dflash" \
+            and pc_dd["spec_n_max"] == 8 and pc_dd["md"] == ed["inputs"]["drafter"]
         print("  RECOMM measured wins, spilled never does, every delta named    %s"
               % ("OK" if rec_ok else "FAIL"))
         rec_all = budget_ok and verdict_ok and rec_ok
@@ -12563,6 +12735,12 @@ def build_argv(exe, model_path, c, port, probe=True, host="127.0.0.1"):
             if c.get("spec_n_min"):
                 av += ["--spec-draft-n-min", str(c["spec_n_min"])]
         else:
+            if spec == "draft-mtp" and c.get("md"):
+                # An external MTP draft model: the MTP blocks live in the
+                # drafter, so it must ride the command the way DFlash's does.
+                # Without an md, draft-mtp uses the model's own blocks and no
+                # extra file is passed - the distinction is the md's presence.
+                av += ["-md", c["md"]]
             if c.get("spec_n_max"):
                 av += ["--spec-draft-n-max", str(c["spec_n_max"])]
             if c.get("spec_n_min"):
@@ -13656,6 +13834,37 @@ class Handler(BaseHTTPRequestHandler):
             res = insights(rows)
             res["ok"] = True
             return self._send(200, res)
+        if u.path == "/api/drafters":
+            # The drafter picker: every .gguf next to the model except the model
+            # itself, classified the way the plan will price it. The plan is the
+            # authority - a file's label here only shapes the dropdown, and a
+            # mislabel is refused there, not silently repriced here.
+            from .gguf import parse_meta_only
+            from .model import _as_int
+            q = parse_qs(u.query)
+            path = (q.get("path") or [""])[0]
+            d = os.path.dirname(os.path.abspath(path)) if path else ""
+            found = []
+            if d and os.path.isdir(d):
+                base = os.path.basename(path).lower()
+                for fn in sorted(os.listdir(d)):
+                    if not fn.lower().endswith(".gguf") or fn.lower() == base:
+                        continue
+                    p = os.path.join(d, fn)
+                    try:
+                        meta = parse_meta_only(p)
+                    except (OSError, ValueError):
+                        continue
+                    arch = (meta.get("general.architecture") or "").lower()
+                    if arch == "dflash":
+                        kind = "dflash"
+                    elif any(str(k).endswith(".nextn_predict_layers")
+                             and _as_int(v) > 0 for k, v in meta.items()):
+                        kind = "mtp"
+                    else:
+                        kind = "other"
+                    found.append({"path": p, "name": fn, "kind": kind})
+            return self._send(200, {"ok": True, "dir": d, "drafters": found})
         if u.path == "/api/templates":
             # A browser <input type=file> cannot hand back a real path, so the
             # field is a text box - and typing an absolute Windows path by hand is
@@ -13777,6 +13986,7 @@ class Handler(BaseHTTPRequestHandler):
                 # the request to price it, and its absence leaves the plan on the
                 # model alone (the same default as the MTP checkbox).
                 dflash=(data.get("spec") == "draft-dflash" or bool(data.get("dflash"))),
+                drafter=(data.get("drafter") or None),
                 flash_attn=bool(data.get("flash_attn", False)),
                 vram_budget_mib=float(data.get("vram_budget_mib", 0)),
                 ram_budget_mib=float(data.get("ram_budget_mib", 0)),

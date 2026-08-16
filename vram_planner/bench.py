@@ -1804,6 +1804,119 @@ def load_speed_rows(path=None):
     return rows
 
 
+def campaign_match(row, model=None, gpu=None, file=None, prompt_id=_ANY,
+                   template_id=_ANY):
+    """Is this row part of the named campaign?
+
+    The same five keys sweep_index() groups on, so "delete what that line is
+    showing me" removes exactly the rows behind that line and nothing else.
+
+    prompt_id and template_id use the _ANY sentinel rather than None because ""
+    is a MEANING here and not an absence: a campaign that pinned no template is
+    identified BY its empty template_id, and treating absent-as-any would widen
+    a delete from one campaign to every campaign of that model. Same reasoning
+    as the insights query, and the stakes are higher on this side.
+    """
+    if model is not None and (row.get("model") or "?") != model:
+        return False
+    if gpu is not None and (row.get("gpu") or "") != gpu:
+        return False
+    if file is not None and (row.get("_file") or "") != file:
+        return False
+    if prompt_id is not _ANY and (row.get("prompt_id") or "") != (prompt_id or ""):
+        return False
+    if template_id is not _ANY and (row.get("template_id") or "") != (template_id or ""):
+        return False
+    return True
+
+
+def deleted_dir():
+    return os.path.join(bench_dir(), "deleted")
+
+
+def delete_campaign(model=None, gpu=None, file=None, prompt_id=_ANY,
+                    template_id=_ANY, backup=True):
+    """Remove one campaign's rows from the store. Returns a report dict.
+
+    Three things this is careful about, because hours of GPU time are on the
+    other end of it:
+
+      * It NEVER deletes the file. A .jsonl is one GPU and one llama.cpp build,
+        so it holds every campaign ever measured on that pair - unlinking it to
+        remove one model's rows would take the rest with it.
+      * The removed rows are written to speed/deleted/ first, so the operation
+        is recoverable by moving one file back. A campaign is two hours of
+        measurement; a confirm dialog is not enough protection on its own.
+      * The rewrite is atomic - full file to a temp beside it, then replace -
+        so an interrupted delete cannot leave a half-written store. A truncated
+        JSONL loses far more than the campaign that was being removed.
+
+    Refusing while a campaign is RUNNING is the caller's job: the job appends to
+    these files as it measures, and a rewrite underneath it would drop whatever
+    landed between the read and the replace.
+    """
+    if not file:
+        return {"ok": False, "error": "no campaign file named"}
+    path = os.path.join(bench_dir(), os.path.basename(file))
+    if not os.path.isfile(path):
+        return {"ok": False, "error": "no such campaign file: %s" % file}
+
+    keep, drop = [], []
+    for line in _read_lines(path):
+        try:
+            row = json.loads(line)
+        except ValueError:
+            keep.append(line)          # unparseable, but not ours to discard
+            continue
+        # campaign_match reads _file, which is stamped by load_speed_rows() and
+        # is not in the line itself.
+        row["_file"] = os.path.basename(file)
+        (drop if campaign_match(row, model, gpu, file, prompt_id,
+                                template_id) else keep).append(line)
+
+    if not drop:
+        return {"ok": False, "error": "no rows matched that campaign",
+                "removed": 0, "kept": len(keep)}
+
+    saved = None
+    if backup:
+        try:
+            os.makedirs(deleted_dir(), exist_ok=True)
+            saved = os.path.join(
+                deleted_dir(), "%s.%s.jsonl"
+                % (re.sub(r"\.jsonl$", "", os.path.basename(file)),
+                   time.strftime("%Y%m%d-%H%M%S")))
+            with open(saved, "w", encoding="utf-8", newline="\n") as f:
+                f.write("".join(l if l.endswith("\n") else l + "\n" for l in drop))
+        except OSError as e:
+            # A delete that cannot be undone is a different operation from the
+            # one that was asked for, so it does not happen by accident.
+            return {"ok": False, "error": "could not write the backup, so nothing "
+                                          "was deleted: %s" % e}
+
+    tmp = path + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8", newline="\n") as f:
+            f.write("".join(l if l.endswith("\n") else l + "\n" for l in keep))
+        os.replace(tmp, path)
+    except OSError as e:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        return {"ok": False, "error": "could not rewrite %s: %s" % (file, e)}
+    return {"ok": True, "removed": len(drop), "kept": len(keep),
+            "file": os.path.basename(file), "backup": saved}
+
+
+def _read_lines(path):
+    try:
+        with open(path, encoding="utf-8") as f:
+            return [l for l in f if l.strip()]
+    except OSError:
+        return []
+
+
 # How far a row's floor must fall below its own campaign's before the gap is a
 # demotion rather than allocator noise. The observed collapse was 246 MiB
 # against neighbours that agreed within 12 MiB of each other, so this sits well

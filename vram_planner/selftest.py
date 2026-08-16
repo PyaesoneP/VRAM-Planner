@@ -1902,6 +1902,27 @@ def _run_suite(require_refs, tmp, skipped_real):
                  "config": dict(base_cfg, ngl=41, ncmoe=18, ub=512)}
         quiet = recommend(pr, [agree], sweep_budget_mib=11508)
         rec_ok = rec_ok and quiet["deltas"] == []
+        # ...and silence has to hold for the DEFAULT plan, which is the one
+        # nearly every user sees. The raw budget field is not the number a split
+        # is chosen against - the reserve and the safety margin come off first -
+        # so comparing it against the sweep's effective basis reported a budget
+        # delta on every plan ever made, including this one, where the entire
+        # gap is the reserve the sweep had already taken off.
+        pr_def = {"plan": {"n_gpu_layers": 41, "n_cpu_moe": 18, "fits_fully": False},
+                  "inputs": {"context": 32768, "kv_type": "q8_0", "n_ubatch": 512,
+                             "n_seq": 1, "flash_attn": True,
+                             "vram_budget_mib": 16376, "gpu_reserve_mib": 512,
+                             "safety_pct": 5}}
+        sweep_eff = (16376 - 512) * 0.95          # what web.py hands recommend()
+        parity = recommend(pr_def, [agree], sweep_budget_mib=sweep_eff)
+        rec_ok = rec_ok and parity["deltas"] == []
+        # ...while a basis that really does differ still says so: free-at-page-
+        # load against card-total is the divergence this module was written for.
+        pr_free = {"plan": pr_def["plan"],
+                   "inputs": dict(pr_def["inputs"], vram_budget_mib=11508,
+                                  gpu_reserve_mib=0)}
+        split = recommend(pr_free, [agree], sweep_budget_mib=sweep_eff)
+        rec_ok = rec_ok and {d["kind"] for d in split["deltas"]} == {"budget"}
         # the plan's own config survives the trip into a row's vocabulary
         pc = plan_config(pr)
         rec_ok = rec_ok and pc["ngl"] == 41 and pc["ncmoe"] == 18 and pc["kv"] == "q8_0"

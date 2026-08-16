@@ -85,6 +85,24 @@ def _fmt_mib(v):
     return "-" if v is None else "{:,.0f} MiB".format(float(v))
 
 
+def plan_effective_budget(plan_result):
+    """What the plan actually had to spend, after the reserve and the margin.
+
+    The same arithmetic analyze() does, deliberately restated rather than read
+    back out of `inputs.eff_vram_mib`: that field has the projector, the MTP
+    draft cache and the vision peak already held out of it, and the sweep's
+    basis has none of those subtracted. Comparing the two would report a
+    difference that is a holdout, not a budget.
+    """
+    inp = (plan_result or {}).get("inputs") or {}
+    have = inp.get("vram_budget_mib")
+    if have is None:
+        return None
+    reserve = float(inp.get("gpu_reserve_mib") or 0.0)
+    safety = float(inp.get("safety_pct") or 0.0)
+    return max(0.0, (float(have) - reserve) * (1.0 - safety / 100.0))
+
+
 def _budget_delta(plan_result, sweep_budget_mib):
     """Was the plan priced against a different amount of VRAM than the rows?
 
@@ -92,16 +110,22 @@ def _budget_delta(plan_result, sweep_budget_mib):
     see: the browser prefilled its budget from FREE VRAM at page load with a
     zero reserve, while the sweep seeded its ladder from TOTAL with a 512 MiB
     reserve. Same model, same question, several -ngl rungs apart.
+
+    Both sides are compared AFTER the reserve and the safety margin, because
+    that is the number a split is actually chosen against. Comparing the raw
+    budget field to the sweep's effective one reported a delta on every plan
+    ever made - including the default one, where the two agree exactly and the
+    whole gap was the 512 MiB reserve the sweep had already taken off.
     """
-    inp = (plan_result or {}).get("inputs") or {}
-    have = inp.get("vram_budget_mib")
+    have = plan_effective_budget(plan_result)
     if have is None or not sweep_budget_mib:
         return None
     if abs(float(have) - float(sweep_budget_mib)) <= 64:      # same basis
         return None
     return {"kind": "budget",
-            "text": "The plan was priced against %s of VRAM; the measurements were "
-                    "taken with %s. A budget that differs by that much moves the "
+            "text": "The plan was priced against %s of usable VRAM; the measurements "
+                    "were taken with %s. Both are after the driver reserve and the "
+                    "safety margin. A budget that differs by that much moves the "
                     "split on its own, before any question of speed."
                     % (_fmt_mib(have), _fmt_mib(sweep_budget_mib))}
 

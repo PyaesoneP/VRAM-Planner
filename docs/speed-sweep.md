@@ -58,7 +58,7 @@ so an interrupted sweep resumes where it stopped.
 
 ### …or from the browser
 
-`python -m vram_planner`, analyse a model, then use the **Measure real speed** card. It
+`python -m vram_planner`, analyse a model, then open **step 2 · Measure real speed**. It
 drives the same harness, so everything in this guide still applies — the differences are
 only in the driving:
 
@@ -73,13 +73,17 @@ only in the driving:
 | rounds | `--speed-rounds N` | the **Rounds** field |
 | reading back | `--speed-report` | **Measured results**, the ranked table |
 | findings | `--speed-report --insights` | **Past sweeps**, expandable per campaign |
-| the payoff | copy the flags by hand | **Launch script**, §11 |
+| forgetting a campaign | `--forget-sweep MODEL` | **✕** on a Past sweeps row (§12) |
+| the payoff | copy the flags by hand | **step 3 · Launch script**, §11 |
 
-Two things the browser does that the CLI does not. It refuses to start while anything
+Three things the browser does that the CLI does not. It refuses to start while anything
 else holds the GPU and *names the process*, rather than printing a number you have to
-interpret. And **Stop** finishes the config in flight before ending, so its row is
-complete rather than half-written — which costs up to a couple of minutes and loses
-nothing, because rows are keyed and restarting resumes from there.
+interpret. **Stop** finishes the config in flight before ending, so its row is complete
+rather than half-written — which costs up to a couple of minutes and loses nothing,
+because rows are keyed and restarting resumes from there. And the **recommendation card**
+at the top of the page reconciles whatever this campaign measures against the planner's
+own estimate, naming every reason the two differ — the objective, the VRAM budget each was
+priced against, and the knobs (`ub`, `spec`, projector placement) that no plan can predict.
 
 **Past sweeps needs none of this.** It reads campaigns already on disk, so it is what the
 page shows before you have analysed anything, and every one of its rows can be turned into
@@ -460,6 +464,14 @@ cache displaced start to cost more than speculation saves.
 
 ## 8.1 What the campaign found
 
+![A campaign's findings: what each knob was worth, speed vs context depth, and the speed-vs-VRAM frontier](ui-insights.png)
+
+Read from a real 65-row campaign: speculation was worth **+37.1%**, the expert split
+**+16.6%**, and ubatch **+1.3%** — which is the whole argument for measuring effects
+rather than rankings. The same panel also shows the one config measured at two depths
+falling **24%** from 2k to 120k, and the speed-vs-VRAM frontier where a row 2% slower
+buys back 3 GiB.
+
 A ranking answers "which config won". It does not answer "what did I learn", and the
 second is the one that tells you where the next two hours should go. `--speed-report
 --insights` — and the **Past sweeps** card in the browser — derive four things from rows
@@ -510,8 +522,14 @@ resolve.
 
 ```
 %LOCALAPPDATA%\vram-planner\speed\<gpu>__<build>.jsonl     # rows
+%LOCALAPPDATA%\vram-planner\speed\deleted\                 # rows removed by --forget-sweep (§12)
 %LOCALAPPDATA%\vram-planner\sweep-logs\                    # last load's log, and failures
 ```
+
+One file per **GPU and llama.cpp build**, which is why a single file holds many
+campaigns: a version bump moves these numbers, and merging two builds into one campaign
+would hide that, while merging two models into one file costs nothing. §12 depends on
+this — forgetting a campaign rewrites its file rather than unlinking it.
 
 **Rows go to `speed/`, never `sweeps/`, and that separation is load-bearing.**
 `fit.load_sweep()` globs every `.jsonl` under `sweeps/` and fits anything
@@ -650,3 +668,44 @@ Four things worth knowing:
 **save next to the model** writes it into the model's folder and reports the path, which
 beats a browser download landing in `Downloads/` with a `.ps1` that then trips execution
 policy. **download** and **copy** are there too.
+
+---
+
+## 12. Forgetting a campaign
+
+A campaign is not cheap to make and is not cheap to lose, so removing one is deliberate
+in three places.
+
+```
+python -m vram_planner --forget-sweep Qwen3.6-35B-A3B   # lists what matches, then asks
+python -m vram_planner --forget-sweep Qwen3.6 --yes     # no prompt
+```
+
+In the browser: **✕** on a **Past sweeps** row, which opens a confirmation naming the row
+count, the model, the GPU and build, and the best tok/s in it.
+
+**A campaign is the same five keys `sweep_index()` groups on** — model, GPU, file,
+`prompt_id`, `template_id` — so "delete what that line is showing me" removes exactly the
+rows behind that line. Present-but-empty is a *value* here and not an absence: a campaign
+that pinned no template is identified **by** its empty `template_id`, and treating absent
+as "any" would widen a delete from one campaign to every campaign of that model. Same
+rule the insights query follows (§8.1), and the stakes are higher on this side.
+
+Matching on the CLI is by **substring, case-insensitive**, which is why it prints the
+table before it asks — `--forget-sweep Qwen3.6-35B-A3B-UD-Q6_K` also matches
+`…-UD-Q6_K_XL.gguf`.
+
+Three guarantees, each pinned by the self-test:
+
+| | |
+|---|---|
+| **the file is never unlinked** | it is one GPU and one build and holds every campaign measured on that pair; it is rewritten without the matching rows instead, atomically, and a line the tool cannot parse is left exactly where it was |
+| **rows are moved, not dropped** | they land in `speed/deleted/<name>.<timestamp>.jsonl`, so a delete is undone by moving one file back. If the backup cannot be written, **nothing is deleted** — a delete that cannot be undone is a different operation from the one that was asked for. The stamp is second-granular, so a name already taken gets a `-1` rather than overwriting the copy that is there |
+| **never lands on top of an append** | the job appends to these files as it measures, so a rewrite underneath it would drop whatever landed between the read and the replace. The browser refuses while its own job is running; that check cannot see across processes, so `delete_campaign()` also fingerprints the file before the read and again before the replace and abandons the delete if it moved. That is the guard `--forget-sweep` relies on, since a terminal cannot see a campaign running in a browser |
+
+`speed/deleted/` is not read by anything: `load_speed_rows()` lists `bench_dir()` and
+takes only `*.jsonl` from it, and a subdirectory is not a `.jsonl`. Forgotten rows stay
+forgotten until you move the file back yourself.
+
+Deleting rows can change what the **recommendation card** shows — including back to the
+planner's estimate, if what went was the only trustworthy campaign for that model.

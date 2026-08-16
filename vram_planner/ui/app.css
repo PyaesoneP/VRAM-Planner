@@ -24,9 +24,12 @@
   --mono:ui-monospace,"Cascadia Code","JetBrains Mono",Consolas,"DejaVu Sans Mono",monospace;
   --sans:system-ui,-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
 
-  /* type scale */
-  --t-micro:11px; --t-small:12px; --t-body:14px; --t-lead:15px;
-  --t-head:20px; --t-hero:26px;
+  /* Type scale. --t-micro used to carry .note and .hint, which is most of the
+     words on the page - so the explanations were set smaller than anything they
+     explained and the page read as one grey block. Micro is now reserved for
+     table chrome and labels; prose starts at --t-small. */
+  --t-micro:11px; --t-small:12.5px; --t-body:14px; --t-lead:15px;
+  --t-head:20px; --t-hero:26px; --t-mega:34px;
   /* spacing rhythm */
   --s1:4px; --s2:8px; --s3:12px; --s4:16px; --s5:22px; --s6:32px;
   --radius:11px; --radius-sm:7px;
@@ -129,9 +132,33 @@ button.ghost:hover:not(:disabled){color:var(--ink)}
 }
 .go:hover:not(:disabled){filter:brightness(1.12)}
 
-.field{margin-bottom:13px}
-.field > label{display:block;font-size:var(--t-small);color:var(--muted);margin-bottom:5px}
-.hint{color:var(--dim);font-size:var(--t-micro);margin-top:var(--s1);line-height:1.5}
+.field{margin-bottom:var(--s4)}
+.field > label{
+  display:block;font-size:var(--t-small);color:var(--ink);margin-bottom:5px;font-weight:500;
+}
+/* The unit belongs to the label but is not part of the name, so it recedes.
+   "Context length tokens" read as three words of equal weight before this. */
+.field > label .unit{color:var(--dim);font-weight:400;font-size:var(--t-micro)}
+.hint{color:var(--muted);font-size:var(--t-small);margin-top:6px;line-height:1.55}
+
+/* ---------- the "why" disclosure ----------
+   Every field on this page had a three-to-six line paragraph under it. The
+   prose is good and none of it is deleted - it moved in here. What changes is
+   the default state: the page now answers first and explains on request,
+   instead of explaining at length beside an answer set in smaller type. */
+details.why{display:inline}
+details.why > summary{
+  display:inline;list-style:none;cursor:pointer;color:var(--wt);
+  border-bottom:1px dotted currentColor;
+}
+details.why > summary::-webkit-details-marker{display:none}
+details.why > summary::after{content:" \25B8";border:0}
+details.why[open] > summary::after{content:" \25BE"}
+details.why[open]{
+  display:block;margin-top:var(--s2);padding:var(--s2) var(--s3);
+  border-left:2px solid var(--line2);background:var(--panel2);border-radius:0 var(--radius-sm) var(--radius-sm) 0;
+}
+details.why[open] > summary{display:block;margin-bottom:6px;border:0;color:var(--muted)}
 input[type=text],input[type=number],select{
   width:100%;background:var(--panel2);border:1px solid var(--line);color:var(--ink);
   border-radius:var(--radius-sm);padding:8px 10px;font-family:var(--mono);font-size:13px;
@@ -160,35 +187,133 @@ details.adv > summary::-webkit-details-marker{display:none}
 details.adv > summary::before{content:"\25B8 ";display:inline-block;transition:transform .15s}
 details.adv[open] > summary::before{transform:rotate(90deg)}
 
+/* ---------- the three form tiers ----------
+   Everything needed for an answer is visible; the other twenty-six controls sit
+   behind these two. A page that asks thirty questions before it answers one is
+   a form, not a tool. */
+.tier2{
+  margin:var(--s5) calc(-1 * var(--s5)) 0;padding:0 var(--s5);
+  border-top:1px solid var(--line);
+}
+.tier2 > summary{
+  display:flex;align-items:baseline;gap:var(--s2);cursor:pointer;list-style:none;
+  padding:var(--s4) 0;color:var(--muted);
+}
+.tier2 > summary::-webkit-details-marker{display:none}
+.tier2 > summary > b{font-size:var(--t-body);color:var(--ink);font-weight:600}
+.tier2 > summary > i{font-style:normal;font-size:var(--t-small);color:var(--dim)}
+.tier2 > summary::after{content:"\25B8";margin-left:auto;color:var(--dim);transition:transform .15s}
+.tier2[open] > summary::after{transform:rotate(90deg)}
+/* A tier holding a decision this model actually has to make says so, rather
+   than springing open and undoing whatever the user had already set. */
+.tier2 > summary > i.flagged{color:var(--kv)}
+.tier2[open]{padding-bottom:var(--s4)}
+.tier2 > summary:hover > b{color:var(--wt)}
+
 /* ---------- layout ---------- */
-.grid{display:grid;grid-template-columns:340px minmax(0,1fr);gap:18px;align-items:start}
+.grid{display:grid;grid-template-columns:352px minmax(0,1fr);gap:var(--s5);align-items:start}
 @media(max-width:900px){.grid{grid-template-columns:1fr}}
 .card{
   background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);
-  padding:var(--s4);box-shadow:var(--shadow);
+  padding:var(--s5);box-shadow:var(--shadow);
 }
 .card + .card{margin-top:0}
 .card > h2{
   font-family:var(--mono);font-size:var(--t-small);letter-spacing:.1em;color:var(--muted);
-  text-transform:uppercase;margin:0 0 var(--s3);font-weight:600;
+  text-transform:uppercase;margin:0 0 var(--s4);font-weight:600;
+  padding-bottom:var(--s2);border-bottom:1px solid var(--line);
 }
-.results{display:flex;flex-direction:column;gap:var(--s4);min-width:0}
+/* Deliberately NOT sticky: with Expert open this column is taller than the
+   viewport, and a sticky box taller than its viewport puts its own bottom out
+   of reach. */
+.results{display:flex;flex-direction:column;gap:var(--s5);min-width:0}
 .placeholder{
   color:var(--dim);font-size:13px;text-align:center;padding:40px 10px;
   font-family:var(--mono);letter-spacing:.05em;
 }
 
-/* The plan card carries the answer, so it gets the accent rail and the only
-   hero-sized type on the page. */
 .card.lead{border-color:var(--line2)}
-.verdict{border-left:3px solid var(--rsv);padding-left:var(--s3)}
+.verdict{border-left:3px solid var(--rsv);padding-left:var(--s4)}
 .verdict.ok{border-color:var(--ok)}
 .verdict.warn{border-color:var(--warn)}
 .verdict.bad{border-color:var(--bad)}
-.verdict .h{font-size:var(--t-lead);font-weight:600}
-.verdict.ok .h{color:var(--ok)}
-.verdict.warn .h{color:var(--warn)}
-.verdict.bad .h{color:var(--bad)}
+/* The state, not the sentence, is what gets read first. It used to be a bare
+   line of Python prose - "Split: 29 of 50 layers on GPU, 21 on CPU." - which is
+   the right sentence and the wrong headline. */
+.verdict .vword{
+  font-family:var(--mono);font-size:var(--t-hero);font-weight:600;
+  letter-spacing:.02em;line-height:1.1;margin:0 0 var(--s1);
+}
+.verdict.ok .vword{color:var(--ok)}
+.verdict.warn .vword{color:var(--warn)}
+.verdict.bad .vword{color:var(--bad)}
+.verdict .h{font-size:var(--t-body);color:var(--ink);margin:0}
+
+/* ---------- the recommendation ----------
+   The one thing the page is for. It sits above the steps because it is the
+   answer all three of them work towards, and because its two possible sources -
+   the planner's arithmetic and the fastest measured row - used to be three
+   clicks apart with nothing anywhere admitting they disagreed. */
+/* The slot is filled asynchronously and can legitimately stay empty; without
+   this it still spends a flex gap looking like a missing card. */
+#rec:empty{display:none}
+.card.rec{border-color:var(--line2);border-top:2px solid var(--line2)}
+.card.rec.is-measured{border-top-color:var(--ok)}
+.rec-head{display:flex;align-items:center;justify-content:space-between;gap:var(--s3)}
+.rec-head > h2{border:0;margin:0;padding:0}
+.pill{
+  font-family:var(--mono);font-size:var(--t-micro);letter-spacing:.08em;
+  padding:3px 10px;border-radius:999px;border:1px solid var(--line2);color:var(--muted);
+}
+.pill.ok{border-color:var(--ok);color:var(--ok)}
+.rec-cfg{
+  font-size:var(--t-hero);font-weight:600;color:var(--ink);
+  margin:var(--s3) 0 var(--s2);line-height:1.2;overflow-wrap:anywhere;
+}
+.rec-figs{display:flex;align-items:baseline;flex-wrap:wrap;gap:var(--s2);margin:0}
+.rec-big{font-family:var(--mono);font-size:var(--t-mega);font-weight:600;color:var(--ok);line-height:1}
+.rec-big.warn{color:var(--warn)}
+.rec-num{font-family:var(--mono);font-size:var(--t-head);color:var(--ink)}
+.rec-unit{font-size:var(--t-small);color:var(--muted)}
+.rec-sep{width:1px;align-self:stretch;background:var(--line);margin:0 var(--s3)}
+.rec-cond{font-size:var(--t-small);color:var(--muted);margin:var(--s2) 0 0}
+.rec-alt{border-top:1px dashed var(--line);padding-top:var(--s3)}
+
+.deltas{
+  margin-top:var(--s4);padding:var(--s3) var(--s4);
+  background:var(--panel2);border:1px solid var(--line);border-radius:var(--radius-sm);
+}
+.deltas > .sublabel{margin-bottom:var(--s3)}
+.delta{
+  display:grid;grid-template-columns:8.5em minmax(0,1fr);gap:var(--s3);
+  padding:6px 0;font-size:var(--t-small);color:var(--muted);line-height:1.55;
+}
+.delta + .delta{border-top:1px dashed var(--line)}
+.delta .dk{
+  font-family:var(--mono);font-size:var(--t-micro);letter-spacing:.06em;
+  color:var(--warn);text-transform:uppercase;padding-top:2px;
+}
+@media(max-width:600px){.delta{grid-template-columns:1fr;gap:2px}}
+
+/* ---------- glossary ----------
+   Six abbreviations head every row table here and none of them was defined
+   anywhere on the page. */
+.glossary{padding:var(--s3) var(--s4)}
+.glossary > summary{
+  cursor:pointer;list-style:none;font-size:var(--t-small);color:var(--muted);
+}
+.glossary > summary::-webkit-details-marker{display:none}
+.glossary > summary::before{content:"\25B8 ";display:inline-block;transition:transform .15s}
+.glossary[open] > summary::before{transform:rotate(90deg)}
+.glossary dl{
+  display:grid;grid-template-columns:6em minmax(0,1fr);gap:var(--s2) var(--s4);
+  margin:var(--s4) 0 var(--s2);font-size:var(--t-small);
+}
+.glossary dt{color:var(--kv)}
+.glossary dd{margin:0;color:var(--muted);line-height:1.55}
+.glossary dd b{color:var(--ink);font-weight:600}
+@media(max-width:600px){.glossary dl{grid-template-columns:1fr;gap:2px var(--s2)}
+  .glossary dd{margin-bottom:var(--s2)}}
 
 .badge{
   display:inline-block;font-family:var(--mono);font-size:var(--t-micro);
@@ -259,7 +384,7 @@ tr.cur td{color:var(--kv)}
 .muted{color:var(--muted)}
 .small{font-size:var(--t-small)}
 .mono{font-family:var(--mono)}
-.note{color:var(--dim);font-size:var(--t-micro);margin-top:var(--s2);line-height:1.5}
+.note{color:var(--muted);font-size:var(--t-small);margin-top:var(--s3);line-height:1.55}
 .note b{color:var(--ink)}
 .hero{font-size:var(--t-hero);font-weight:600}
 .hero.ok{color:var(--kv)}
@@ -380,8 +505,8 @@ tr.cur td{color:var(--kv)}
 /* Everything the planner derives, behind one disclosure: reference material,
    not a next action. The cards inside it lose their own frames so it reads as
    one thing rather than five. */
-.derived > .card{border:0;padding:0;margin-top:var(--s4);background:none}
-.derived > .card > h2{font-size:var(--t-body)}
+.derived > .card{border:0;padding:0;margin-top:var(--s6);background:none}
+.derived > .card > h2{font-size:var(--t-body);border-bottom-color:var(--line)}
 
 /* -- past sweeps ---------------------------------------------------------- */
 .camps{display:flex;flex-direction:column;gap:6px;margin-bottom:var(--s4)}
@@ -394,6 +519,28 @@ tr.cur td{color:var(--kv)}
 }
 .camprow:hover{background:var(--sunk)}
 .camprow > .mono{flex:1 1 16em;min-width:0;overflow-wrap:anywhere}
+/* The delete sits BESIDE the open button, not inside it - nesting a button in a
+   button is invalid, and here it would also mean every attempt to open a
+   campaign risked deleting it. */
+.camphead{display:flex;align-items:stretch}
+.camphead > .camprow{flex:1 1 auto;min-width:0}
+.campdel{
+  flex:0 0 auto;border:0;background:none;color:var(--dim);
+  padding:0 12px;font-size:var(--t-body);border-radius:0 8px 8px 0;
+}
+.campdel:hover{color:var(--bad);background:var(--sunk)}
+button.ghost.danger{border:1px solid var(--bad);color:var(--bad)}
+button.ghost.danger:hover:not(:disabled){background:var(--bad);color:var(--bg)}
+.campconfirm{
+  padding:var(--s3) var(--s4);border-top:1px solid var(--bad);
+  background:var(--panel2);
+}
+.campconfirm > p:first-child{margin:0;font-size:var(--t-small)}
+.campconfirm .actions{margin-top:var(--s3)}
+.delnote{
+  padding:var(--s2) var(--s3);border-left:2px solid var(--kv);
+  background:var(--panel2);margin-bottom:var(--s3);
+}
 .campnum{font-size:var(--t-small);color:var(--muted);white-space:nowrap}
 .campbest{font-family:var(--mono);color:var(--kv);white-space:nowrap}
 .campcaret{color:var(--dim);width:1em;text-align:center}

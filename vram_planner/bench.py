@@ -653,6 +653,15 @@ SPEED_BASE = {"ctx": 131072, "kv": "q8_0", "fa": True, "seq": 1, "ub": 512,
 NGL_BELOW, NGL_ABOVE = 2, 6
 
 
+# The basis every campaign is planned against, named once so the browser can be
+# handed the same three numbers instead of picking its own. analyze() takes the
+# budget and the reserve separately and subtracts one from the other, so the
+# helper is asked for a raw total here and the reserve is passed on below.
+PLAN_BASIS = "total"
+PLAN_RESERVE_MIB = 512
+PLAN_SAFETY_PCT = 5
+
+
 def planner_split(model_path, c):
     """Where the planner thinks the split falls, for seeding the ladder.
 
@@ -662,21 +671,20 @@ def planner_split(model_path, c):
     Imported here rather than at module scope only to keep the cost off the path
     of callers that never build a grid; plan sits above bench in the DAG, so the
     direction is fine."""
-    from .plan import analyze                      # plan is above bench in the DAG
+    from .plan import analyze, default_vram_budget  # plan is above bench in the DAG
     from .gpu import get_gpus, get_ram
     try:
         g = (get_gpus() or [{}])[0]
         ram = get_ram() or {}
-        # TOTAL, not free. The grid is built now and run later, and preflight()
-        # refuses to run it unless the card is essentially empty - so free VRAM at
-        # build time is transient state that has nothing to do with the conditions
-        # the rows will be measured under. Seeding off it produces a garbage ladder
-        # whenever anything happens to be loaded, which is exactly when someone is
-        # most likely to be planning their next sweep.
+        # TOTAL, not free - and via the shared helper, because the browser used to
+        # answer this same question its own way (free VRAM, 0 reserve) and so
+        # planned a different config than the one the ladder was centred on. See
+        # default_vram_budget() for why total is the right basis here.
         r = analyze(model_path, int(c["ctx"]), c["kv"], int(c["ub"]), bool(c["fa"]),
-                    vram_budget_mib=float(g.get("total_mib") or 0),
+                    vram_budget_mib=default_vram_budget(g, PLAN_BASIS, 0),
                     ram_budget_mib=float(ram.get("total_mib") or 0),
-                    gpu_reserve_mib=512, compute_override_mib=None, safety_pct=5,
+                    gpu_reserve_mib=PLAN_RESERVE_MIB,
+                    compute_override_mib=None, safety_pct=PLAN_SAFETY_PCT,
                     n_seq=int(c.get("seq") or 1),
                     include_mmproj=(c.get("mmproj_offload") is not False),
                     mtp_spec=bool(c.get("spec") == "draft-mtp"))
@@ -1794,6 +1802,171 @@ def load_speed_rows(path=None):
             rows.append(r)
     _infer_demotion(rows)
     return rows
+
+
+def campaign_match(row, model=None, gpu=None, file=None, prompt_id=_ANY,
+                   template_id=_ANY):
+    """Is this row part of the named campaign?
+
+    The same five keys sweep_index() groups on, so "delete what that line is
+    showing me" removes exactly the rows behind that line and nothing else.
+
+    prompt_id and template_id use the _ANY sentinel rather than None because ""
+    is a MEANING here and not an absence: a campaign that pinned no template is
+    identified BY its empty template_id, and treating absent-as-any would widen
+    a delete from one campaign to every campaign of that model. Same reasoning
+    as the insights query, and the stakes are higher on this side.
+    """
+    if model is not None and (row.get("model") or "?") != model:
+        return False
+    if gpu is not None and (row.get("gpu") or "") != gpu:
+        return False
+    if file is not None and (row.get("_file") or "") != file:
+        return False
+    if prompt_id is not _ANY and (row.get("prompt_id") or "") != (prompt_id or ""):
+        return False
+    if template_id is not _ANY and (row.get("template_id") or "") != (template_id or ""):
+        return False
+    return True
+
+
+def deleted_dir():
+    return os.path.join(bench_dir(), "deleted")
+
+
+def delete_campaign(model=None, gpu=None, file=None, prompt_id=_ANY,
+                    template_id=_ANY, backup=True):
+    """Remove one campaign's rows from the store. Returns a report dict.
+
+    Three things this is careful about, because hours of GPU time are on the
+    other end of it:
+
+      * It NEVER deletes the file. A .jsonl is one GPU and one llama.cpp build,
+        so it holds every campaign ever measured on that pair - unlinking it to
+        remove one model's rows would take the rest with it.
+      * The removed rows are written to speed/deleted/ first, so the operation
+        is recoverable by moving one file back. A campaign is two hours of
+        measurement; a confirm dialog is not enough protection on its own.
+      * The rewrite is atomic - full file to a temp beside it, then replace -
+        so an interrupted delete cannot leave a half-written store. A truncated
+        JSONL loses far more than the campaign that was being removed.
+
+    A caller that can see a running job should refuse before reaching here (the
+    web server does, against its own JOB). But it can only see ITS OWN process:
+    a --forget-sweep in a terminal knows nothing about a campaign appending from
+    a browser, and neither knows about the other. So the last word is here - the
+    file is fingerprinted before it is read and again before it is replaced, and
+    a delete that would land on top of an append is abandoned instead. That
+    covers every writer, including the ones no guard could have known about.
+    """
+    if not file:
+        return {"ok": False, "error": "no campaign file named"}
+    path = os.path.join(bench_dir(), os.path.basename(file))
+    if not os.path.isfile(path):
+        return {"ok": False, "error": "no such campaign file: %s" % file}
+    before = _fingerprint(path)
+
+    keep, drop = [], []
+    for line in _read_lines(path):
+        try:
+            row = json.loads(line)
+        except ValueError:
+            keep.append(line)          # unparseable, but not ours to discard
+            continue
+        # campaign_match reads _file, which is stamped by load_speed_rows() and
+        # is not in the line itself.
+        row["_file"] = os.path.basename(file)
+        (drop if campaign_match(row, model, gpu, file, prompt_id,
+                                template_id) else keep).append(line)
+
+    if not drop:
+        return {"ok": False, "error": "no rows matched that campaign",
+                "removed": 0, "kept": len(keep)}
+
+    saved = None
+    if backup:
+        body = "".join(l if l.endswith("\n") else l + "\n" for l in drop)
+        stem = re.sub(r"\.jsonl$", "", os.path.basename(file))
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        try:
+            os.makedirs(deleted_dir(), exist_ok=True)
+            # The stamp is only second-granular, and one file holds many
+            # campaigns - forgetting two of them in the same second put the
+            # second backup on top of the first and took an hour of measurement
+            # with it. Opened "x" rather than checked-then-written, so the name
+            # is claimed by the same call that finds it free.
+            for n in range(200):
+                saved = os.path.join(deleted_dir(), "%s.%s%s.jsonl"
+                                     % (stem, stamp, "" if not n else "-%d" % n))
+                try:
+                    f = open(saved, "x", encoding="utf-8", newline="\n")
+                except FileExistsError:
+                    continue
+                with f:
+                    f.write(body)
+                break
+            else:
+                raise OSError("200 backups already stamped %s" % stamp)
+        except OSError as e:
+            # A delete that cannot be undone is a different operation from the
+            # one that was asked for, so it does not happen by accident.
+            return {"ok": False, "error": "could not write the backup, so nothing "
+                                          "was deleted: %s" % e}
+
+    # Last look before the file is replaced. Anything that landed since the read
+    # is a row this rewrite does not contain, so replacing now would delete a
+    # measurement nobody asked to forget.
+    if _fingerprint(path) != before:
+        _unlink(saved)
+        return {"ok": False, "error": "%s changed while it was being read - a "
+                                      "campaign is probably still measuring into "
+                                      "it. Nothing was deleted; stop the campaign "
+                                      "and try again." % os.path.basename(file)}
+
+    tmp = path + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8", newline="\n") as f:
+            f.write("".join(l if l.endswith("\n") else l + "\n" for l in keep))
+        os.replace(tmp, path)
+    except OSError as e:
+        _unlink(tmp)
+        _unlink(saved)
+        return {"ok": False, "error": "could not rewrite %s: %s" % (file, e)}
+    return {"ok": True, "removed": len(drop), "kept": len(keep),
+            "file": os.path.basename(file), "backup": saved}
+
+
+def _read_lines(path):
+    try:
+        with open(path, encoding="utf-8") as f:
+            return [l for l in f if l.strip()]
+    except OSError:
+        return []
+
+
+def _fingerprint(path):
+    """Enough of a file's identity to notice an append under a rewrite.
+
+    Size alone catches every append a campaign makes; mtime catches an in-place
+    edit that happened to keep the length. A missing file fingerprints as None,
+    which compares unequal to any real reading - the right answer, since a file
+    that vanished mid-delete is also not one to replace.
+    """
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    return (st.st_size, st.st_mtime_ns)
+
+
+def _unlink(path):
+    """Remove a file we wrote ourselves, if it is still there."""
+    if not path:
+        return
+    try:
+        os.remove(path)
+    except OSError:
+        pass
 
 
 # How far a row's floor must fall below its own campaign's before the gap is a

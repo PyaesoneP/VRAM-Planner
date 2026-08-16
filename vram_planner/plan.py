@@ -11,6 +11,103 @@ from .calib import calibration_status
 from .cards import load_card, remember_card
 
 
+def default_vram_budget(gpu, basis="total", reserve_mib=512):
+    """The VRAM a plan should be built against. One rule, two callers.
+
+    This function exists because there used to be two rules. The browser
+    prefilled its budget from free VRAM at page load and sent a 0 reserve; the
+    speed sweep seeded its stage-A ladder from TOTAL VRAM with a 512 MiB
+    reserve. Both are defensible and running both is not: on a 16 GiB card with
+    11.5 GiB free they differ by several -ngl rungs, so the planner and the
+    sweep recommended different configs for no reason either of them stated.
+
+    `basis="total"` is the default and is what the sweep measures under.
+    preflight() refuses to run a campaign unless the card is essentially empty,
+    so free VRAM at planning time is transient state that the rows will never
+    be measured under - seeding off it produces a garbage ladder exactly when
+    something happens to be loaded, which is when someone is most likely to be
+    planning.
+
+    `basis="free"` answers the different question - "will this load right now,
+    next to what I already have open" - and is the user's to choose. It is a
+    real question; it is just not the one a campaign answers.
+
+    Returns MiB, never negative.
+    """
+    gpu = gpu or {}
+    total = float(gpu.get("total_mib") or 0)
+    free = float(gpu.get("free_mib") or 0)
+    have = free if basis == "free" else total
+    return max(0.0, have - max(0.0, float(reserve_mib or 0)))
+
+
+# How close to the budget counts as "tight" rather than simply fitting. The
+# compute buffer is the one estimated term, and its held-out error is 22.5%
+# mean on the buffer alone - so a plan landing inside the last few percent of
+# the budget is inside the estimate's own error bar and should not be reported
+# with the same confidence as one with room to spare.
+VERDICT_TIGHT_FRAC = 0.97
+
+
+def _verdict(plan, inputs=None, ram_free_mib=None):
+    """The plan's answer as a state and a word, rather than as prose.
+
+    `headline` stays what it is - the sentence, and what the CLI prints. This
+    is the part the UI leads with, and it is derived here so the browser cannot
+    invent its own reading of the same fields. It used to: the step tab read
+    r.verdict.fits and r.totals.vram_mib, neither of which this module has ever
+    returned, so the tab said "fits" for every plan including the ones that did
+    not.
+
+    Two bases are in play and they differ by the reserve and the safety margin:
+
+      * the EFFECTIVE one the split was searched against - usage excluding the
+        driver reserve, budget already reduced by it - which is the pair that
+        must be compared to decide whether the plan fits;
+      * the RAW one the memory bar draws and the user checks against Task
+        Manager, which counts the reserve as occupied and the budget as typed.
+
+    The decision is made on the first and reported on the second, because a tab
+    reading 10.25 GiB beside a bar reading 11,013 MiB is two answers to one
+    question.
+    """
+    inputs = inputs or {}
+    used = float(plan.get("vram_used_mib") or 0.0)
+    budget = float(plan.get("vram_budget_mib") or 0.0)
+    reserve = float(inputs.get("gpu_reserve_mib") or 0.0)
+    raw_budget = float(inputs.get("vram_budget_mib") or 0.0) or budget
+    ram = float(plan.get("ram_used_mib") or 0.0)
+    if plan.get("attention_overflow") or plan.get("kv_overflow"):
+        state, word = "no_fit", "DOES NOT FIT"
+    elif budget and used > budget:
+        # It loads - WDDM spills into shared system memory rather than failing -
+        # and that is the worst outcome here, not the safest: the numbers still
+        # look like numbers while the speed is off a cliff.
+        state, word = "spills", "SPILLS TO SHARED MEMORY"
+    elif plan.get("ram_ok") is False:
+        state, word = "no_fit", "DOES NOT FIT IN RAM"
+    elif budget and used > budget * VERDICT_TIGHT_FRAC:
+        state, word = "tight", "FITS, BARELY"
+    else:
+        state, word = "fits", "FITS"
+    return {
+        "state": state, "word": word,
+        # Reported on the raw basis, so this agrees with the memory bar.
+        "vram_mib": used + reserve, "vram_budget_mib": raw_budget,
+        # ...and the pair the decision was actually made on, for anyone who
+        # needs to reproduce it.
+        "vram_used_eff_mib": used, "vram_budget_eff_mib": budget,
+        "gpu_reserve_mib": reserve,
+        "ram_mib": ram,
+        "ram_budget_mib": plan.get("ram_budget_mib"),
+        "ram_free_mib": ram_free_mib,
+        # The two knobs a launcher needs, normalised across the three planners
+        # so a caller does not have to know which one produced this plan.
+        "ngl": plan.get("n_gpu_layers"),
+        "ncmoe": plan.get("n_cpu_moe") or 0,
+    }
+
+
 def find_mmproj(model_path):
     """A multimodal model ships a separate vision/audio projector next to the
     weights (mmproj-*.gguf). LM Studio loads it with the model and puts it on the
@@ -379,6 +476,10 @@ def analyze(path, ctx, kv_type, n_ubatch, flash_attn,
         plan["vram_used_mib"] = plan.get("vram_used_mib", 0.0) + held_out
         if plan.get("vram_budget_mib") is not None:
             plan["vram_budget_mib"] = plan["vram_budget_mib"] + held_out
+    # Recorded on the plan so the verdict and the UI read one budget rather than
+    # each reaching for a different field.
+    plan["ram_budget_mib"] = ram_budget_mib
+    plan["verdict"] = _verdict(plan, result["inputs"], ram_free_mib)
     result["plan"] = plan
 
     # ---- speed roofline ----------------------------------------------------

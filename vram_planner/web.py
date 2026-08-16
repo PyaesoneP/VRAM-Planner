@@ -314,6 +314,80 @@ class Handler(BaseHTTPRequestHandler):
                 res["error"] = "could not write %s: %s" % (dest, e)
         return {"ok": False, "error": res.get("error") or "could not write the script"}
 
+    def _budget_block(self, gpus):
+        """Both VRAM bases and the one the sweep uses, computed server-side.
+
+        The browser used to derive its own budget - free VRAM, zero reserve -
+        while the sweep seeded its ladder from total minus 512. Nothing was
+        wrong with either number; having two of them was the problem, and the
+        fix is that only one place computes them now.
+        """
+        from .bench import PLAN_BASIS, PLAN_RESERVE_MIB, PLAN_SAFETY_PCT
+        from .plan import default_vram_budget
+        g = (gpus or [{}])[0] or {}
+        return {"total": g.get("total_mib"), "free": g.get("free_mib"),
+                "basis": PLAN_BASIS, "reserve": PLAN_RESERVE_MIB,
+                "safety_pct": PLAN_SAFETY_PCT,
+                "default": default_vram_budget(g, PLAN_BASIS, 0),
+                "on_total": default_vram_budget(g, "total", 0),
+                "on_free": default_vram_budget(g, "free", 0)}
+
+    def _speed_delete(self, data):
+        """Forget one campaign's rows.
+
+        Refused outright while a campaign is running: the job appends to these
+        files as it measures, so a rewrite underneath it would silently drop
+        whatever landed between the read and the replace. Waiting is cheap;
+        losing rows measured minutes ago is not.
+        """
+        from .bench import delete_campaign, _ANY
+        from .job import JOB
+        st = JOB.snapshot(since=0) or {}
+        if st.get("status") == "running":
+            return {"ok": False, "error": "A campaign is running and is writing to "
+                                          "these files. Stop it first, then delete."}
+        if not data.get("confirm"):
+            # The browser asks twice. The API refuses to act on a request that
+            # never passed through that, so a stray POST cannot delete two hours
+            # of measurement.
+            return {"ok": False, "error": "delete not confirmed"}
+        # Present-but-empty is a value, absent is "any" - the same rule the
+        # insights query follows, and the reason the sentinel travels this far.
+        pid = data["pid"] if "pid" in data else _ANY
+        tid = data["tid"] if "tid" in data else _ANY
+        return delete_campaign(model=data.get("model"), gpu=data.get("gpu"),
+                               file=data.get("file"), prompt_id=pid,
+                               template_id=tid)
+
+    def _recommend(self, data):
+        """One config to run, reconciled against whatever has been measured.
+
+        The plan arrives from the caller rather than being recomputed, so this
+        answers about the plan actually on screen - including one built with an
+        -ngl override, where recomputing would quietly answer about a different
+        config.
+        """
+        from .bench import load_speed_rows
+        from .recommend import recommend
+        plan_result = data.get("plan") or {}
+        if not plan_result.get("plan"):
+            return {"ok": False, "error": "no plan to reconcile"}
+        name = data.get("model") or ""
+        rows = load_speed_rows()
+        if name:
+            rows = [r for r in rows if r.get("model") == name]
+        gpus = get_gpus()
+        budget = self._budget_block(gpus)
+        # What the rows were measured under: the sweep's own basis, after the
+        # reserve and the safety margin analyze() would have applied to it.
+        sweep_budget = ((budget["default"] or 0) - budget["reserve"]) \
+            * (1.0 - budget["safety_pct"] / 100.0)
+        out = recommend(plan_result, rows, sweep_budget_mib=sweep_budget,
+                        strict=bool(data.get("strict", True)))
+        out["ok"] = True
+        out["sweep_budget_mib"] = sweep_budget
+        return out
+
     def _send(self, code, body, ctype="application/json"):
         if isinstance(body, (dict, list)):
             body = json.dumps(body).encode("utf-8")
@@ -447,7 +521,9 @@ class Handler(BaseHTTPRequestHandler):
         if u.path == "/api/system":
             fresh = parse_qs(u.query).get("fresh", ["0"])[0] == "1"
             from .launch import LOAD_MODES, SHELLS, default_shell
-            return self._send(200, {"gpus": get_gpus(fresh=fresh), "ram": get_ram(),
+            gpus = get_gpus(fresh=fresh)
+            return self._send(200, {"gpus": gpus, "ram": get_ram(),
+                                    "vram_budget": self._budget_block(gpus),
                                     "default_dir": default_models_dir(),
                                     "version": __version__,
                                     "platform": platform_support(),
@@ -479,7 +555,8 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         u = urlparse(self.path)
         POSTS = ("/api/analyze", "/api/calibrate", "/api/script", "/api/script/save",
-                 "/api/speed/plan", "/api/speed/start", "/api/speed/stop")
+                 "/api/speed/plan", "/api/speed/start", "/api/speed/stop",
+                 "/api/speed/delete", "/api/recommend")
         if u.path not in POSTS:
             return self._send(404, {"error": "not found"})
         try:
@@ -493,6 +570,10 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, self._script(data))
         if u.path == "/api/script/save":
             return self._send(200, self._script_save(data))
+        if u.path == "/api/speed/delete":
+            return self._send(200, self._speed_delete(data))
+        if u.path == "/api/recommend":
+            return self._send(200, self._recommend(data))
         if u.path == "/api/speed/plan":
             return self._send(200, self._speed_plan(data))
         if u.path == "/api/speed/start":

@@ -11,6 +11,11 @@ speed_history.json
 # scratch
 *.png
 *.pdf
+# ...except the documentation screenshots, which are captured from the running
+# app by driving headless Chrome over the DevTools protocol and are meant to be
+# committed. Regenerate them after any UI change - a screenshot that no longer
+# matches the tool is worse than none.
+!docs/*.png
 
 # Demo recordings. These are uploaded to GitHub (release or issue attachment)
 # and linked from the README, never committed - git keeps every binary blob in

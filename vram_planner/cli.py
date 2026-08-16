@@ -6,6 +6,62 @@ from .web import serve
 from .selftest import self_test
 
 
+def _forget_sweeps(names, assume_yes=False):
+    """Forget recorded speed campaigns for the named models.
+
+    Prints what matches BEFORE removing anything, because a campaign is the two
+    hours of GPU time that produced it and a model name is an easy thing to
+    mistype. A name matches a campaign whose model contains it, case-insensitive
+    - the full file name is long and the point is not to make you type it - so
+    the listing is what confirms which campaigns were actually meant.
+
+    This runs in its own process and cannot see a campaign running in a browser,
+    so it does not try to: delete_campaign() fingerprints the file and abandons
+    a delete that would land on top of an append, which is the guard that holds
+    across processes rather than only within one.
+    """
+    from .bench import delete_campaign, load_speed_rows, sweep_index
+    groups = sweep_index(load_speed_rows())
+    wanted = [g for g in groups
+              if any(n.lower() in (g["model"] or "").lower() for n in names)]
+    if not wanted:
+        print("no recorded campaign matches: %s" % ", ".join(names))
+        return 1
+    print("\n%-42s %-22s %6s %10s  %s"
+          % ("model", "gpu", "rows", "best tok/s", "recorded"))
+    for g in wanted:
+        print("%-42s %-22s %6d %10s  %s"
+              % (g["model"][:42], (g["gpu"] or "?")[:22], g["n_rows"],
+                 ("%.2f" % g["best_tok_s"]) if g["best_tok_s"] else "-",
+                 datetime.datetime.fromtimestamp(g["last"]).strftime("%Y-%m-%d")
+                 if g["last"] else "?"))
+    total = sum(g["n_rows"] for g in wanted)
+    print("\n%d campaign(s), %d row(s). They move to speed/deleted/, not to nothing."
+          % (len(wanted), total))
+    if not assume_yes:
+        try:
+            if input("Forget them? [y/N] ").strip().lower() not in ("y", "yes"):
+                print("nothing deleted")
+                return 1
+        except EOFError:
+            # No terminal to ask at. Refusing is the only safe reading of that.
+            print("nothing deleted - no terminal to confirm at; pass --yes to skip "
+                  "the prompt")
+            return 1
+    rc = 0
+    for g in wanted:
+        r = delete_campaign(model=g["model"], gpu=g["gpu"], file=g["file"],
+                            prompt_id=g["prompt_id"] or "",
+                            template_id=g["template_id"] or "")
+        if r.get("ok"):
+            print("forgot %d row(s) from %s -> %s"
+                  % (r["removed"], r["file"], r.get("backup") or "(no backup)"))
+        else:
+            print("failed on %s: %s" % (g["model"], r.get("error")))
+            rc = 1
+    return rc
+
+
 def main():
     ap = argparse.ArgumentParser(description="Plan GGUF model fit on GPU/RAM.")
     ap.add_argument("--version", action="version", version="vram-planner %s" % __version__)
@@ -121,7 +177,15 @@ def main():
                          "after the weights are deleted")
     ap.add_argument("--forget-card", nargs="+", metavar="NAME",
                     help="delete stored model cards by file name")
+    ap.add_argument("--forget-sweep", nargs="+", metavar="MODEL",
+                    help="forget recorded speed campaigns for these models. Lists "
+                         "what matches and asks before removing anything; the rows "
+                         "are moved to speed/deleted/ rather than dropped")
+    ap.add_argument("--yes", action="store_true",
+                    help="with --forget-sweep: skip the confirmation prompt")
     args = ap.parse_args()
+    if args.forget_sweep:
+        sys.exit(_forget_sweeps(args.forget_sweep, args.yes))
     if args.add_card or args.forget_card or args.cards:
         from .cards import forget_card, list_cards, remember_card
         for p in (args.add_card or []):

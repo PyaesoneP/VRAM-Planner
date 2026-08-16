@@ -1787,6 +1787,289 @@ def _run_suite(require_refs, tmp, skipped_real):
         print("  CHAIN/FIND raised %s: %s  FAIL" % (type(e).__name__, e))
     ok = ok and find_ok
 
+    # ---- the recommendation, and the two divergences it exists to report ----
+    #
+    # The planner and the speed sweep answered the same question two different
+    # ways and neither said so. Three things are pinned here because each was a
+    # silent wrong answer before it was a test.
+    print("\n  Recommendation and budget parity")
+    try:
+        from vram_planner.plan import default_vram_budget
+        from vram_planner.bench import PLAN_BASIS, PLAN_RESERVE_MIB
+        from vram_planner.recommend import plan_config, recommend
+
+        # 1) ONE budget rule. planner_split() used to compute total-minus-512
+        #    inline while the browser prefilled free-minus-nothing. The helper is
+        #    now the only definition; this pins it to what the sweep expects.
+        g = {"total_mib": 16376.0, "free_mib": 11508.0}
+        b_total = default_vram_budget(g, PLAN_BASIS, 0)
+        b_free = default_vram_budget(g, "free", 0)
+        b_res = default_vram_budget(g, PLAN_BASIS, PLAN_RESERVE_MIB)
+        budget_ok = (b_total == 16376.0 and b_free == 11508.0
+                     and b_res == 16376.0 - PLAN_RESERVE_MIB
+                     and PLAN_BASIS == "total"
+                     # never negative, however small the card or large the reserve
+                     and default_vram_budget({"total_mib": 100}, "total", 4096) == 0.0
+                     and default_vram_budget(None) == 0.0)
+        print("  BUDGET one rule, total basis, reserve applied, never negative  %s"
+              % ("OK" if budget_ok else "FAIL"))
+
+        # 2) The verdict is COMPUTED, not inferred by the browser. The step tab
+        #    read r.verdict.fits and r.totals.vram_mib, neither of which this API
+        #    has ever returned - so it announced "fits" for every plan analyzed,
+        #    including the ones that did not.
+        r_no = analyze(p2, 4096, "f16", 512, False, vram_budget_mib=8,
+                       ram_budget_mib=8, gpu_reserve_mib=0,
+                       compute_override_mib=40, safety_pct=0)
+        r_yes = analyze(p2, 4096, "f16", 512, False, vram_budget_mib=100000,
+                        ram_budget_mib=100000, gpu_reserve_mib=0,
+                        compute_override_mib=40, safety_pct=0)
+        v_no, v_yes = r_no["plan"]["verdict"], r_yes["plan"]["verdict"]
+        verdict_ok = (v_yes["state"] == "fits" and v_yes["word"] == "FITS"
+                      and v_no["state"] in ("no_fit", "spills")
+                      and v_no["word"] != v_yes["word"]
+                      and v_yes["vram_mib"] > 0
+                      # the two knobs a launcher needs, normalised across planners
+                      and "ngl" in v_yes and "ncmoe" in v_yes)
+
+        # The verdict must be reported on the SAME basis the memory bar draws,
+        # or the step tab and the card under it give two answers to one
+        # question - they differed by exactly the driver reserve, so the tab
+        # read 10.25 GiB beside a bar reading 11,013 MiB.
+        r_res = analyze(p2, 4096, "f16", 512, False, vram_budget_mib=4000,
+                        ram_budget_mib=40000, gpu_reserve_mib=512,
+                        compute_override_mib=40, safety_pct=5)
+        pl, vr = r_res["plan"], r_res["plan"]["verdict"]
+        bar = sum(pl.get(k) or 0 for k in
+                  ("gpu_weights_mib", "gpu_kv_mib", "gpu_recurrent_mib",
+                   "mmproj_mib", "spec_mib", "compute_mib")) + 512
+        basis_ok = (abs(vr["vram_mib"] - bar) < 0.5
+                    and vr["vram_budget_mib"] == 4000
+                    # ...while the fit decision stays on the effective pair
+                    and abs(vr["vram_used_eff_mib"] - pl["vram_used_mib"]) < 0.5
+                    and abs(vr["vram_budget_eff_mib"] - pl["vram_budget_mib"]) < 0.5
+                    and vr["vram_budget_eff_mib"] < vr["vram_budget_mib"])
+        verdict_ok = verdict_ok and basis_ok
+        print("  VERDICT state server-side, starved plan is not 'fits', bar agrees  %s"
+              % ("OK" if verdict_ok else "FAIL"))
+
+        # 3) recommend(): a measured winner supersedes the estimate, an
+        #    untrustworthy one never does however fast it reads, and every reason
+        #    the two differ is named rather than left for the user to spot.
+        pr = {"plan": {"n_gpu_layers": 41, "n_cpu_moe": 18, "fits_fully": False},
+              "inputs": {"context": 32768, "kv_type": "q8_0", "n_ubatch": 512,
+                         "n_seq": 1, "flash_attn": True, "vram_budget_mib": 11508}}
+        base_cfg = {"ctx": 32768, "kv": "q8_0", "fa": True, "seq": 1, "fill": 2048}
+        win = {"model": "m.gguf", "status": "ok", "tok_s": 8.41,
+               "proc_vram_mib": 14880,
+               "config": dict(base_cfg, ngl=47, ncmoe=12, ub=1024,
+                              spec="draft-mtp", spec_n_max=2)}
+        # Faster, and unusable: WDDM spilled it into shared system memory, so it
+        # reports ok while running off a cliff. It must never win.
+        spill = {"model": "m.gguf", "status": "ok", "tok_s": 9.9, "spilled": True,
+                 "config": dict(base_cfg, ngl=50, ncmoe=0, ub=512)}
+        got = recommend(pr, [win, spill], sweep_budget_mib=15864)
+        kinds = {d["kind"] for d in got["deltas"]}
+        rec_ok = (got["source"] == "measured"
+                  and got["config"]["ngl"] == 47 and got["tok_s"] == 8.41
+                  and got["n_trusted"] == 1 and got["n_rows"] == 2
+                  # the objective difference is the headline: largest-that-fits
+                  # is not fastest-measured, and nothing said so before
+                  and "objective" in kinds
+                  # priced against different amounts of VRAM
+                  and "budget" in kinds
+                  # knobs no plan has a field for
+                  and "axis" in kinds)
+        only_spill = recommend(pr, [spill], sweep_budget_mib=15864)
+        rec_ok = rec_ok and (only_spill["source"] == "predicted"
+                             and only_spill["config"]["ngl"] == 41
+                             and {d["kind"] for d in only_spill["deltas"]} == {"untrusted"})
+        none_at_all = recommend(pr, [])
+        rec_ok = rec_ok and (none_at_all["source"] == "predicted"
+                             and none_at_all["deltas"] == [])
+        # A row measured at another context is a different experiment, not a
+        # faster config - strict mode must not let it take over the answer.
+        elsewhere = {"model": "m.gguf", "status": "ok", "tok_s": 40.0,
+                     "config": dict(base_cfg, ctx=4096, ngl=60)}
+        far = recommend(pr, [elsewhere, win], sweep_budget_mib=15864)
+        rec_ok = rec_ok and far["config"]["ngl"] == 47
+        # ...and with nothing comparable at all it still answers, saying so.
+        loose = recommend(pr, [elsewhere], sweep_budget_mib=15864)
+        rec_ok = rec_ok and (loose["source"] == "measured"
+                             and "stale" in {d["kind"] for d in loose["deltas"]})
+        # agreement is silent: same split, same budget, no unplannable knobs
+        agree = {"model": "m.gguf", "status": "ok", "tok_s": 5.0,
+                 "config": dict(base_cfg, ngl=41, ncmoe=18, ub=512)}
+        quiet = recommend(pr, [agree], sweep_budget_mib=11508)
+        rec_ok = rec_ok and quiet["deltas"] == []
+        # ...and silence has to hold for the DEFAULT plan, which is the one
+        # nearly every user sees. The raw budget field is not the number a split
+        # is chosen against - the reserve and the safety margin come off first -
+        # so comparing it against the sweep's effective basis reported a budget
+        # delta on every plan ever made, including this one, where the entire
+        # gap is the reserve the sweep had already taken off.
+        pr_def = {"plan": {"n_gpu_layers": 41, "n_cpu_moe": 18, "fits_fully": False},
+                  "inputs": {"context": 32768, "kv_type": "q8_0", "n_ubatch": 512,
+                             "n_seq": 1, "flash_attn": True,
+                             "vram_budget_mib": 16376, "gpu_reserve_mib": 512,
+                             "safety_pct": 5}}
+        sweep_eff = (16376 - 512) * 0.95          # what web.py hands recommend()
+        parity = recommend(pr_def, [agree], sweep_budget_mib=sweep_eff)
+        rec_ok = rec_ok and parity["deltas"] == []
+        # ...while a basis that really does differ still says so: free-at-page-
+        # load against card-total is the divergence this module was written for.
+        pr_free = {"plan": pr_def["plan"],
+                   "inputs": dict(pr_def["inputs"], vram_budget_mib=11508,
+                                  gpu_reserve_mib=0)}
+        split = recommend(pr_free, [agree], sweep_budget_mib=sweep_eff)
+        rec_ok = rec_ok and {d["kind"] for d in split["deltas"]} == {"budget"}
+        # comparable() also gates on the SAMPLERS, and a plan has none of those
+        # either - so a campaign that swept real sampler settings matched
+        # nothing, strict narrowing emptied, and the fallback recommended a
+        # sampled row against a greedy assumption without a word. It falls back
+        # still, because some answer beats none; it names it now.
+        sampled = {"model": "m.gguf", "status": "ok", "tok_s": 7.0,
+                   "config": dict(base_cfg, ngl=41, ncmoe=18, ub=512,
+                                  temp=0.7, top_p=0.95)}
+        samp = recommend(pr, [sampled], sweep_budget_mib=11508)
+        samp_text = "".join(d["text"] for d in samp["deltas"] if d["kind"] == "samplers")
+        rec_ok = rec_ok and (samp["source"] == "measured"
+                             and {d["kind"] for d in samp["deltas"]} == {"samplers"}
+                             and "temperature 0.7" in samp_text)
+        # ...and stays quiet when the rows were greedy, which is what `agree` is.
+        rec_ok = rec_ok and "samplers" not in {d["kind"] for d in quiet["deltas"]}
+        # the plan's own config survives the trip into a row's vocabulary
+        pc = plan_config(pr)
+        rec_ok = rec_ok and pc["ngl"] == 41 and pc["ncmoe"] == 18 and pc["kv"] == "q8_0"
+        print("  RECOMM measured wins, spilled never does, every delta named    %s"
+              % ("OK" if rec_ok else "FAIL"))
+        rec_all = budget_ok and verdict_ok and rec_ok
+    except Exception as e:
+        rec_all = False
+        print("  RECOMMEND raised %s: %s  FAIL" % (type(e).__name__, e))
+    ok = ok and rec_all
+
+    # ---- forgetting a campaign -------------------------------------------
+    #
+    # Destructive, and what it destroys is hours of GPU time. Every guarantee it
+    # makes is pinned here: it takes only its own campaign, it never unlinks the
+    # file that campaign shares with others, and it leaves the removed rows
+    # somewhere they can be moved back from.
+    print("\n  Forgetting a campaign")
+    try:
+        import json as _json
+        from vram_planner import bench as _b
+        from vram_planner.bench import campaign_match, delete_campaign, sweep_index
+
+        store = os.path.join(tmp, "speed")
+        os.makedirs(store, exist_ok=True)
+        _real_dir = _b.bench_dir
+        _b.bench_dir = lambda: store
+        try:
+            fn = "GPU_A__build-1.jsonl"
+            def _row(model, pid, tid, tok):
+                return {"model": model, "gpu": "GPU A", "prompt_id": pid,
+                        "template_id": tid, "status": "ok", "tok_s": tok,
+                        "when": 1000 + tok, "n_predict": 128, "repeat": 3,
+                        "config": {"ctx": 4096, "kv": "f16", "fa": True, "seq": 1,
+                                   "ngl": int(tok), "ub": 512, "fill": 0}}
+            # Three campaigns in ONE file: same model under two prompts, plus a
+            # second model. Deleting the first must leave the other two intact -
+            # a file is one GPU and one build, never one campaign.
+            rows = ([_row("a.gguf", "p1", "t1", 1.0), _row("a.gguf", "p1", "t1", 2.0)]
+                    + [_row("a.gguf", "p2", "t1", 3.0)]
+                    + [_row("b.gguf", "p1", "t1", 4.0)])
+            with open(os.path.join(store, fn), "w", encoding="utf-8", newline="\n") as f:
+                for r in rows:
+                    f.write(_json.dumps(r) + "\n")
+            # A line this tool did not write is not this tool's to discard.
+            with open(os.path.join(store, fn), "a", encoding="utf-8", newline="\n") as f:
+                f.write("{not json at all}\n")
+
+            before = sweep_index(_b.load_speed_rows())
+            res = delete_campaign(model="a.gguf", gpu="GPU A", file=fn,
+                                  prompt_id="p1", template_id="t1")
+            after = sweep_index(_b.load_speed_rows())
+            left = {(g["model"], g["prompt_id"]) for g in after}
+            del_ok = (len(before) == 3 and res.get("ok") and res["removed"] == 2
+                      # the file survives, carrying the campaigns it shared with
+                      and os.path.isfile(os.path.join(store, fn))
+                      and len(after) == 2
+                      and ("a.gguf", "p2") in left and ("b.gguf", "p1") in left
+                      and ("a.gguf", "p1") not in left
+                      # ...and the rows are recoverable, not gone
+                      and res["backup"] and os.path.isfile(res["backup"])
+                      and len(open(res["backup"], encoding="utf-8")
+                              .read().strip().splitlines()) == 2
+                      # the unparseable line was left exactly where it was
+                      and "{not json at all}" in open(os.path.join(store, fn),
+                                                      encoding="utf-8").read())
+            # An empty prompt_id is a VALUE - the campaigns that pinned none -
+            # and must never widen to every campaign of that model.
+            wide = delete_campaign(model="b.gguf", gpu="GPU A", file=fn,
+                                   prompt_id="", template_id="")
+            del_ok = del_ok and not wide.get("ok") and wide.get("removed") == 0
+            del_ok = del_ok and campaign_match(
+                {"model": "b.gguf", "prompt_id": "p1"}, model="b.gguf", prompt_id="p1")
+            # A name that matches nothing changes nothing.
+            miss = delete_campaign(model="nope.gguf", gpu="GPU A", file=fn)
+            del_ok = del_ok and not miss.get("ok") and len(sweep_index(
+                _b.load_speed_rows())) == 2
+            # ...and neither does one naming a file that is not there.
+            gone = delete_campaign(model="a.gguf", gpu="GPU A", file="no-such.jsonl")
+            del_ok = del_ok and not gone.get("ok")
+
+            # A campaign appending WHILE the delete reads: the row that landed
+            # is not in the rewrite, so replacing would forget a measurement
+            # nobody asked to forget. The web server refuses this by checking
+            # its own JOB, but a --forget-sweep in a terminal is a different
+            # process and cannot see that job at all - so the guard that counts
+            # is here, and it is the file itself that reports the collision.
+            n_backups = len(os.listdir(_b.deleted_dir()))
+            _real_read = _b._read_lines
+            def _read_then_append(path):
+                out = _real_read(path)
+                with open(path, "a", encoding="utf-8", newline="\n") as f:
+                    f.write(_json.dumps(_row("a.gguf", "p2", "t1", 9.0)) + "\n")
+                return out
+            _b._read_lines = _read_then_append
+            try:
+                race = delete_campaign(model="a.gguf", gpu="GPU A", file=fn,
+                                       prompt_id="p2", template_id="t1")
+            finally:
+                _b._read_lines = _real_read
+            still = {(g["model"], g["prompt_id"]) for g in sweep_index(_b.load_speed_rows())}
+            del_ok = del_ok and (not race.get("ok")
+                                 and "changed" in (race.get("error") or "")
+                                 # the campaign is untouched, appended row and all
+                                 and ("a.gguf", "p2") in still
+                                 and "\"ngl\": 9" in open(os.path.join(store, fn),
+                                                          encoding="utf-8").read()
+                                 # and no backup left behind claiming otherwise
+                                 and len(os.listdir(_b.deleted_dir())) == n_backups)
+
+            # Two campaigns out of one file inside the same second. The backup
+            # stamp is second-granular, so the second copy landed on the first
+            # and the rows it was protecting went with it - a recovery file that
+            # silently replaces another is worse than none, because it is the
+            # thing the confirm dialog is not enough protection without.
+            second = delete_campaign(model="b.gguf", gpu="GPU A", file=fn,
+                                     prompt_id="p1", template_id="t1")
+            backups = os.listdir(_b.deleted_dir())
+            del_ok = del_ok and (second.get("ok") and second["removed"] == 1
+                                 and len(backups) == n_backups + 1
+                                 and len(set(backups)) == len(backups)
+                                 and all(os.path.getsize(os.path.join(
+                                     _b.deleted_dir(), b)) > 0 for b in backups))
+            print("  FORGET takes one campaign, keeps the file, keeps a copy back  %s"
+                  % ("OK" if del_ok else "FAIL"))
+        finally:
+            _b.bench_dir = _real_dir
+    except Exception as e:
+        del_ok = False
+        print("  FORGET raised %s: %s  FAIL" % (type(e).__name__, e))
+    ok = ok and del_ok
+
     if skipped_real:
         print("\n  %d real-measurement section(s) did not run: %s"
               % (len(skipped_real), ", ".join(skipped_real)))

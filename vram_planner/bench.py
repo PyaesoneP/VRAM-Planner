@@ -1851,15 +1851,20 @@ def delete_campaign(model=None, gpu=None, file=None, prompt_id=_ANY,
         so an interrupted delete cannot leave a half-written store. A truncated
         JSONL loses far more than the campaign that was being removed.
 
-    Refusing while a campaign is RUNNING is the caller's job: the job appends to
-    these files as it measures, and a rewrite underneath it would drop whatever
-    landed between the read and the replace.
+    A caller that can see a running job should refuse before reaching here (the
+    web server does, against its own JOB). But it can only see ITS OWN process:
+    a --forget-sweep in a terminal knows nothing about a campaign appending from
+    a browser, and neither knows about the other. So the last word is here - the
+    file is fingerprinted before it is read and again before it is replaced, and
+    a delete that would land on top of an append is abandoned instead. That
+    covers every writer, including the ones no guard could have known about.
     """
     if not file:
         return {"ok": False, "error": "no campaign file named"}
     path = os.path.join(bench_dir(), os.path.basename(file))
     if not os.path.isfile(path):
         return {"ok": False, "error": "no such campaign file: %s" % file}
+    before = _fingerprint(path)
 
     keep, drop = [], []
     for line in _read_lines(path):
@@ -1880,19 +1885,43 @@ def delete_campaign(model=None, gpu=None, file=None, prompt_id=_ANY,
 
     saved = None
     if backup:
+        body = "".join(l if l.endswith("\n") else l + "\n" for l in drop)
+        stem = re.sub(r"\.jsonl$", "", os.path.basename(file))
+        stamp = time.strftime("%Y%m%d-%H%M%S")
         try:
             os.makedirs(deleted_dir(), exist_ok=True)
-            saved = os.path.join(
-                deleted_dir(), "%s.%s.jsonl"
-                % (re.sub(r"\.jsonl$", "", os.path.basename(file)),
-                   time.strftime("%Y%m%d-%H%M%S")))
-            with open(saved, "w", encoding="utf-8", newline="\n") as f:
-                f.write("".join(l if l.endswith("\n") else l + "\n" for l in drop))
+            # The stamp is only second-granular, and one file holds many
+            # campaigns - forgetting two of them in the same second put the
+            # second backup on top of the first and took an hour of measurement
+            # with it. Opened "x" rather than checked-then-written, so the name
+            # is claimed by the same call that finds it free.
+            for n in range(200):
+                saved = os.path.join(deleted_dir(), "%s.%s%s.jsonl"
+                                     % (stem, stamp, "" if not n else "-%d" % n))
+                try:
+                    f = open(saved, "x", encoding="utf-8", newline="\n")
+                except FileExistsError:
+                    continue
+                with f:
+                    f.write(body)
+                break
+            else:
+                raise OSError("200 backups already stamped %s" % stamp)
         except OSError as e:
             # A delete that cannot be undone is a different operation from the
             # one that was asked for, so it does not happen by accident.
             return {"ok": False, "error": "could not write the backup, so nothing "
                                           "was deleted: %s" % e}
+
+    # Last look before the file is replaced. Anything that landed since the read
+    # is a row this rewrite does not contain, so replacing now would delete a
+    # measurement nobody asked to forget.
+    if _fingerprint(path) != before:
+        _unlink(saved)
+        return {"ok": False, "error": "%s changed while it was being read - a "
+                                      "campaign is probably still measuring into "
+                                      "it. Nothing was deleted; stop the campaign "
+                                      "and try again." % os.path.basename(file)}
 
     tmp = path + ".tmp"
     try:
@@ -1900,10 +1929,8 @@ def delete_campaign(model=None, gpu=None, file=None, prompt_id=_ANY,
             f.write("".join(l if l.endswith("\n") else l + "\n" for l in keep))
         os.replace(tmp, path)
     except OSError as e:
-        try:
-            os.remove(tmp)
-        except OSError:
-            pass
+        _unlink(tmp)
+        _unlink(saved)
         return {"ok": False, "error": "could not rewrite %s: %s" % (file, e)}
     return {"ok": True, "removed": len(drop), "kept": len(keep),
             "file": os.path.basename(file), "backup": saved}
@@ -1915,6 +1942,31 @@ def _read_lines(path):
             return [l for l in f if l.strip()]
     except OSError:
         return []
+
+
+def _fingerprint(path):
+    """Enough of a file's identity to notice an append under a rewrite.
+
+    Size alone catches every append a campaign makes; mtime catches an in-place
+    edit that happened to keep the length. A missing file fingerprints as None,
+    which compares unequal to any real reading - the right answer, since a file
+    that vanished mid-delete is also not one to replace.
+    """
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    return (st.st_size, st.st_mtime_ns)
+
+
+def _unlink(path):
+    """Remove a file we wrote ourselves, if it is still there."""
+    if not path:
+        return
+    try:
+        os.remove(path)
+    except OSError:
+        pass
 
 
 # How far a row's floor must fall below its own campaign's before the gap is a

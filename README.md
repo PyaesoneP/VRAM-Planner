@@ -742,10 +742,13 @@ Three things it is careful about:
 - **The removed rows are moved, not dropped.** They land in `speed/deleted/` under the
   original name plus a timestamp, so a delete is undone by moving one file back. If the
   backup cannot be written, nothing is deleted — a delete that cannot be undone is a
-  different operation from the one that was asked for.
-- **The rewrite is atomic**, and is refused outright while a campaign is running: the job
-  appends to these files as it measures, so a rewrite underneath it would drop whatever
-  landed in between.
+  different operation from the one that was asked for. Two campaigns forgotten in the
+  same second get two files, not one on top of the other.
+- **The rewrite is atomic, and never lands on top of an append.** The browser refuses
+  outright while a campaign is running, but it can only see the job in its own process —
+  a `--forget-sweep` in a terminal knows nothing about a campaign running in a browser.
+  So the file itself is fingerprinted before it is read and again before it is replaced,
+  and a delete that would drop a row measured in between is abandoned instead.
 
 Deleting rows can change what the recommendation card shows — including back to the
 planner's estimate, if what went was the only trustworthy campaign for that model.

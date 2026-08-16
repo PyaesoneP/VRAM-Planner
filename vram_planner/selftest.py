@@ -1982,6 +1982,49 @@ def _run_suite(require_refs, tmp, skipped_real):
             # ...and neither does one naming a file that is not there.
             gone = delete_campaign(model="a.gguf", gpu="GPU A", file="no-such.jsonl")
             del_ok = del_ok and not gone.get("ok")
+
+            # A campaign appending WHILE the delete reads: the row that landed
+            # is not in the rewrite, so replacing would forget a measurement
+            # nobody asked to forget. The web server refuses this by checking
+            # its own JOB, but a --forget-sweep in a terminal is a different
+            # process and cannot see that job at all - so the guard that counts
+            # is here, and it is the file itself that reports the collision.
+            n_backups = len(os.listdir(_b.deleted_dir()))
+            _real_read = _b._read_lines
+            def _read_then_append(path):
+                out = _real_read(path)
+                with open(path, "a", encoding="utf-8", newline="\n") as f:
+                    f.write(_json.dumps(_row("a.gguf", "p2", "t1", 9.0)) + "\n")
+                return out
+            _b._read_lines = _read_then_append
+            try:
+                race = delete_campaign(model="a.gguf", gpu="GPU A", file=fn,
+                                       prompt_id="p2", template_id="t1")
+            finally:
+                _b._read_lines = _real_read
+            still = {(g["model"], g["prompt_id"]) for g in sweep_index(_b.load_speed_rows())}
+            del_ok = del_ok and (not race.get("ok")
+                                 and "changed" in (race.get("error") or "")
+                                 # the campaign is untouched, appended row and all
+                                 and ("a.gguf", "p2") in still
+                                 and "\"ngl\": 9" in open(os.path.join(store, fn),
+                                                          encoding="utf-8").read()
+                                 # and no backup left behind claiming otherwise
+                                 and len(os.listdir(_b.deleted_dir())) == n_backups)
+
+            # Two campaigns out of one file inside the same second. The backup
+            # stamp is second-granular, so the second copy landed on the first
+            # and the rows it was protecting went with it - a recovery file that
+            # silently replaces another is worse than none, because it is the
+            # thing the confirm dialog is not enough protection without.
+            second = delete_campaign(model="b.gguf", gpu="GPU A", file=fn,
+                                     prompt_id="p1", template_id="t1")
+            backups = os.listdir(_b.deleted_dir())
+            del_ok = del_ok and (second.get("ok") and second["removed"] == 1
+                                 and len(backups) == n_backups + 1
+                                 and len(set(backups)) == len(backups)
+                                 and all(os.path.getsize(os.path.join(
+                                     _b.deleted_dir(), b)) > 0 for b in backups))
             print("  FORGET takes one campaign, keeps the file, keeps a copy back  %s"
                   % ("OK" if del_ok else "FAIL"))
         finally:

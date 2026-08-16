@@ -700,8 +700,8 @@ Three guarantees, each pinned by the self-test:
 | | |
 |---|---|
 | **the file is never unlinked** | it is one GPU and one build and holds every campaign measured on that pair; it is rewritten without the matching rows instead, atomically, and a line the tool cannot parse is left exactly where it was |
-| **rows are moved, not dropped** | they land in `speed/deleted/<name>.<timestamp>.jsonl`, so a delete is undone by moving one file back. If the backup cannot be written, **nothing is deleted** — a delete that cannot be undone is a different operation from the one that was asked for |
-| **refused while a campaign is running** | the job appends to these files as it measures, so a rewrite underneath it would drop whatever landed between the read and the replace |
+| **rows are moved, not dropped** | they land in `speed/deleted/<name>.<timestamp>.jsonl`, so a delete is undone by moving one file back. If the backup cannot be written, **nothing is deleted** — a delete that cannot be undone is a different operation from the one that was asked for. The stamp is second-granular, so a name already taken gets a `-1` rather than overwriting the copy that is there |
+| **never lands on top of an append** | the job appends to these files as it measures, so a rewrite underneath it would drop whatever landed between the read and the replace. The browser refuses while its own job is running; that check cannot see across processes, so `delete_campaign()` also fingerprints the file before the read and again before the replace and abandons the delete if it moved. That is the guard `--forget-sweep` relies on, since a terminal cannot see a campaign running in a browser |
 
 `speed/deleted/` is not read by anything: `load_speed_rows()` lists `bench_dir()` and
 takes only `*.jsonl` from it, and a subdirectory is not a `.jsonl`. Forgotten rows stay

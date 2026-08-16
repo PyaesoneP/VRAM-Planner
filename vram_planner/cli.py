@@ -14,6 +14,11 @@ def _forget_sweeps(names, assume_yes=False):
     mistype. A name matches a campaign whose model contains it, case-insensitive
     - the full file name is long and the point is not to make you type it - so
     the listing is what confirms which campaigns were actually meant.
+
+    This runs in its own process and cannot see a campaign running in a browser,
+    so it does not try to: delete_campaign() fingerprints the file and abandons
+    a delete that would land on top of an append, which is the guard that holds
+    across processes rather than only within one.
     """
     from .bench import delete_campaign, load_speed_rows, sweep_index
     groups = sweep_index(load_speed_rows())

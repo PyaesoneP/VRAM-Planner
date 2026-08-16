@@ -130,6 +130,32 @@ def _budget_delta(plan_result, sweep_budget_mib):
                     % (_fmt_mib(have), _fmt_mib(sweep_budget_mib))}
 
 
+# What comparable() falls back to when the plan has no opinion. A plan has no
+# sampler settings at all, so the comparison assumes these - and a row measured
+# at real sampler settings is a different experiment, not a slower config.
+SAMPLERS = (("temp", "temperature", 0.0), ("top_k", "top-k", 0),
+            ("top_p", "top-p", 1.0), ("min_p", "min-p", 0.0),
+            ("rep_pen", "repeat penalty", 1.0), ("pres_pen", "presence penalty", 0.0))
+
+
+def _sampler_delta(won):
+    """The winner came from a fallback that comparable() had rejected."""
+    bits = []
+    for key, label, default in SAMPLERS:
+        v = won.get(key)
+        if v is None:
+            v = default
+        if v != default:
+            bits.append("%s %s" % (label, v))
+    return {"kind": "samplers",
+            "text": "A plan has no sampler settings, so the comparison assumes the "
+                    "defaults - greedy. No row here was measured that way%s, so the "
+                    "ranking fell back to the rows there are. Greedy is speculation's "
+                    "best case, so a sampled row and a greedy plan are two experiments "
+                    "rather than two configs."
+                    % ((": these ran at " + ", ".join(bits)) if bits else "")}
+
+
 def _axis_deltas(won, planned):
     """Knobs the winner sets that a plan cannot predict."""
     out = []
@@ -207,6 +233,7 @@ def recommend(plan_result, rows, sweep_budget_mib=None, strict=True):
     cand = [r for r in rank_rows(rows) if trustworthy(r)]
     out["n_trusted"] = len(cand)
     depth_note = None
+    sampler_fallback = False
     if strict and cand:
         # Two passes, because a plan and a row do not have the same vocabulary.
         #
@@ -242,7 +269,14 @@ def recommend(plan_result, rows, sweep_budget_mib=None, strict=True):
             same = [r for r in fills[fill]
                     if comparable(r, r.get("model"), base, prompt_id=None,
                                   template_id=_ANY)]
+            # Everything comparable() still gates on here is the samplers - the
+            # conditions were settled above and `base` carries the group's own
+            # fill. So an empty narrowing means the campaign swept real sampler
+            # settings, and falling back silently would recommend a sampled row
+            # against a greedy assumption without saying so - the same silence
+            # this module exists to end. Fall back, and name it.
             cand = same or fills[fill]
+            sampler_fallback = not same
     if not cand:
         if rows:
             out["deltas"].append({
@@ -270,6 +304,7 @@ def recommend(plan_result, rows, sweep_budget_mib=None, strict=True):
     for d in (_budget_delta(plan_result, sweep_budget_mib),
               _axis_deltas(won, planned),
               _stale_delta(won, planned),
+              _sampler_delta(won) if sampler_fallback else None,
               depth_note):
         if d:
             out["deltas"].append(d)

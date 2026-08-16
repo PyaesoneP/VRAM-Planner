@@ -1923,6 +1923,21 @@ def _run_suite(require_refs, tmp, skipped_real):
                                   gpu_reserve_mib=0)}
         split = recommend(pr_free, [agree], sweep_budget_mib=sweep_eff)
         rec_ok = rec_ok and {d["kind"] for d in split["deltas"]} == {"budget"}
+        # comparable() also gates on the SAMPLERS, and a plan has none of those
+        # either - so a campaign that swept real sampler settings matched
+        # nothing, strict narrowing emptied, and the fallback recommended a
+        # sampled row against a greedy assumption without a word. It falls back
+        # still, because some answer beats none; it names it now.
+        sampled = {"model": "m.gguf", "status": "ok", "tok_s": 7.0,
+                   "config": dict(base_cfg, ngl=41, ncmoe=18, ub=512,
+                                  temp=0.7, top_p=0.95)}
+        samp = recommend(pr, [sampled], sweep_budget_mib=11508)
+        samp_text = "".join(d["text"] for d in samp["deltas"] if d["kind"] == "samplers")
+        rec_ok = rec_ok and (samp["source"] == "measured"
+                             and {d["kind"] for d in samp["deltas"]} == {"samplers"}
+                             and "temperature 0.7" in samp_text)
+        # ...and stays quiet when the rows were greedy, which is what `agree` is.
+        rec_ok = rec_ok and "samplers" not in {d["kind"] for d in quiet["deltas"]}
         # the plan's own config survives the trip into a row's vocabulary
         pc = plan_config(pr)
         rec_ok = rec_ok and pc["ngl"] == 41 and pc["ncmoe"] == 18 and pc["kv"] == "q8_0"

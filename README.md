@@ -412,9 +412,12 @@ Three things changed:
    supersedes the estimate; rows that spilled, looped or copied the prompt back
    are never eligible however fast they read. When the two answers differ, the
    card at the top of the page names each reason — `objective`, `budget`,
-   `axis` (knobs no plan can predict), `depth` and `stale` — instead of leaving
-   you to notice that step 1 said `ncmoe 32` and step 2's best row said
-   `ncmoe 31`.
+   `axis` (knobs no plan can predict), `depth`, `samplers` and `stale` — instead
+   of leaving you to notice that step 1 said `ncmoe 32` and step 2's best row
+   said `ncmoe 31`. `budget` compares the two **after** each side's reserve and
+   safety margin, since that is the number a split is actually chosen against;
+   comparing the raw field reported a difference on every plan, including the
+   default one where there is none.
 
 ![The recommendation card: a measured config, and the four reasons it differs from the estimate](docs/ui-recommendation.png)
 

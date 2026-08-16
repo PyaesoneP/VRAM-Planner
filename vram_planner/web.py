@@ -91,12 +91,20 @@ class Handler(BaseHTTPRequestHandler):
     # bench/sweep are imported inside these handlers, not at module scope: they
     # pull in the subprocess machinery, and starting the web UI should not.
 
+    # The launch-script form's sampler names, mapped to what a sweep config
+    # calls them. One set of fields feeds both cards, which is the point: a
+    # campaign measured under settings the launcher does not use is how the
+    # header ends up quoting an acceptance rate from a different experiment.
+    _SWEEP_SAMPLER = {"repeat_penalty": "rep_pen",
+                      "presence_penalty": "pres_pen"}
+
     def _speed_args(self, data):
         """The subset of --speed-sweep's arguments the UI exposes.
 
         ctx and kv come straight off the main form, because the settings you are
         planning for are the ones worth measuring - they are --speed-ctx and
         --speed-kv, which freeze those axes instead of sweeping them."""
+        from .sweep import parse_overrides
         def as_int(k, default=None):
             v = data.get(k)
             return int(v) if v not in (None, "", False) else default
@@ -112,6 +120,38 @@ class Handler(BaseHTTPRequestHandler):
             # each knob at the split that won rather than at the planner's guess.
             "chain": bool(data.get("chain", True)),
             "rounds": max(1, as_int("rounds", 1) or 1),
+            # verify is opt-in from the browser, like --speed-verify on the CLI
+            "verify": bool(data.get("verify")),
+            "verify_overrides": (parse_overrides(data.get("verify_overrides").split())
+                                 if data.get("verify_overrides") else None),
+            # An explicit ladder, which REPLACES the staged grid. The staged
+            # search measures one knob at a time from a baseline, which cannot
+            # answer a question about an INTERACTION - "does speculation work at
+            # a split that leaves room for its draft cache" - because stage D
+            # only ever tries speculation at the split stage B already settled
+            # on. If that split is at the ceiling, every speculative row OOMs
+            # and the campaign reads as "speculation does not work here".
+            "axes": (parse_overrides(data.get("axes").split())
+                     if data.get("axes") else None),
+            # None means "sweep it", which is stage B's job. True/False pin it
+            # for the campaign - so None is a real third value here and cannot
+            # be collapsed with False the way `or None` would.
+            "mmproj_offload": (None if data.get("mmproj_offload") is None
+                               else bool(data.get("mmproj_offload"))),
+            # Same two fields the launch-script card already carries, so a
+            # campaign can be MEASURED under the template it will be RUN under.
+            # Absent means the GGUF's own metadata template, which is what every
+            # row recorded before this was measured against.
+            "chat_template_file": data.get("chat_template_file") or None,
+            "chat_template_kwargs": data.get("chat_template_kwargs") or None,
+            "reasoning": data.get("reasoning") or None,
+            "reasoning_preserve": data.get("reasoning_preserve") or None,
+            # Frozen for the campaign, like ctx and kv - not swept. The form
+            # sends the launch-script spelling so one set of fields can feed
+            # both cards; a sweep config spells the last two shorter.
+            "sampling": {self._SWEEP_SAMPLER.get(k, k): v
+                         for k, v in (data.get("sampling") or {}).items()
+                         if v is not None and v != ""},
         }
 
     def _speed_start(self, data):
@@ -145,6 +185,8 @@ class Handler(BaseHTTPRequestHandler):
             # race against the driver still releasing memory.
             return speed_sweep(log=job._append, on_row=add_row,
                                should_stop=job.cancelled, on_total=job.set_total,
+                               should_abort=job.aborting,
+                               on_server=job.set_live_proc,
                                skip_preflight=True, **kw)
 
         ok, msg = JOB.start("speed sweep", work)
@@ -226,6 +268,8 @@ class Handler(BaseHTTPRequestHandler):
                 load_mode=load_mode, measured=data.get("measured") or None,
                 chat_template_file=data.get("chat_template_file") or None,
                 chat_template_kwargs=data.get("chat_template_kwargs") or None,
+                reasoning=data.get("reasoning") or None,
+                reasoning_preserve=data.get("reasoning_preserve") or None,
                 path_resolved=resolved)
         except ValueError as e:
             # Raised by template_args() for kwargs that are not a JSON object.
@@ -337,7 +381,11 @@ class Handler(BaseHTTPRequestHandler):
                                     "dir": bench_dir(), "n_rows": len(rows)})
         if u.path == "/api/speed/insights":
             from .bench import insights, load_speed_rows
-            q = parse_qs(u.query)
+            # keep_blank_values, because "" is a MEANING here and not an absence:
+            # a campaign with no template pinned is identified by an empty
+            # template_id, and dropping the key would widen the filter to every
+            # template instead of narrowing to the one that has none.
+            q = parse_qs(u.query, keep_blank_values=True)
             get = lambda k: (q.get(k) or [""])[0]
             rows = load_speed_rows()
             # Filter BEFORE analysing, not after: the whole correctness of
@@ -347,6 +395,12 @@ class Handler(BaseHTTPRequestHandler):
                 v = get(key)
                 if v:
                     rows = [r for r in rows if r.get(field) == v]
+            # ...and on what the model was ASKED, which is the half sweep_index
+            # keys on. Present-but-empty means "the rows that have none".
+            for key, field in (("pid", "prompt_id"), ("tid", "template_id")):
+                if key in q:
+                    v = get(key)
+                    rows = [r for r in rows if (r.get(field) or "") == v]
             if not rows:
                 return self._send(200, {"ok": False, "error": "no rows match"})
             res = insights(rows)

@@ -98,15 +98,30 @@ async function showPastSweeps(){
   // recorded yet - that is exactly when the page would otherwise look idle
   // while the GPU is busy.
   if(!n && !(SWEEP.status && SWEEP.status.status === "running")) return;
-  const busy = !!(SWEEP.status && SWEEP.status.status === "running");
-  $("out").innerHTML = busy
-    // A sweep is running from another tab or from before a reload. Show the
-    // whole measured column so it can be watched and stopped, not just listed.
-    ? renderSweep() + renderHistory()
-    : h`<div class="card"><p class="placeholder">Pick a model and press Analyze fit.</p></div>` +
-      renderHistory() +
-      h`<section class="card" id="sweepscriptcard">
-          <h2>Launch script</h2><div id="sweepscript"></div></section>`;
+  renderIdle();
+}
+
+/** The page with no model analyzed. Same three steps, with step 1 asking for the
+ *  one thing it needs instead of being empty - and steps 2 and 3 fully usable,
+ *  because browsing a recorded campaign and building a script from one of its
+ *  rows needs no plan and touches no GPU. */
+function renderIdle(){
+  if(LAST) return;
+  const busy = !!(SWEEP && SWEEP.status && SWEEP.status.status === "running");
+  const step = stepNow();
+  let panel;
+  if(step === "fit"){
+    panel = h`<section class="card lead">
+      <p class="placeholder">Pick a model on the left and press <b>Analyze fit</b>.</p>
+      <p class="note">Steps 2 and 3 work without this: a recorded campaign can be read and a
+        launch script built from any of its rows with nothing analyzed and the GPU untouched.</p>
+    </section>`;
+  }else if(step === "measure"){
+    panel = renderSweep() + renderHistory();
+  }else{
+    panel = renderScriptStep();
+  }
+  $("out").innerHTML = renderStepper(null) + panel;
   drawSweep({ grid: busy, results: busy, script: true, history: true });
 }
 
@@ -288,7 +303,13 @@ async function run(){
     });
     const r = await res.json();
     if(!r.ok) $("out").innerHTML = h`<div class="card warns"><b>Error:</b> ${r.error || "unknown"}</div>`;
-    else render(r);
+    else {
+      // Pressing Analyze is a question about FIT, so answer that one - even if
+      // the last thing looked at was a script. Without this the step stuck
+      // wherever it was left and Analyze appeared to do nothing at all.
+      STEP = null;
+      render(r);
+    }
   }catch(e){
     $("out").innerHTML = h`<div class="card warns"><b>Request failed:</b> ${e}</div>`;
   }
@@ -586,12 +607,24 @@ function render(r){
   // an audio-only mmproj has no patch grid to size.
   $("visionrow").hidden = !(r.vision && r.vision.config);
   $("visioninputs").hidden = !$("visionplan").checked;
-  $("out").innerHTML =
-    renderVerdict(r) + renderWarnings(r) +
-    renderSweep() + renderHistory() +
-    tier("PREDICTED", "calculated, not measured — the cards above supersede these once you have rows") +
-    renderSettings(r) + renderSpeed(r) + renderSummary(r) +
-    renderKvTable(r) + renderBreakdown(r);
+  const step = stepNow();
+  let panel;
+  if(step === "fit"){
+    // The gate, and then everything the planner DERIVED - which is reference
+    // material, not a next action, so it opens closed.
+    panel = renderVerdict(r) + renderWarnings(r) +
+      tier("PREDICTED", "calculated from the model's own metadata — step 2 supersedes it") +
+      h`<details class="adv derived"><summary>Settings the planner suggests, its speed
+        estimate, and where the memory goes</summary>` +
+      renderSettings(r) + renderSpeed(r) + renderSummary(r) +
+      renderKvTable(r) + renderBreakdown(r) +
+      h`</details>`;
+  }else if(step === "measure"){
+    panel = renderSweep() + renderHistory();
+  }else{
+    panel = renderScriptStep();
+  }
+  $("out").innerHTML = renderStepper(r) + panel;
   if(r.speed && !r.speed.error) loadSpeedHistory(r);
   // Filled in asynchronously: it needs a live GPU reading and the recorded rows,
   // and neither should hold up the plan the user actually pressed the button for.
@@ -840,23 +873,26 @@ function sweepDefaults(){
  * text inputs, and rebuilding it under the poll destroyed whatever was being
  * typed into them once every second and a half. */
 function renderSweep(){
-  return h`<section class="card" id="sweepcard">
-    <h2>Measure real speed</h2>
-    <p class="note">Everything above is calculated. Two of the settings that matter most to
-      tokens/second are <b>not calculable</b>: speculative decoding has no acceptance rate
-      until you run it, and prompt processing is compute bound and is not modelled here at
-      all. This drives <span class="mono">llama-server</span> across a grid and records what
-      it actually does &mdash; then writes the launch script for whatever wins.</p>
+  return h`<section class="card lead" id="sweepcard">
+    <p class="note">Two of the settings that matter most to tokens/second cannot be calculated:
+      speculative decoding has no acceptance rate until you run it, and prompt processing is
+      compute bound and is not modelled at all. This drives
+      <span class="mono">llama-server</span> across a grid and records what it really does.</p>
     <div id="sweepbody"><p class="muted small">checking the GPU&hellip;</p></div>
   </section>
   <section class="card" id="sweepresultcard">
     <h2>Measured results</h2>
     <div id="sweepresults"><p class="muted small">looking for recorded rows&hellip;</p></div>
-  </section>
-  <section class="card" id="sweepscriptcard">
-    <h2>Launch script</h2>
-    <div id="sweepscript"></div>
   </section>`;
+}
+
+/** Step 3 on its own. Kept out of renderSweep() because it must NOT be rewritten
+ *  on the 1.5s poll - it holds a dozen text inputs, and redrawing it under the
+ *  poll destroyed whatever was being typed once every second and a half. */
+function renderScriptStep(){
+  return h`<section class="card lead" id="sweepscriptcard">
+    <div id="sweepscript"></div>
+  </section>` + renderHistory();
 }
 
 function renderHistory(){
@@ -871,6 +907,89 @@ function renderHistory(){
 
 function tier(label, note){
   return h`<div class="tier"><span>${label}</span><i>${note}</i></div>`;
+}
+
+/* ---------------------------------------------------------------- the steps
+ *
+ *  Three things anyone actually comes here to do, in the order they depend on
+ *  each other: does it FIT, how FAST is it really, and what do I RUN.
+ *
+ *  They used to be twelve stacked sections in one scrolling column - verdict,
+ *  notes, measure, results, script, past sweeps, predicted settings, speed
+ *  estimate, model, KV table, memory breakdown - with no signal about which
+ *  ones were answers and which were controls. Every one of them was visible at
+ *  once, so none of them was the next thing to do.
+ *
+ *  Only the active step renders. The others collapse into the stepper's own
+ *  labels, which carry their answer - "FITS · 11.4 GB", "MEASURED · 3.95 tok/s"
+ *  - so nothing is hidden that you would have to go looking for. */
+const STEPS = [
+  ["fit",     "Does it fit"],
+  ["measure", "Measure real speed"],
+  ["script",  "Launch script"],
+];
+
+let STEP = null;          // null = follow the default for the current state
+
+function stepNow(){
+  if(STEP) return STEP;
+  // A campaign running is the thing you opened the page for, whatever else is
+  // on it. Otherwise start at the gate: measuring a config that cannot load is
+  // an hour spent proving it cannot load.
+  if(SWEEP && SWEEP.status && SWEEP.status.status === "running") return "measure";
+  return LAST ? "fit" : "measure";
+}
+
+function stepSummary(id, r){
+  if(id === "fit"){
+    if(!r) return "no model analyzed";
+    const v = r.verdict || {};
+    return (v.fits === false ? "does not fit" : "fits")
+      + (r.totals && r.totals.vram_mib ? " · " + fmtG(r.totals.vram_mib) : "");
+  }
+  if(id === "measure"){
+    const st = SWEEP && SWEEP.status;
+    if(st && st.status === "running")
+      return "measuring " + st.done + "/" + (st.total || "?");
+    const rows = sweepAllRows ? sweepAllRows() : [];
+    const best = rows.find(x => x.tok_s);
+    return best ? best.tok_s.toFixed(2) + " tok/s best" : "nothing measured yet";
+  }
+  const row = (typeof sweepPickedRow === "function") ? sweepPickedRow() : null;
+  const c = row ? row.config : (SWEEP && SWEEP.predicted);
+  return c ? "ngl " + c.ngl + (c.spec && c.spec !== "none" ? " · " + c.spec : "")
+           : "not ready";
+}
+
+function renderStepper(r){
+  const now = stepNow();
+  const tabs = STEPS.map(([id, label], i) => {
+    const on = id === now;
+    const busy = id === "measure" && SWEEP && SWEEP.status
+                 && SWEEP.status.status === "running";
+    return h`<button class="step ${on ? "on" : ""} ${busy ? "busy" : ""}" type="button"
+      data-action="set-step" data-step="${id}" aria-pressed="${on ? "true" : "false"}">
+      <b>${String(i + 1)}</b><span>${label}</span><i>${stepSummary(id, r)}</i></button>`;
+  }).join("");
+  return h`<nav class="steps" id="stepper" aria-label="What do you want to do">${raw(tabs)}</nav>`;
+}
+
+/** Refresh only the tab labels.
+ *
+ *  They carry the answer of every step that is NOT open - "3.95 tok/s best",
+ *  "measuring 4/9" - which is the entire reason collapsing the other two is
+ *  acceptable. Left out of the poll they went stale immediately: rows load
+ *  after the first paint, so step 2 sat on "nothing measured yet" for a model
+ *  with 145 recorded rows. */
+function drawStepper(){
+  const el = $("stepper");
+  if(el) el.outerHTML = renderStepper(LAST);
+}
+
+function setStep(id){
+  STEP = id;
+  if(LAST) render(LAST); else renderIdle();
+  window.scrollTo({ top: 0, behavior: "smooth" });
 }
 
 async function initSweep(r){
@@ -895,8 +1014,13 @@ async function initSweep(r){
                      attachRunningJob()]);
   // Pre-select this model's campaign, so Past sweeps opens on what was just
   // analyzed instead of on whatever ran most recently.
+  // `mine.length === 1` used to be right, because a model had exactly one
+  // campaign entry. Splitting the index by prompt and template means a model
+  // that has been measured more than once now has several, and an equality on
+  // 1 quietly stopped opening anything at all. Campaigns arrive newest first,
+  // so the most recent one is the one to open - which is the same intent.
   const mine = (SWEEP.campaigns || []).filter(g => g.model === SWEEP.model);
-  if(mine.length === 1) openCampaign(campaignId(mine[0]));
+  if(mine.length) openCampaign(campaignId(mine[0]));
   drawSweepAll();
 }
 
@@ -975,6 +1099,7 @@ function drawSweep(what){
     const hh = $("sweephistory");
     if(hh) hh.innerHTML = sweepHistory();
   }
+  drawStepper();
 }
 
 /** Everything, including the panes that hold live inputs. Only safe when the
@@ -1029,6 +1154,19 @@ function sweepForm(pf){
       <div class="field"><label for="swlimit">Stop after (blank = all)</label>
         <input type="number" id="swlimit" step="1" min="1" placeholder="all"></div>
     </div>
+    <div class="field" style="max-width:24em">
+      <label for="swmmproj">Vision projector</label>
+      <select id="swmmproj">
+        <option value="">sweep it (that is stage B)</option>
+        <option value="vram">keep in VRAM</option>
+        <option value="ram">move to system RAM</option>
+      </select>
+      <p class="hint">Where the projector lives is a real axis &mdash; it was worth ~900 MiB of
+        VRAM on one model, which bought back whole expert layers. Sweeping it is stage B. Pin it
+        instead when you already know where you want it and you are sweeping something else:
+        otherwise the only way to say so was to write
+        <span class="mono">mmproj_offload=false</span> into the axes box.</p>
+    </div>
     <p class="hint" style="margin-top:-4px">Measure where you actually work: decode slows as
       the context fills, so a number taken at 2k is not the speed you feel at 40k. A deeper
       fill costs real time though &mdash; the prompt has to be processed once per config.</p>
@@ -1042,20 +1180,114 @@ function sweepForm(pf){
         model looping is never carried forward &mdash; it would bend every later stage the same
         way, silently. A new baseline also has to win by more than 2%, because tok/s is a median
         of a few passes and rebasing on jitter would make the campaign&rsquo;s path depend on noise.</p>
-      <div class="field" id="swroundsfield" style="max-width:16em">
+      <div class="field" id="swroundsfield" style="max-width:22em">
         <label for="swrounds">Rounds</label>
         <input type="number" id="swrounds" value="1" min="1" max="4" step="1">
-        <p class="hint">Re-run the stages from the winner. Cheap: a config a later round
-          revisits unchanged is already recorded and is skipped, so only genuinely new
-          combinations cost time.</p>
+        <p class="hint">Runs A&ndash;D again from the winner. The point is that A and B choose
+          the memory split <i>before</i> D turns speculation on, and speculation costs VRAM
+          &mdash; so the wall A found has moved by the time D is done. A second round re-walks
+          the split with the speculation that won already switched on.
+          <b>The preview cannot price it</b>: which configs a later round adds depends on what
+          this one finds. It is cheap by construction though &mdash; anything a round revisits
+          unchanged is already recorded and is skipped, so only new combinations cost time.</p>
       </div>
     </div>
+    <div class="field">
+      <label class="check"><input type="checkbox" id="swverify"> Verify the winner with
+        the production config</label>
+      <p class="hint">One extra load after the sweep: the winning config plus the knobs
+        below, e.g. <span class="mono">spec=draft-mtp spec_n_max=2</span>. The row that
+        wins is often not the row you run &mdash; MTP&rsquo;s draft cache alone moved the
+        OOM wall one <span class="mono">ngl</span> rung on one model &mdash; so this
+        measures what you would actually launch, and says if it is trustworthy.</p>
+      <div class="field" id="swverifyfield" style="max-width:28em">
+        <label for="swverifyoverrides">Overrides (same grammar as axes)</label>
+        <input type="text" id="swverifyoverrides" placeholder="spec=draft-mtp spec_n_max=2">
+      </div>
+    </div>
+    <details class="adv" id="swaxesbox"><summary>Sweep exact values instead of the stages</summary>
+      <p class="hint">The staged grid moves one knob at a time from a baseline, which cannot
+        answer a question about an <b>interaction</b>. Stage D only ever tries speculation at the
+        split stage B settled on &mdash; so if that split is already at the memory ceiling, every
+        speculative row OOMs and the campaign reads as &ldquo;speculation does not work here&rdquo;
+        when the truth is &ldquo;speculation needs one more rung of offload&rdquo;.</p>
+      <div class="field">
+        <label for="swaxes">Axes</label>
+        <input type="text" id="swaxes"
+               placeholder="ncmoe=30,31,32,33 spec=draft-mtp spec_n_max=2 mmproj_offload=false">
+        <p class="hint">Space-separated <span class="mono">key=v,v,v</span>, run as a full cross
+          product. Anything left out keeps the value from the form above.
+          <b>This replaces the stages and the chaining</b> &mdash; a ladder you wrote down is
+          already the search, so there is nothing left to chain.</p>
+      </div>
+    </details>
+    ${raw(sweepAskSection())}
     <div class="actions">
       <button class="ghost" type="button" data-action="sweep-plan">Preview grid</button>
       <button class="go" type="button" style="width:auto" data-action="sweep-start">&#9654; Start measuring</button>
     </div>
     <div id="sweepplan"></div>
   </div>`;
+}
+
+/** How the model is ASKED, while it is being measured.
+ *
+ *  These are not axes. They are frozen for the campaign, exactly like context
+ *  and KV quant, and they are here because leaving them out made every campaign
+ *  measure something other than what the launcher would go on to run:
+ *
+ *    - no template, so an instruction-tuned model was handed raw text and
+ *      continued the document instead of answering it
+ *    - greedy sampling, which is speculation's BEST case, so an acceptance
+ *      rate measured here is an upper bound and not a result
+ *
+ *  The generated script now warns when it is launching a config that differs
+ *  from the row it cites. This is the other half: the way to make it not
+ *  differ. */
+function sweepAskSection(){
+  const tl = (SWEEP && SWEEP.templates) || [];
+  const num = (id, label, ph) => h`<div class="field"><label for="${id}">${label}</label>
+    <input type="number" id="${id}" step="0.01" placeholder="${ph}"></div>`;
+  return h`<details class="adv" id="swaskbox"><summary>How the model is asked while measuring
+      &mdash; template, thinking, samplers</summary>
+    <p class="hint">Frozen for the campaign, not swept &mdash; the same standing as context and
+      KV quant. Set these to <b>what you will actually run</b>. A row measured under other
+      settings is a different experiment: rows are keyed on the template&rsquo;s content hash
+      and on the samplers, so changing anything here re-measures rather than resuming.</p>
+    <div class="field">
+      <label for="swtmplfile">Chat template file</label>
+      <input type="text" id="swtmplfile" list="tmpllist2"
+             placeholder="&mdash; the model&rsquo;s own &mdash;">
+      <datalist id="tmpllist2">${raw(tl.map(t => h`<option value="${t}"></option>`).join(""))}</datalist>
+      <p class="hint">Without one the benchmark still asks through the server&rsquo;s
+        <span class="mono">/apply-template</span>, so it uses whatever the GGUF carries. Pin the
+        file here when the launcher will pin it, or the two are measuring different prompts.
+        Quotes around a pasted Windows path are stripped.</p>
+    </div>
+    <div class="field">
+      <label for="swtmplkw">Template keyword arguments (JSON object)</label>
+      <input type="text" id="swtmplkw" placeholder='{"reasoning_effort":"xhigh"}'>
+    </div>
+    <div class="row">
+      <div class="field"><label for="swreason">Thinking</label>
+        <select id="swreason"><option value="auto">auto</option>
+          <option value="on">on</option><option value="off">off</option></select></div>
+      <div class="field"><label for="swreasonpre">Preserve thinking</label>
+        <select id="swreasonpre"><option value="default">template default</option>
+          <option value="on">on</option><option value="off">off</option></select></div>
+    </div>
+    <p class="sublabel" style="margin-top:14px">SAMPLERS</p>
+    <p class="hint" style="margin-top:-4px">Blank means <b>greedy</b> (temp 0), which is the
+      right default for comparing configs &mdash; it makes the token stream reproducible, so two
+      rows differ by the knob under test and nothing else. It is the wrong thing to draw a
+      <b>speculation</b> conclusion from: llama.cpp accepts a draft token when the target&rsquo;s
+      own sampled token matches it, and under greedy that comparison is deterministic. Greedy is
+      speculation&rsquo;s best case, so fill these in before believing an acceptance rate.</p>
+    <div class="row">${raw(num("swtemp", "temp", "0 (greedy)") + num("swtopk", "top-k", "0")
+      + num("swtopp", "top-p", "1.0") + num("swminp", "min-p", "0"))}</div>
+    <div class="row">${raw(num("swreppen", "repeat-penalty", "1.0")
+      + num("swprespen", "presence-penalty", "0"))}</div>
+  </details>`;
 }
 
 function sweepStage(letter, label, hint){
@@ -1071,10 +1303,44 @@ function sweepStages(){
 function sweepBody(){
   const v = id => { const el = $(id); return el && el.value !== "" ? parseInt(el.value) : null; };
   const chain = $("swchain") ? $("swchain").checked : true;
+  const verify = $("swverify") ? $("swverify").checked : false;
   return { path: SWEEP.path, stages: sweepStages(), context: parseInt($("ctx").value),
            kv_type: $("kv").value, fill: v("swfill"), n_predict: v("swpred"),
            repeat: v("swrep"), limit: v("swlimit"),
-           chain: chain, rounds: chain ? (v("swrounds") || 1) : 1 };
+           chain: chain, rounds: chain ? (v("swrounds") || 1) : 1,
+           verify: verify,
+           verify_overrides: verify ? ($("swverifyoverrides").value.trim() || null) : null,
+           axes: ($("swaxes") && $("swaxes").value.trim()) || null,
+           // "" = sweep it (stage B's job). Otherwise pinned for the campaign,
+           // which is a different thing from absent and has to survive as one.
+           mmproj_offload: (($("swmmproj") && $("swmmproj").value) || "") === ""
+             ? null : $("swmmproj").value === "ram" ? false : true,
+           ...sweepAskBody() };
+}
+
+/** The "how the model is asked" fields, in the shapes the server expects.
+ *  Sampler names are the launch-script card's, so one vocabulary reaches both
+ *  and web.py does the single mapping to a sweep config's shorter spelling. */
+function sweepAskBody(){
+  const t = id => { const el = $(id); return (el && el.value.trim()) || null; };
+  const n = id => { const el = $(id); return el && el.value.trim() !== ""
+                                      ? parseFloat(el.value) : null; };
+  const sel = id => { const el = $(id); return el ? el.value : null; };
+  const sampling = {};
+  [["swtemp", "temp"], ["swtopk", "top_k"], ["swtopp", "top_p"],
+   ["swminp", "min_p"], ["swreppen", "repeat_penalty"],
+   ["swprespen", "presence_penalty"]].forEach(([id, k]) => {
+     const v = n(id); if(v !== null) sampling[k] = v;
+   });
+  return {
+    chat_template_file: t("swtmplfile"),
+    chat_template_kwargs: t("swtmplkw"),
+    // auto/default are llama.cpp's own answers, sent as null so no flag is
+    // emitted rather than one restating a default that could later move
+    reasoning: sel("swreason") === "auto" ? null : sel("swreason"),
+    reasoning_preserve: sel("swreasonpre") === "default" ? null : sel("swreasonpre"),
+    sampling: sampling
+  };
 }
 
 async function sweepPlan(){
@@ -1105,6 +1371,14 @@ async function sweepPlan(){
         values for them would be a guess dressed up as a plan. The <i>counts</i> are exact
         &mdash; a ladder&rsquo;s length does not depend on where it is centred &mdash; so the
         estimate above is not a guess. Stages: ${raw(later)}.</p>` : "") +
+    /* The estimate covers round 1 only, and said nothing about it - the preview
+       was byte-identical for rounds 1 and rounds 4, so the control changed
+       nothing anyone could inspect before committing the hours. */
+    ((d.rounds || 1) > 1 ? h`<p class="note"><b>${String(d.rounds)} rounds.</b> The count and
+        the estimate above are for <b>round 1</b>. What a later round adds cannot be listed or
+        priced here &mdash; it is built from a winner that does not exist yet &mdash; but it is
+        bounded: anything a round revisits unchanged is already recorded and is skipped, so a
+        round only pays for combinations round 1 never tried.</p>` : "") +
     (d.planned ? h`<div class="tablewrap"><table>
       <thead><tr><th>stage</th><th>ngl</th><th>ncmoe</th><th>ub</th><th>fill</th>
         <th>spec</th><th>n-max</th><th>projector</th></tr></thead>
@@ -1160,16 +1434,38 @@ function sweepRunning(st){
   const pct = st.total ? clampPct(100 * st.done / st.total) : 0;
   const mins = st.elapsed_s != null ? (st.elapsed_s / 60).toFixed(1) : "?";
   const tail = (st.log || []).slice(-14).join("\n");
+  /* Under a chained search the bar's denominator is THIS STAGE, not the
+     campaign: a later stage's configs are built from a baseline that does not
+     exist yet, so only the running one has a known list. The header meanwhile
+     prints the campaign's estimate. Showing one and not the other made the
+     other look like a mistake - "1 of 9" under a log saying "36 to run". */
+  const chained = !!st.stage;
+  const head = chained
+    ? h`<b>Measuring</b> &mdash; ${st.stage} &middot; ${st.done} of ${st.total || "?"}
+        &middot; ~${st.planned || "?"} planned for the campaign, ${mins} min elapsed`
+    : h`<b>Measuring</b> &mdash; ${st.done} of ${st.total || "?"} configs, ${mins} min elapsed`;
   return h`<div class="running">
-    <p><b>Measuring</b> &mdash; ${st.done} of ${st.total || "?"} configs, ${mins} min elapsed
+    <p>${raw(head)}
       ${raw(st.cancelling ? '<span style="color:var(--warn)">&middot; stopping</span>' : "")}</p>
+    ${raw(chained ? h`<p class="hint" style="margin:-2px 0 8px">The bar tracks the stage that is
+      running. Chained, the stages after it are built from a baseline that has not been measured
+      yet, so their contents are not known in advance &mdash; the campaign figure is an estimate
+      from the unchained grid and can move.</p>` : "")}
     <div class="prog"><i style="width:${pct}%"></i></div>
     <div class="actions">
       <button class="ghost" type="button" data-action="sweep-stop" ${
-        st.cancelling ? "disabled" : ""}>&#9632; Stop</button>
-      <span class="muted small">Stopping finishes the config in flight first, so its row is
-        complete rather than half-written. Nothing is lost either way &mdash; every row is
-        already on disk and keyed, so starting again resumes from here.</span>
+        st.aborting ? "disabled" : ""}>&#9632; ${st.cancelling && !st.aborting
+          ? "Stop now &mdash; abandon this config" : "Stop"}</button>
+      <span class="muted small">${raw(st.aborting
+        ? "Abandoning the config in flight. Its row is discarded rather than recorded, so it " +
+          "is re-measured next time rather than kept as a failure it never really was."
+        : st.cancelling
+          ? "Finishing the config in flight so its row is complete rather than half-written. " +
+            "That can be minutes at a deep fill &mdash; nearly all of a config's time is one " +
+            "blocking request to the server. <b>Press again</b> to kill it now instead."
+          : "Stopping finishes the config in flight first, so its row is complete rather than " +
+            "half-written. Nothing is lost either way &mdash; every row is already on disk and " +
+            "keyed, so starting again resumes from here.")}</span>
     </div>
     ${raw(st.log_dropped ? h`<p class="muted small">${st.log_dropped} earlier log line${
       st.log_dropped == 1 ? "" : "s"} dropped</p>` : "")}
@@ -1192,13 +1488,43 @@ function sweepAllRows(){
 function rowFlags(r){
   const f = [];
   if(r.spilled) f.push(["spilled", "Loaded, but over-committed: WDDM spilled into shared " +
-    "system memory instead of failing. The row says ok and the speed is off a cliff."]);
+    "system memory instead of failing. The row says ok and the speed is off a cliff." +
+    /* The EXCESS over the rest of the ladder, never the raw counter. Shared Usage
+       counts host memory this process holds on purpose - pinned staging buffers,
+       --no-mmproj-offload - so every healthy row reads in the hundreds of MiB. */
+    (r.shared_excess != null ? " " + Math.round(r.shared_excess) +
+      " MiB more host memory than the rest of its ladder." : "")]);
+  /* Deduced from the campaign's own floors rather than read from a counter, so it is
+     shown but NOT treated as untrustworthy: the fastest row in one real campaign carried
+     this signature, because the extra layer bought more than the displaced memory cost. */
+  else if(r.spill_inferred) f.push(["at the wall", "This config could not grow: " +
+    Math.round(r.spill_inferred) + " MiB moved out of VRAM into system RAM, deduced from a " +
+    "floor that fell that far below the rest of the campaign. Still a real measurement - a " +
+    "ladder slowing at its top rung is the wall being found."]);
+  /* Not a bad row - the decode figure is fine, it comes from the warm passes.
+     Only PREFILL is unusable: the pass it was taken from also paid the one-time
+     cost of faulting CPU-resident weights in, which a shallow prompt cannot
+     amortise. Measured, ~100s of it on an ncmoe config at fill 2048. */
+  if(r.prefill_warm !== true && r.prefill_tok_s)
+    f.push(["prefill unwarmed", "The prefill figure on this row includes one-time load cost " +
+      "- lazily-faulted CPU-resident weights and kernel init - because it was taken from the " +
+      "first request after the server came up. At a shallow fill that dominates it: 2,065 " +
+      "tokens took ~110s where the rate implies ~8s. Decode is unaffected; it comes from the " +
+      "warm passes. Re-measure for a prefill number you can compare."]);
+  if(r.templated === false) f.push(["no template", "This backend had no /apply-template, so " +
+    "the model was handed raw text with nothing marking it as a request and merely continued " +
+    "the document. Not comparable with templated rows."]);
   if(r.corpus_repeated && r.config && r.config.spec && r.config.spec !== "none")
     f.push(["filler repeats", "The prompt had to repeat to reach this depth, which inflates " +
       "any speculative acceptance rate. Compare only against other rows at this depth."]);
   if(r.distinct_ratio != null && r.distinct_ratio < 0.5)
     f.push(["looping", "Only " + Math.round(100 * r.distinct_ratio) + "% of 8-word windows " +
       "were distinct - the model was repeating itself, so this speed is not real work."]);
+  if(r.copyback_ratio != null && r.copyback_ratio > 0.5)
+    f.push(["copying", Math.round(100 * r.copyback_ratio) + "% of the output was a verbatim " +
+      "copy of the prompt - the model stopped generating and echoed its context back, which " +
+      "distinct_ratio cannot see and which inflates speculative acceptance exactly like " +
+      "looping. Not real work."]);
   return f;
 }
 
@@ -1221,8 +1547,23 @@ function sweepRow(r, i, pickable){
   const c = r.config || {}, flags = rowFlags(r);
   const failed = r.status && r.status !== "ok";
   const key = rowKey(r);
-  if(pickable) PICKABLE[key] = r;
-  const on = SWEEP.pickKey == null ? (pickable && i === 0) : SWEEP.pickKey === key;
+  if(pickable){
+    PICKABLE[key] = r;
+    // The FIRST pickable row to render adopts the selection outright, instead
+    // of merely drawing itself checked and leaving SWEEP.pickKey null.
+    //
+    // Drawing it checked without recording it was two bugs at once. Pressing
+    // Generate with nothing clicked fell through to sweepAllRows()[0], which
+    // before any Analyze is empty - so a page showing a plainly selected row
+    // answered "Analyze a model first". And once a model HAD been analyzed,
+    // two tables each drew their own row 0 checked under one radio name, so
+    // the browser showed the campaign's row selected while the script was
+    // built from the results table's - silently the wrong row, which is worse.
+    //
+    // Now exactly one radio is ever checked, and it is the one that is used.
+    if(SWEEP.pickKey == null) SWEEP.pickKey = key;
+  }
+  const on = pickable && SWEEP.pickKey === key;
   return h`<tr class="${on && pickable ? "best" : ""}">
     <td>${raw(pickable ? h`<input type="radio" name="swpick" data-action="sweep-pick"
       data-key="${key}" ${on ? "checked" : ""}>` : "")}</td>
@@ -1282,7 +1623,8 @@ function sweepResults(){
 /* -- 4. the launcher ------------------------------------------------------ */
 const SAMPLERS = ["temp", "top_k", "top_p", "min_p", "repeat_penalty",
                   "presence_penalty"];
-const SCRIPT_FIELDS = ["swport", "swhost", "swload", "sm_tmplfile", "sm_tmplkw"]
+const SCRIPT_FIELDS = ["swport", "swhost", "swload", "sm_tmplfile", "sm_tmplkw",
+                       "sm_reason", "sm_reasonpre"]
   .concat(SAMPLERS.map(k => "sm_" + k));
 
 /** Read the launch-script pane's inputs into SWEEP.form.
@@ -1323,14 +1665,20 @@ function sweepScript(){
     ? h`the <b>measured</b> row selected above (${(row.tok_s || 0).toFixed(2)} tok/s)`
     : h`the planner's <b>predicted</b> split &mdash; nothing has been measured for this model yet,
         and the script will say so`;
-  return h`<div style="margin-top:20px">
-    <p class="sublabel">LAUNCH SCRIPT</p>
-    <p class="note">Built from ${raw(src)}. It resolves the llama.cpp backend fresh at every
-      launch, puts the vendor CUDA libraries on the path (without them the process dies with
-      <span class="mono">STATUS_DLL_NOT_FOUND</span> and no message), writes a dated log file,
-      and uses <span class="mono">--load-mode</span> and
-      <span class="mono">--spec-draft-n-max</span> rather than the deprecated and removed
-      spellings that are accepted and then silently ignored.</p>
+  /* No heading here. This renders INTO the "Launch script" card, which already
+     has one - the sublabel was left behind when the block moved out of the
+     "Measure real speed" card into its own, and printed the title twice. */
+  return h`<div>
+    <p class="note">Built from ${raw(src)}.</p>
+    <details class="adv"><summary>What the script takes care of</summary>
+      <p class="hint">Resolves the llama.cpp backend fresh at every launch, so a pinned path
+        cannot stop existing when LM Studio updates. Puts the vendor CUDA libraries on the path
+        &mdash; without them the process dies with <span class="mono">STATUS_DLL_NOT_FOUND</span>
+        and no message at all. Writes a dated log file, because llama.cpp does not rotate one.
+        Uses <span class="mono">--load-mode</span> and
+        <span class="mono">--spec-draft-n-max</span> rather than the deprecated spellings that
+        are accepted and then silently ignored.</p>
+    </details>
     <div class="chips">${raw(shells)}</div>
     <div class="row" style="margin-top:10px">
       <div class="field"><label for="swport">Port</label>
@@ -1379,6 +1727,36 @@ function sweepScript(){
           <b>server defaults</b>: a client that sends its own
           <span class="mono">chat_template_kwargs</span> wins for that request.</p>
       </div>
+      <div class="row">
+        <div class="field">
+          <label for="sm_reason">Thinking</label>
+          <select id="sm_reason">
+            <option value="auto"${fv('sm_reason') === 'on' || fv('sm_reason') === 'off' ? "" : " selected"}>auto — detect from the template</option>
+            <option value="on"${fv('sm_reason') === 'on' ? " selected" : ""}>on</option>
+            <option value="off"${fv('sm_reason') === 'off' ? " selected" : ""}>off</option>
+          </select>
+          <p class="hint">Replaces <span class="mono">enable_thinking</span> in the kwargs above,
+            which current builds accept and then warn about:
+            <i>&ldquo;Setting 'enable_thinking' via --chat-template-kwargs is deprecated. Use
+            --reasoning on / --reasoning off instead.&rdquo;</i></p>
+        </div>
+        <div class="field">
+          <label for="sm_reasonpre">Preserve thinking across history</label>
+          <select id="sm_reasonpre">
+            <option value="default"${fv('sm_reasonpre') === 'on' || fv('sm_reasonpre') === 'off' ? "" : " selected"}>template default</option>
+            <option value="on"${fv('sm_reasonpre') === 'on' ? " selected" : ""}>on</option>
+            <option value="off"${fv('sm_reasonpre') === 'off' ? " selected" : ""}>off</option>
+          </select>
+          <p class="hint">Keeps the reasoning trace for the <b>whole</b> history, not just the
+            last assistant message. This one <b>cannot</b> be set from the kwargs above even
+            when the template has a variable for it (Qwen3 spells it
+            <span class="mono">preserve_thinking</span>): llama-server strips
+            <span class="mono">&lt;think&gt;</span> out of the history <i>before</i> rendering,
+            so by the time the template reads the variable there is nothing left to preserve.
+            Only shows from the second turn on &mdash; which is how it survives a benchmark and
+            then quietly loses the trace in daily use.</p>
+        </div>
+      </div>
     </details>
     <details class="adv" ${raw(fopen(1))}><summary>Sampling (optional)</summary>
       <p class="hint">Left blank, no sampler flags are written at all &mdash; a made-up default
@@ -1423,6 +1801,12 @@ function sweepScriptBody(){
            sampling: sampling,
            chat_template_file: val("sm_tmplfile"),
            chat_template_kwargs: val("sm_tmplkw"),
+           // "auto"/"default" are llama.cpp's own answers, so they are sent as
+           // null - meaning no flag at all rather than a flag that restates the
+           // default and would then be wrong if the default ever moved.
+           reasoning: val("sm_reason") === "auto" ? null : val("sm_reason"),
+           reasoning_preserve: val("sm_reasonpre") === "default"
+             ? null : val("sm_reasonpre"),
            port: parseInt(($("swport") || {}).value || 8080),
            bind_host: ($("swhost") || {}).value || "127.0.0.1",
            load_mode: ($("swload") || {}).value || "none",
@@ -1455,7 +1839,17 @@ async function loadHistory(){
   }catch(e){ SWEEP.campaigns = []; }
 }
 
-function campaignId(g){ return g.model + " " + g.gpu + " " + g.file; }
+/* prompt_id and template_id are part of the identity, not decoration: the same
+   model on the same build can hold several campaigns that asked different
+   questions, and they must not open each other. */
+function campaignId(g){
+  return [g.model, g.gpu, g.file, g.prompt_id || "", g.template_id || ""]// A separator that survives an HTML attribute round trip. This id goes out
+  // as data-id and comes back through el.dataset.id, and a control
+  // character does NOT make that trip: it is dropped, the returned id stops
+  // matching the one campaignRow() computes, and every campaign silently
+  // refuses to open.
+  .join("~");
+}
 
 async function openCampaign(id){
   if(SWEEP.openCampaign === id){         // second click closes it
@@ -1469,7 +1863,11 @@ async function openCampaign(id){
   const g = (SWEEP.campaigns || []).find(x => campaignId(x) === id);
   if(!g) return;
   const q = "model=" + encodeURIComponent(g.model) + "&gpu=" + encodeURIComponent(g.gpu) +
-            "&file=" + encodeURIComponent(g.file);
+            "&file=" + encodeURIComponent(g.file) +
+            // always sent, even empty - "" narrows to the rows that have none,
+            // where omitting the key would widen to all of them
+            "&pid=" + encodeURIComponent(g.prompt_id || "") +
+            "&tid=" + encodeURIComponent(g.template_id || "");
   try{ SWEEP.insights = await (await fetch("/api/speed/insights?" + q)).json(); }
   catch(e){ SWEEP.insights = { ok: false, error: String(e) }; }
   drawSweep({ grid: false, results: false, history: true });
@@ -1486,9 +1884,16 @@ function campaignRow(g){
   return h`<div class="camp ${open ? "open" : ""}">
     <button class="camprow" type="button" data-action="sweep-open" data-id="${id}">
       <span class="mono">${g.model}</span>
-      <span class="muted small">${g.gpu || "?"} &middot; ${g.backend} &middot; ${span}</span>
+      <span class="muted small">${g.gpu || "?"} &middot; ${g.backend} &middot; ${span}
+        &middot; ${raw(g.prompt_id ? "prompt " + h`${g.prompt_id.slice(0, 8)}`
+                       : "<i>pre-freeze prompt</i>")}
+        &middot; ${raw(g.chat_template
+                       ? "template " + h`${g.chat_template}`
+                       : (g.template_id ? "template " + h`${g.template_id.slice(0, 8)}`
+                          : "<i>model&rsquo;s own template</i>"))}</span>
       <span class="campnum">${g.n_ok}/${g.n_rows} ok${raw(
-        g.n_untrusted ? " &middot; " + g.n_untrusted + " flagged" : "")}</span>
+        g.n_untrusted ? " &middot; " + g.n_untrusted + " flagged" : "")}${raw(
+        g.n_ungated ? " &middot; " + g.n_ungated + " pre-copy-gate" : "")}</span>
       <span class="campbest">${g.best_tok_s ? g.best_tok_s.toFixed(2) + " tok/s" : "—"}</span>
       <span class="campcaret">${open ? "▾" : "▸"}</span>
     </button>
@@ -1534,7 +1939,8 @@ function axisPanel(ax){
       context, KV quant, fill depth or pass count are different experiments and never meet in
       one comparison &mdash; putting them together would manufacture an effect out of the
       difference between the runs.${raw(ax.n_excluded ? h` ${ax.n_excluded} row(s) are excluded
-      from every number here: they spilled into shared memory, or caught the model looping.` : "")}</p>
+      from every number here: they spilled into shared memory, looped, or copied the prompt
+      back verbatim.` : "")}</p>
     <div class="tablewrap"><table class="axtable"><tbody>${raw(body)}</tbody></table></div>`;
 }
 
@@ -1632,8 +2038,12 @@ const ACTIONS = {
   "sweep-plan":  () => sweepPlan(),
   "sweep-start": () => sweepStart(),
   "sweep-stop":  () => sweepStop(),
+  // Picking a row IS the step-3 question - "build me this one" - so it goes
+  // there rather than leaving you to find the tab yourself.
   "sweep-pick":  el => { SWEEP.pickKey = el.dataset.key; SWEEP.script = null;
+                         if(stepNow() !== "script"){ setStep("script"); return; }
                          drawSweep({ grid: false, script: true, history: true }); },
+  "set-step":    el => setStep(el.dataset.step),
   "sweep-open":  el => openCampaign(el.dataset.id),
   "sweep-shell": el => { SWEEP.shell = el.value; SWEEP.script = null;
                          drawSweep({ grid: false, results: false, script: true }); },

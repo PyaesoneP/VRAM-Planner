@@ -913,6 +913,27 @@ def _run_suite(require_refs, tmp, skipped_real):
             "m.gguf", base, shell="bash", sampling={"temp": 1.0, "min_p": ""})))
         if "--temp" not in run or "--min-p" in run:
             gen_ok = False; why.append("blank sampler handling")
+        # The browser assets, checked as BYTES. A stray control character in a
+        # string literal is invisible in an editor, parses fine, and passes
+        # node --check - and then breaks at runtime in a way that points
+        # nowhere near itself. A NUL landed in campaignId()'s separator, the id
+        # went out as data-id, came back through el.dataset.id with the NUL
+        # dropped, stopped matching the id campaignRow() computed, and every
+        # campaign silently refused to open. Nothing in the file looked wrong.
+        ui_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ui")
+        ctl_bad = []
+        for fn in sorted(os.listdir(ui_dir)) if os.path.isdir(ui_dir) else []:
+            if not fn.endswith((".js", ".css", ".html")):
+                continue
+            raw_b = open(os.path.join(ui_dir, fn), "rb").read()
+            for i, b in enumerate(raw_b):
+                if b < 9 or 13 < b < 32:
+                    ctl_bad.append("%s byte %d = 0x%02x (line %d)"
+                                   % (fn, i, b, raw_b[:i].count(b"\n") + 1))
+                    break
+        if ctl_bad:
+            gen_ok = False; why.append("control chars: " + "; ".join(ctl_bad))
+
         print("  SCRIPT no dead flags, flags match config, blank samplers omitted%s  %s"
               % ("" if gen_ok else "  " + "; ".join(why[:4]), "OK" if gen_ok else "FAIL"))
 
@@ -957,6 +978,77 @@ def _run_suite(require_refs, tmp, skipped_real):
                 pass
         if template_args(None, {"b": 1, "a": 2})[1] != '{"a":2,"b":1}':
             tmpl_ok = False; twhy.append("dict kwargs not serialised stably")
+
+        # Windows Explorer's "Copy as path" - the normal way anyone produces a
+        # path to paste - always wraps it in double quotes, and they are not
+        # part of the filename. Left on, Test-Path fails for a file that plainly
+        # exists and the launcher dies on its own guard.
+        want_p = "C:\\d\\chat.jinja"
+        for given in ('"C:\\d\\chat.jinja"', "'C:\\d\\chat.jinja'",
+                      '  "C:\\d\\chat.jinja"  '):
+            if template_args(given, None)[0] != want_p:
+                tmpl_ok = False; twhy.append("quotes kept in %r" % given)
+        # ...but a quote that is part of the name survives, and an unbalanced
+        # one is not a wrapper
+        for keep in ("C:\\it's\\chat.jinja", '"C:\\d\\chat.jinja'):
+            if template_args(keep, None)[0] != keep:
+                tmpl_ok = False; twhy.append("mangled %r" % keep)
+
+        # The header's divergence line. A row that names no sampler was measured
+        # GREEDY - that is a fact about it, not a gap - and greedy is
+        # speculation's best case, so a script running temp 1.0 must not quote
+        # the acceptance rate as though it applied.
+        from .launch import _config_divergence
+        meas = {"config": {"ngl": 28, "spec": "draft-mtp", "spec_n_max": 2}}
+        dv = _config_divergence(meas["config"], meas,
+                                {"temp": 1.0, "top_k": 20, "top_p": 0.95,
+                                 "repeat_penalty": 1.05})
+        if "temp 0.0->1.0" not in dv or "top_k 0->20" not in dv:
+            tmpl_ok = False; twhy.append("greedy baseline not reported: %r" % dv)
+        # rep_pen/pres_pen are spelled differently on the two sides; without the
+        # alias they could never diverge however far apart they were set
+        if "rep_pen 1.0->1.05" not in dv:
+            tmpl_ok = False; twhy.append("rep_pen alias not applied: %r" % dv)
+        # and matching samplers still report nothing
+        if _config_divergence(meas["config"], meas,
+                              {"temp": 0.0, "top_k": 0, "top_p": 1.0}):
+            tmpl_ok = False; twhy.append("greedy-vs-greedy reported a difference")
+
+        # --reasoning-preserve. The trap: a Qwen3 template HAS a preserve_thinking
+        # variable, so setting it in --chat-template-kwargs looks like it works -
+        # but llama-server strips <think> out of the history BEFORE rendering, so
+        # the variable has nothing left to act on. It has to be a real flag.
+        from .launch import reasoning_args
+        for shell, want in (("powershell", "$ReasoningPreserve = 'on'"),
+                            ("bash", 'REASONINGPRESERVE="${REASONINGPRESERVE:-on}"')):
+            t = "\n".join(command_lines(launch_script(
+                "m.gguf", base, shell=shell, reasoning="on",
+                reasoning_preserve="on")))
+            # BOTH branches are in the script on purpose - it is a parameter, so
+            # it has to be flippable at launch without regenerating the file.
+            # What the caller chose is the DEFAULT, not the only branch present.
+            if "--reasoning-preserve" not in t or "--no-reasoning-preserve" not in t:
+                tmpl_ok = False; twhy.append("%s has only one preserve branch" % shell)
+            if want not in t:
+                tmpl_ok = False; twhy.append("%s default is not 'on'" % shell)
+            if "--reasoning" not in t:
+                tmpl_ok = False; twhy.append("%s lost --reasoning" % shell)
+            # unset stays unset: 'default' is a real third value here, because
+            # the flag pair's own default is "whatever the template says"
+            blank = "\n".join(command_lines(launch_script("m.gguf", base, shell=shell)))
+            if "reasoning" in blank.lower():
+                tmpl_ok = False; twhy.append("%s emits reasoning when unset" % shell)
+        if reasoning_args(None, None) != (None, None) \
+                or reasoning_args("ON", True) != ("on", "on") \
+                or reasoning_args(None, False) != (None, "off") \
+                or reasoning_args(None, "default") != (None, None):
+            tmpl_ok = False; twhy.append("reasoning_args normalisation")
+        for bad in (("yes", None), (None, "maybe")):
+            try:
+                reasoning_args(*bad)
+                tmpl_ok = False; twhy.append("accepted %r" % (bad,))
+            except ValueError:
+                pass
         print("  TMPL  --jinja precedes the template flags, bad kwargs refused%s  %s"
               % ("" if tmpl_ok else "  " + "; ".join(twhy[:4]), "OK" if tmpl_ok else "FAIL"))
 
@@ -991,7 +1083,27 @@ def _run_suite(require_refs, tmp, skipped_real):
                    and "--load-mode" in "\n".join(command_lines(miss)))
         print("  TMPL  unresolved model still generates, and says so  %s"
               % ("OK" if lost_ok else "FAIL"))
-        script_ok = probe_ok and gen_ok and tmpl_ok and lost_ok
+
+        # 11e) A launcher built from a measured row must SAY when the launched
+        # config differs from the row's config. The row's tok/s and fit evidence
+        # belong to the row as measured - a script that adds MTP on top of a row
+        # measured without it, carrying the row's ngl into a config that OOMs on
+        # it, would otherwise look exactly like the row it is not.
+        from .launch import _config_divergence
+        rowcfg = dict(base, spec="none")
+        meas = {"tok_s": 9.45, "config": rowcfg}
+        same = launch_script("m.gguf", dict(base, spec="none"), shell="bash",
+                             measured=meas)
+        div = launch_script("m.gguf", dict(base, spec="draft-mtp", spec_n_max=2),
+                            shell="bash", measured=meas)
+        div_ok = ("DIFFERS from the measured row" in div
+                  and "spec none->draft-mtp" in div
+                  and "DIFFERS" not in same
+                  # a config that omits a knob groups with one that never set it
+                  and _config_divergence(dict(base), meas) == "")
+        print("  SCRIPT launcher says when the launched config differs from the row  %s"
+              % ("OK" if div_ok else "FAIL"))
+        script_ok = probe_ok and gen_ok and tmpl_ok and lost_ok and div_ok
     except Exception as e:
         script_ok = False
         print("  SCRIPT raised %s: %s  FAIL" % (type(e).__name__, e))
@@ -1000,6 +1112,7 @@ def _run_suite(require_refs, tmp, skipped_real):
     # 12) the job runner: one at a time, and a cancel that is actually observed
     try:
         import threading, time as _time
+        import time as _t
         from .job import Job
         j = Job()
         gate, seen = threading.Event(), {}
@@ -1103,6 +1216,21 @@ def _run_suite(require_refs, tmp, skipped_real):
                            for v in (0.0, 0.5, 1.0)}) == 3)
         print("  CHAIN sampler ladders resume distinctly, old rows key unchanged  %s"
               % ("OK" if key_ok else "FAIL"))
+
+        # --speed-axes and --speed-chain are mutually exclusive: chaining rebuilds
+        # each STAGE from the previous winner and an explicit ladder has no
+        # stages. The ladder is the more specific instruction and must win, out
+        # loud - silently running the staged grid instead would burn the same
+        # hours measuring something nobody asked for.
+        from .bench import resolve_search
+        ax = {"kv": ["f16", "q8_0"]}
+        excl_ok = (resolve_search(ax, True)[0] is False       # ladder wins
+                   and resolve_search(ax, True)[1]            # and says so
+                   and resolve_search(None, True) == (True, None)   # chain alone
+                   and resolve_search(ax, False) == (False, None))  # axes alone
+        print("  CHAIN --speed-axes overrides --speed-chain, and says so  %s"
+              % ("OK" if excl_ok else "FAIL"))
+        chain_ok = chain_ok and excl_ok
         chain_ok = chain_ok and samp_ok and key_ok
         print("  CHAIN untrustworthy/incomparable rows refused, 2%% margin held%s  %s"
               % ("" if chain_ok else "  " + "; ".join(cwhy[:3]), "OK" if chain_ok else "FAIL"))
@@ -1145,8 +1273,515 @@ def _run_suite(require_refs, tmp, skipped_real):
                   and abs(dep[0]["drop_pct"] - 50.0) < 0.1)
         print("  FIND  pareto frontier %s, depth curve needs two depths  %s"
               % (got, "OK" if (par_ok and dep_ok) else "FAIL"))
+
+        # A looping row must be VISIBLE while the campaign runs, not only dropped
+        # from conclusions an hour later. The two must also use one threshold: a
+        # row warned about and then kept - or dropped having never been flagged -
+        # is worse than either rule alone.
+        from .bench import _fmt_row, trustworthy, LOOP_RATIO
+        loop = row(2.85, {"spec": "draft-mtp", "spec_n_max": 2},
+                   distinct_ratio=0.184, accept_rate=1.0)
+        quiet = row(2.85, {"spec": "draft-mtp", "spec_n_max": 2},
+                    distinct_ratio=1.0, accept_rate=1.0)
+        edge = row(2.85, distinct_ratio=LOOP_RATIO)          # exactly at the line
+        lt = _fmt_row(loop["config"], loop)
+        # the acceptance rate is the trap: 100% on looping text reads as the
+        # drafter excelling, so the line has to say which one it is
+        warn_ok = ("LOOPING" in lt and "82%" in lt and "not the drafter" in lt
+                   and "LOOPING" not in _fmt_row(quiet["config"], quiet)
+                   and "LOOPING" not in _fmt_row(edge["config"], edge))
+        # non-speculative looping still warns, but without the acceptance clause
+        plain = row(2.10, distinct_ratio=0.184)
+        pt = _fmt_row(plain["config"], plain)
+        warn_ok = warn_ok and "LOOPING" in pt and "drafter" not in pt
+        # one threshold, both directions
+        gate_ok = (not trustworthy(loop) and trustworthy(quiet)
+                   and trustworthy(edge))
+        print("  FIND  looping row warned at run time and gated by one threshold  %s"
+              % ("OK" if (warn_ok and gate_ok) else "FAIL"))
+
+        # Copying the prompt back is the second degenerate mode, and it is the
+        # one distinct_ratio cannot see: a verbatim copy's 8-word windows are
+        # all distinct, so it reads a clean 1.00 - healthy - while inflating
+        # speculative acceptance exactly as much as looping does. The copy gate
+        # must mark the row at run time and refuse it, at one shared threshold.
+        from .bench import (COPY_RATIO, verify_config,
+                            _copyback_ratio, _distinct_ratio)
+        copied = row(2.9, {"spec": "draft-mtp", "spec_n_max": 2},
+                     distinct_ratio=1.0, copyback_ratio=0.96, accept_rate=1.0)
+        ct = _fmt_row(copied["config"], copied)
+        copy_ok = ("COPYING" in ct and "96%" in ct and "not the drafter" in ct
+                   and not trustworthy(copied) and "LOOPING" not in ct)
+        # a copy is one mode and a loop is the other; the note names what happened
+        plainc = row(2.9, distinct_ratio=1.0, copyback_ratio=0.9)
+        pt2 = _fmt_row(plainc["config"], plainc)
+        copy_ok = copy_ok and ("COPYING" in pt2 and "drafter" not in pt2
+                               and not trustworthy(plainc))
+        # a row that loops on the prompt's own text is BOTH modes - still marked,
+        # still refused, named as the copy it is
+        both = row(2.9, distinct_ratio=0.1, copyback_ratio=0.9)
+        bt = _fmt_row(both["config"], both)
+        copy_ok = copy_ok and ("COPYING" in bt and "excluded" in bt
+                               and not trustworthy(both))
+        # exactly at the line passes, like the looping edge above
+        edgec = row(2.9, distinct_ratio=1.0, copyback_ratio=COPY_RATIO)
+        copy_ok = copy_ok and trustworthy(edgec)
+        # the metric itself: verbatim windows hit, original prose misses, and a
+        # copy is exactly the case distinct_ratio calls healthy
+        prompt = ("alpha beta gamma delta epsilon zeta eta theta iota kappa "
+                  "lambda mu nu xi omicron pi rho sigma tau upsilon chi psi omega")
+        verbatim = ("alpha beta gamma delta epsilon zeta eta theta iota kappa "
+                    "lambda mu nu")
+        fresh = "completely different words that have no relation to the corpus"
+        metric_ok = (_copyback_ratio(verbatim, prompt) == 1.0
+                     and _copyback_ratio(fresh, prompt) == 0.0
+                     and _distinct_ratio(verbatim) == 1.0
+                     and _copyback_ratio("a b c", prompt) is None)
+        print("  FIND  copying detected, marked, and gated (distinct_ratio misses it)  %s"
+              % ("OK" if (copy_ok and metric_ok) else "FAIL"))
+
+        # /completion is raw continuation. An instruction-tuned model handed a
+        # wall of source with no role markers has nothing telling it a REQUEST
+        # was made, so it continues the document - which is what produced 23
+        # unusable rows. The prompt now goes through the model's own chat
+        # template, and a build too old to offer one must say so per row rather
+        # than quietly reproducing the old behaviour.
+        import hashlib
+        from .bench import (apply_template, PROMPT_SCHEME, prompt_identity,
+                            corpus_text)
+        calls = []
+
+        def fake_post(url, path, payload, timeout=600):
+            calls.append(path)
+            if path == "/apply-template":
+                return {"prompt": "<|im_start|>user\n"
+                                  + payload["messages"][0]["content"]
+                                  + "<|im_end|>\n<|im_start|>assistant\n"}
+            raise RuntimeError("no such endpoint")
+
+        import vram_planner.bench as _b
+        real_post = _b._post
+        try:
+            _b._post = fake_post
+            got, applied = apply_template("u", "hello")
+            tmpl_ok = (applied is True and "<|im_start|>user" in got
+                       and "hello" in got)
+            # a build without the endpoint falls back rather than failing the
+            # campaign - but reports it, so the row can be marked RAW
+            _b._post = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("404"))
+            got2, applied2 = apply_template("u", "hello")
+            tmpl_ok = tmpl_ok and got2 == "hello" and applied2 is False
+        finally:
+            _b._post = real_post
+        # an untemplated row is named even when its output looks healthy: the
+        # defect is in how the row was produced, not in what came out
+        rawrow = row(3.9, distinct_ratio=1.0, copyback_ratio=0.0, templated=False)
+        rt = _fmt_row(rawrow["config"], rawrow)
+        okrow = row(3.9, distinct_ratio=1.0, copyback_ratio=0.0, templated=True)
+        tmpl_ok = (tmpl_ok and "RAW" in rt
+                   and "RAW" not in _fmt_row(okrow["config"], okrow))
+        # changing HOW a prompt is assembled must re-key it, or rows measured on
+        # raw continuation would merge with templated ones and average two
+        # different experiments together
+        h = hashlib.sha256()
+        h.update(corpus_text().encode("utf-8"))
+        h.update(_b.INSTRUCTION.encode("utf-8"))
+        scheme_ok = (h.hexdigest() != prompt_identity()
+                     and PROMPT_SCHEME in ("chat",))
+        print("  FIND  prompt goes through the chat template, raw builds say so  %s"
+              % ("OK" if (tmpl_ok and scheme_ok) else "FAIL"))
+
+        # A campaign starts a server every few minutes on the same port. The
+        # previous socket is still in TIME_WAIT, llama-server does not set
+        # SO_REUSEADDR, and the row dies as EXIT - which reads as a crash, so
+        # the config looks like evidence about the wall when it is a harness
+        # fault. Two rows of the 32k campaign were lost exactly this way.
+        import socket as _sock
+        from .bench import free_port, BENCH_PORT
+        held = _sock.socket()
+        held.bind(("127.0.0.1", 0))
+        held.listen(1)
+        taken = held.getsockname()[1]
+        try:
+            alt = free_port(taken)
+            port_ok = (alt != taken and 1024 < alt < 65536
+                       # and an unused port is handed back unchanged, so the
+                       # ordinary case still lands on the documented default
+                       and free_port(BENCH_PORT) in (BENCH_PORT,))
+            # probing must not itself leave the port unusable for the server
+            port_ok = port_ok and free_port(alt) == alt
+        finally:
+            held.close()
+        print("  BENCH busy port falls back instead of dying as EXIT  %s"
+              % ("OK" if port_ok else "FAIL"))
+
+        # Stage D could not succeed. A and B pick the fastest split that FITS,
+        # so it is the one with the least headroom; D then asks for a draft KV
+        # cache llama.cpp keeps at f16 whatever -ctk says. It OOMed on both
+        # models tried and speculation was the WINNER on both once given room:
+        # ngl 31 -> 28 (3.95 vs 3.25), ncmoe 29 -> 34 (54.87 vs 47.17).
+        from .bench import _spec_retry, SPEC_RETRY_RUNGS
+        moe, dense = {"is_moe": True, "n_layers": 41}, {"is_moe": False, "n_layers": 65}
+        oom, okrow = {"status": "oom"}, {"status": "ok"}
+
+        def walk(c0, facts, key):
+            t, c, seen = {}, dict(c0), [c0[key]]
+            while True:
+                n = _spec_retry(c, oom, facts, t)
+                if n is None:
+                    return seen
+                c = n; seen.append(c[key])
+        # The directions are OPPOSITE and getting it backwards walks into the
+        # wall: more n_cpu_moe frees VRAM, more ngl consumes it.
+        retry_ok = (
+            34 in walk({"spec": "draft-mtp", "spec_n_max": 2, "ncmoe": 29}, moe, "ncmoe")
+            and 28 in walk({"spec": "draft-mtp", "spec_n_max": 2, "ngl": 31}, dense, "ngl")
+            # a row that LOADED is not retried
+            and _spec_retry({"spec": "draft-mtp", "ncmoe": 29}, okrow, moe, {}) is None
+            # n-gram speculators allocate no second cache, so their OOM is about
+            # the model and walking would only prove it more slowly
+            and _spec_retry({"spec": "ngram-mod", "ncmoe": 29}, oom, moe, {}) is None
+            and _spec_retry({"spec": "none", "ncmoe": 29}, oom, moe, {}) is None
+            # bounded, or an OOM that is not about the draft cache marches the
+            # whole ladder proving the model does not fit at all
+            and len(walk({"spec": "draft-mtp", "ncmoe": 0}, moe, "ncmoe"))
+                == SPEC_RETRY_RUNGS + 1
+            # and it cannot walk off either end
+            and _spec_retry({"spec": "draft-mtp", "ncmoe": 41}, oom, moe, {}) is None
+            and _spec_retry({"spec": "draft-mtp", "ngl": 1}, oom, dense, {}) is None)
+        print("  SPEC  a draft config that OOMs is retried with room, not written off  %s"
+              % ("OK" if retry_ok else "FAIL"))
+        port_ok = port_ok and retry_ok
+
+        # A knob that silently does not apply is worse than one that is refused.
+        # rounds re-runs the stages from the WINNER, so without chaining there is
+        # no winner to re-run them from - it was accepted in that state and did
+        # precisely nothing, with nothing said.
+        from .bench import resolve_rounds
+        rnd_ok = (resolve_rounds(True, 3) == (3, None)
+                  and resolve_rounds(True, 1) == (1, None)
+                  and resolve_rounds(False, 1) == (1, None)
+                  and resolve_rounds(False, 3)[0] == 1
+                  and "ignored" in (resolve_rounds(False, 3)[1] or "")
+                  # nonsense normalises rather than raising mid-campaign
+                  and resolve_rounds(True, 0) == (1, None)
+                  and resolve_rounds(True, None) == (1, None))
+        # ...and the two controls that cannot act are hidden by CSS, not by JS:
+        # the grid pane is rewritten every 1.5s while a campaign runs, so a
+        # script toggle is one missed redraw away from being wrong.
+        css = open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                "ui", "app.css"), encoding="utf-8").read()
+        rnd_ok = (rnd_ok and "#swchain:not(:checked)) > #swroundsfield" in css
+                  and "#swverify:not(:checked)) > #swverifyfield" in css)
+        print("  ROUND rounds refused without chaining, dead controls hidden  %s"
+              % ("OK" if rnd_ok else "FAIL"))
+        port_ok = port_ok and rnd_ok
+
+        # prefill is taken from the FIRST request after the server comes up, so
+        # it also paid for faulting CPU-resident weights in. bench_one already
+        # throws that pass's DECODE away for the same reason; it kept its
+        # prefill. A tiny throwaway generation now goes first, and rows say
+        # which side of that they were measured on - old ones must not be
+        # averaged with new ones as though the number meant the same thing.
+        import inspect as _i
+        src = _i.getsource(_b.bench_one)
+        warm_ok = ('row["prefill_warm"] = True' in src
+                   # the throwaway has to come BEFORE the timed cold pass, or it
+                   # warms nothing that matters
+                   and src.index("seed=999") < src.index("seed=1000")
+                   and "prefill_warm" in _i.getsource(_b._slim))
+        # the badge fires on rows lacking the flag, and only when there is a
+        # prefill figure to distrust
+        js = open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               "ui", "app.js"), encoding="utf-8").read()
+        warm_ok = warm_ok and "r.prefill_warm !== true && r.prefill_tok_s" in js
+        print("  WARM  prefill measured after the fault-in, and old rows say so  %s"
+              % ("OK" if warm_ok else "FAIL"))
+        port_ok = port_ok and warm_ok
+
+        # Stop, twice. The soft stop lands between configs and keeps the store
+        # free of half-measurements, but nearly all of a config's wall time is
+        # one blocking request to the server, so at a deep fill it is minutes
+        # away. A second press kills the server, which ends that request at
+        # once, and the abandoned row is DISCARDED - a genfail written here
+        # would be indistinguishable on disk from a real one and the next
+        # campaign would carry it forward as a wall that does not exist.
+        import time as _t
+        from .job import Job
+        class _P(object):
+            def __init__(self): self.killed = False
+            def poll(self): return None
+            def kill(self): self.killed = True
+        jb = Job()
+        stop_ok = jb.cancel() == (False, "nothing running")   # idle refuses
+        jb.status, jb.started = "running", _t.time()
+        proc = _P()
+        jb.set_live_proc(proc)
+        ok1, m1 = jb.cancel()
+        stop_ok = (stop_ok and ok1 and m1 == "stopping"
+                   and jb.cancelled() and not jb.aborting()
+                   # the first press must NOT kill: the row in flight is still
+                   # going to be finished and recorded
+                   and not proc.killed
+                   and jb.snapshot()["cancelling"] and not jb.snapshot()["aborting"])
+        ok2, m2 = jb.cancel()
+        stop_ok = (stop_ok and ok2 and m2 == "aborting"
+                   and jb.aborting() and proc.killed
+                   and jb.snapshot()["aborting"])
+        # nothing to kill between configs is not an error
+        jb2 = Job(); jb2.status, jb2.started = "running", _t.time()
+        jb2.cancel()
+        stop_ok = stop_ok and jb2.cancel()[0] and jb2.aborting()
+        print("  STOP  first press finishes the config, second abandons it  %s"
+              % ("OK" if stop_ok else "FAIL"))
+        port_ok = port_ok and stop_ok
+
+        # WDDM does not fail an allocation past the dedicated budget - it moves
+        # part of the process to system RAM and keeps going, so the row says ok
+        # while every token that touches the moved bytes crosses PCIe. The old
+        # detector could not see it: its floor test only catches a NONSENSICAL
+        # floor, and a partial demotion leaves a plausible one.
+        from .bench import (demoted, spill_note, _infer_demotion,
+                            SHARED_SPILL_MIB, FLOOR_DROP_MIB)
+        # The verdict comes from the EXCESS over the ladder, never from the raw
+        # counter. Shared Usage also counts host memory the process holds on
+        # PURPOSE - pinned staging buffers, --no-mmproj-offload - so a threshold
+        # on the absolute value fires on every healthy row. It did: 474.0 MiB
+        # flat across ngl 26/27/28 with the projector in RAM, unmoved by ngl,
+        # and the row carrying it was the fastest ever measured on that model.
+        meas_ok = (demoted({"shared_excess": SHARED_SPILL_MIB + 1})
+                   and not demoted({"shared_excess": SHARED_SPILL_MIB})
+                   # the raw reading, however large, is not the question
+                   and not demoted({"shared_mib": 9999.0})
+                   # unmeasured is not the same as clean
+                   and not demoted({"shared_excess": None})
+                   and not demoted({}))
+        note = spill_note({"shared_excess": 246.0})
+        meas_ok = meas_ok and "246" in note and "PCIe" in note
+        # mid-campaign there is no ladder, so the counter is reported as a fact
+        # and given no verdict rather than being called a spill
+        raw = spill_note({"shared_mib": 474.0})
+        meas_ok = meas_ok and "474" in raw and "SPILLED" not in raw
+
+        # The real 65k ladder: three rungs at a flat 474.0 with the projector in
+        # RAM, all of it deliberate. Nothing here is a spill, and the fastest row
+        # is one of them - the shape that broke the first version.
+        def srow(ngl, shared, tok, **kw):
+            r = {"model": "M.gguf", "gpu": "G", "_file": "f.jsonl", "status": "ok",
+                 "tok_s": tok, "floor_mib": 1050.0 + ngl, "shared_mib": shared,
+                 "spilled": True,      # what the first detector wrote to disk
+                 "config": {"ctx": 131072, "kv": "q8_0", "ub": 512, "ngl": ngl,
+                            "fill": 65536, "mmproj_offload": False,
+                            "spec": "draft-mtp", "spec_n_max": 2}}
+            r.update(kw)
+            return r
+        flat = [srow(26, 474.0, 3.61), srow(27, 474.0, 3.86), srow(28, 474.0, 3.95)]
+        _infer_demotion(flat)
+        meas_ok = (meas_ok
+                   and all(r["shared_excess"] == 0.0 for r in flat)
+                   # ...and the stored verdict is CORRECTED, not carried forward,
+                   # or every row of that campaign stays outside trustworthy()
+                   # and best_config() has nothing left to pick
+                   and not any(r["spilled"] for r in flat)
+                   and all(trustworthy(r) for r in flat))
+        # one rung carrying 240 MiB the others do not IS the driver moving
+        # something, and that is the only thing the counter can say
+        step = flat + [srow(29, 714.0, 2.10)]
+        _infer_demotion(step)
+        meas_ok = (meas_ok and step[-1]["shared_excess"] == 240.0
+                   and step[-1]["spilled"] and not trustworthy(step[-1]))
+        # A LONE measured row has no ladder to be excess over, so nothing in the
+        # grouping can reach it - and it would otherwise keep the stored verdict
+        # of a detector that no longer exists, permanently untrustworthy. This is
+        # the real ngl 31 reference row, the only measured row in its group.
+        lone = [srow(31, 238.0, 3.25, spec="none")]
+        lone[0]["config"] = dict(lone[0]["config"], spec="none", spec_n_max=0)
+        _infer_demotion(lone)
+        meas_ok = (meas_ok and lone[0].get("shared_excess") is None
+                   and not lone[0]["spilled"] and trustworthy(lone[0]))
+        # ...unless suspect_reason() flagged it, which never used the counter
+        sus = [srow(31, 238.0, 3.25, suspect="floor_mib is negative")]
+        _infer_demotion(sus)
+        meas_ok = meas_ok and sus[0]["spilled"]
+
+        # The inference, for rows recorded before the counter existed. These are
+        # the real numbers from the ngl ladder: five rungs agreeing within 12
+        # MiB, then one that fell 246 MiB when the process could not grow.
+        def frow(ngl, floor, **kw):
+            r = {"model": "M.gguf", "gpu": "G", "_file": "f.jsonl", "status": "ok",
+                 "tok_s": 3.0, "floor_mib": floor,
+                 "config": {"ctx": 131072, "kv": "q8_0", "ub": 512, "ngl": ngl,
+                            "fill": 65536}}
+            r.update(kw)
+            return r
+
+        ladder = [frow(24, 1348.0), frow(25, 1351.9), frow(26, 1355.8),
+                  frow(27, 1356.3), frow(28, 1360.2), frow(29, 1114.1)]
+        _infer_demotion(ladder)
+        inf_ok = (ladder[-1].get("spill_inferred") > FLOOR_DROP_MIB
+                  and not any(r.get("spill_inferred") for r in ladder[:-1])
+                  # marked but NOT gated: an inference is weaker than a reading,
+                  # and a ladder slowing at its top rung is the wall being found
+                  # rather than a row to hide
+                  and not ladder[-1].get("spilled")
+                  and trustworthy(ladder[-1]))
+        # a measured row is judged on its reading, never on the inference - a
+        # measurement beats a deduction about the same fact
+        measured = ladder[:-1] + [frow(29, 1114.1, shared_mib=300.0)]
+        _infer_demotion(measured)
+        inf_ok = inf_ok and not measured[-1].get("spill_inferred")
+        # Speculation moves the floor by ~800 MiB legitimately: llama.cpp does
+        # not report the draft KV cache in alloc_gpu, so it lands in floor. The
+        # first version of this grouped across it, the median landed between the
+        # two populations, and every ORDINARY row read as a 380 MiB collapse.
+        # These are those real floors.
+        spec_mix = [frow(n, f) for n, f in
+                    ((28, 224.2), (30, 230.0), (31, 232.5), (32, 236.4))]
+        for n, f, nmax in ((28, 1000.0, 1), (26, 1049.6, 2), (28, 1058.0, 2),
+                           (28, 1118.0, 3)):
+            r = frow(n, f)
+            r["config"] = dict(r["config"], spec="draft-mtp", spec_n_max=nmax)
+            spec_mix.append(r)
+        _infer_demotion(spec_mix)
+        inf_ok = inf_ok and not any(r.get("spill_inferred") for r in spec_mix)
+        # the projector moves the floor the same way, at ~1100 MiB
+        mixed = ladder[:-1] + [frow(28, 230.0)]
+        mixed[-1]["config"] = dict(mixed[-1]["config"], mmproj_offload=False)
+        _infer_demotion(mixed)
+        inf_ok = inf_ok and not mixed[-1].get("spill_inferred")
+        # and the inference names itself as one rather than claiming a reading
+        inote = spill_note({"spill_inferred": 246.1})
+        inf_ok = inf_ok and "floor fell" in inote and "246" in inote
+        print("  SPILL demotion measured from the counter, inferred for old rows  %s"
+              % ("OK" if (meas_ok and inf_ok) else "FAIL"))
+
+        # The frozen corpus is an experiment condition. Two rows measured
+        # against different corpora - or one recorded before the corpus was
+        # frozen at all - are different experiments and must never meet in a
+        # baseline or an effect size.
+        pid_a, pid_b = "a" * 40, "b" * 40
+        id_ok = (not comparable(row(9.0, prompt_id=pid_a), "M.gguf", B, 128, 3,
+                                prompt_id=pid_b)
+                 and comparable(row(9.0, prompt_id=pid_a), "M.gguf", B, 128, 3,
+                                prompt_id=pid_a)
+                 # a row recorded before the freeze has no id: it is its own
+                 # experiment, not the campaign's
+                 and not comparable(row(9.0), "M.gguf", B, 128, 3, prompt_id=pid_a)
+                 # ...and ids also split effect sizes, never merging the corpora
+                 and sorted(v["value"] for v in [e for e in axis_effects(
+                     [row(5.0, {"ub": 512}, prompt_id=pid_a),
+                      row(6.0, {"ub": 1024}, prompt_id=pid_a),
+                      row(99.0, {"ub": 2048})])["effects"]
+                     if e["axis"] == "ub"][0]["values"]) == [512, 1024])
+        # --speed-verify composes the winner's knobs with the production
+        # config, so the row actually loaded is the config actually launched.
+        vc = verify_config({"ngl": 28, "ctx": 131072, "stage": "A", "fill": 100000},
+                           {"spec": ["draft-mtp"], "spec_n_max": [2], "temp": [1.0]})
+        vc_ok = (vc == {"ngl": 28, "ctx": 131072, "fill": 100000,
+                        "spec": "draft-mtp", "spec_n_max": 2, "temp": 1.0}
+                 and "stage" not in vc)
+        print("  FIND  prompt_id splits experiments, verify composes winner+production  %s"
+              % ("OK" if (id_ok and vc_ok) else "FAIL"))
+
+        # The chat template is the other half of what a tok/s number means: a
+        # thinking template spends tokens reasoning before it answers. So it
+        # splits experiments exactly like prompt_id, in BOTH directions - and
+        # its identity is the file's CONTENT, not its path, or editing a
+        # template in place would leave the old rows looking current.
+        import tempfile as _tf
+        from vram_planner.bench import template_identity, _ANY
+        from vram_planner.sweep import build_argv
+        td = _tf.mkdtemp()
+        tp = os.path.join(td, "chat template.jinja")
+        with open(tp, "w", encoding="utf-8") as fh:
+            fh.write("{{ messages[0].content }}")
+        kw = '{"enable_thinking":true}'
+        t1 = template_identity(tp, kw)
+        with open(tp, "a", encoding="utf-8") as fh:
+            fh.write("\n{# edited #}")
+        t2 = template_identity(tp, kw)
+        ti_ok = (t1 and t2 and t1 != t2                     # content, not path
+                 and template_identity(tp, None) != t2      # kwargs count too
+                 and template_identity(None, None) is None) # nothing pinned
+        # comparable() filters both ways, and _ANY means "do not filter" -
+        # which is what keeps every row recorded before this from vanishing.
+        cmp_ok = (comparable(row(9.0, template_id=t1), "M.gguf", B, 128, 3,
+                             template_id=t1)
+                  and not comparable(row(9.0, template_id=t1), "M.gguf", B, 128, 3,
+                                     template_id=t2)
+                  # a campaign that pinned NO template must not inherit a
+                  # baseline from one that did
+                  and not comparable(row(9.0, template_id=t1), "M.gguf", B, 128, 3,
+                                     template_id=None)
+                  and not comparable(row(9.0), "M.gguf", B, 128, 3, template_id=t1)
+                  and comparable(row(9.0, template_id=t1), "M.gguf", B, 128, 3)
+                  and comparable(row(9.0), "M.gguf", B, 128, 3, template_id=_ANY)
+                  # ...and it splits effect sizes, never merging two templates
+                  and sorted(v["value"] for v in [e for e in axis_effects(
+                      [row(5.0, {"ub": 512}, template_id=t1),
+                       row(6.0, {"ub": 1024}, template_id=t1),
+                       row(99.0, {"ub": 2048}, template_id=t2)])["effects"]
+                      if e["axis"] == "ub"][0]["values"]) == [512, 1024])
+        # --jinja MUST precede --chat-template-file or the build rejects a path,
+        # and a path that does not exist is a SILENT fallback to the GGUF's own
+        # template - a whole campaign measured against something nobody chose.
+        bc = {"ctx": 4096, "ub": 512, "seq": 1, "ngl": 28, "fa": True, "kv": "q8_0"}
+        av = build_argv("s.exe", "m.gguf", dict(bc, chat_template_file=tp,
+                                                chat_template_kwargs=kw), 8232)
+        arg_ok = (av.index("--jinja") < av.index("--chat-template-file")
+                  and av[av.index("--chat-template-file") + 1] == tp
+                  and av[av.index("--chat-template-kwargs") + 1] == kw
+                  # no flags at all when nothing is pinned
+                  and "--jinja" not in build_argv("s.exe", "m.gguf", dict(bc), 8232)
+                  # probe=False is launch.py's, which emits these itself at
+                  # script runtime; a second copy here would double them
+                  and "--jinja" not in build_argv(
+                      "s.exe", "m.gguf", dict(bc, chat_template_file=tp), 8232,
+                      probe=False))
+        try:
+            build_argv("s.exe", "m.gguf",
+                       dict(bc, chat_template_file=tp + ".nope"), 8232)
+            arg_ok = False
+        except ValueError:
+            pass
+        # Samplers are frozen for a campaign, like ctx and kv, and they have to
+        # reach the CONFIG - sampling_of() reads them there and _key() hashes
+        # them, so a campaign re-run at real settings must not resume its greedy
+        # rows as though they were the same measurement. They are not: greedy
+        # makes the target's token deterministic, so it is speculation's best
+        # case, and an acceptance rate measured there is an upper bound.
+        from vram_planner.bench import (stage_configs, sampling_of,
+                                        _SWEEP_SAMPLER_KEYS)
+        from vram_planner.sweep import _key
+        b_greedy = {"ctx": 4096, "kv": "q8_0", "fa": True, "seq": 1, "ub": 512,
+                    "ngl": 28, "fill": 2048}
+        b_real = dict(b_greedy, temp=1.0, top_k=20, top_p=0.95, rep_pen=1.05)
+        c_g = stage_configs("a", b_greedy, 65, False, [27, 28])[0]
+        c_r = stage_configs("a", b_real, 65, False, [27, 28])[0]
+        samp_ok = (sampling_of(c_g)["temperature"] == 0.0
+                   and sampling_of(c_r)["temperature"] == 1.0
+                   and sampling_of(c_r)["top_k"] == 20
+                   and sampling_of(c_r)["repeat_penalty"] == 1.05
+                   # ...and the two are different rows, so resume re-measures
+                   and _key("m.gguf", c_g) != _key("m.gguf", c_r)
+                   # every name the sweep uses survives the trip
+                   and all(k in b_real or k in ("min_p", "pres_pen")
+                           for k in _SWEEP_SAMPLER_KEYS))
+        # the web layer's field names map onto those, or the two cards would
+        # measure and launch under settings that only LOOK like each other
+        from vram_planner.web import Handler
+        mapped = {Handler._SWEEP_SAMPLER.get(k, k) for k in
+                  ("temp", "top_k", "top_p", "min_p", "repeat_penalty",
+                   "presence_penalty")}
+        samp_ok = samp_ok and mapped == set(_SWEEP_SAMPLER_KEYS)
+        print("  TMPL  template splits experiments by content, --jinja leads it  %s"
+              % ("OK" if (ti_ok and cmp_ok and arg_ok and samp_ok) else "FAIL"))
         find_ok = (chain_ok and split_ok and alone_ok and clean_ok and par_ok
-                   and dep_ok)
+                   and dep_ok and warn_ok and gate_ok
+                   and copy_ok and metric_ok and id_ok and vc_ok
+                   and tmpl_ok and scheme_ok and port_ok
+                   and meas_ok and inf_ok
+                   and ti_ok and cmp_ok and arg_ok and samp_ok)
     except Exception as e:
         find_ok = False
         print("  CHAIN/FIND raised %s: %s  FAIL" % (type(e).__name__, e))

@@ -159,6 +159,45 @@ def get_gpu_processes():
     return procs
 
 
+def gpu_shared_mib(pid):
+    """Host memory this process's GPU work is reaching over PCIe, in MiB.
+
+    The number that makes a WDDM demotion visible. When a process's dedicated
+    allocations reach the driver's budget, Windows does not fail the request -
+    it places some of it in system RAM and carries on. Dedicated usage then
+    stops rising while the model keeps growing, and every token pays a PCIe
+    round trip for whatever moved. That is why an ngl ladder can get SLOWER as
+    it climbs while the row still says "ok".
+
+    nvidia-smi cannot see this on WDDM. The GPU performance counters can, and
+    the same counter set already backs get_gpu_processes' Windows fallback.
+
+    Instances are per adapter and per segment, so one process can own several
+    and they are summed. Returns None when the counters cannot be read - which
+    is NOT the same as zero and must never be recorded as zero, because zero is
+    the answer that means "measured, and nothing was demoted"."""
+    if os.name != "nt":
+        return None
+    ps = (r"try { $c = Get-Counter '\GPU Process Memory(*)\Shared Usage' -EA Stop }"
+          r" catch { 'NA'; exit };"
+          r"$s = ($c.CounterSamples | Where-Object {"
+          r" ($_.InstanceName -split '_')[1] -eq '%s' } |"
+          r" Measure-Object CookedValue -Sum).Sum;"
+          # No matching instance means the process holds nothing shared, which is
+          # a real zero. Only a failure to READ the counters is unknown.
+          r"if ($null -eq $s) { '0' } else { [math]::Round($s/1MB, 1) }" % str(pid))
+    try:
+        out = subprocess.check_output(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
+            stderr=subprocess.DEVNULL, timeout=25).decode("utf-8", "replace").strip()
+    except Exception:
+        return None
+    try:
+        return float(out.splitlines()[-1].strip())
+    except (ValueError, IndexError):
+        return None
+
+
 def get_ram():
     try:
         if os.name == "nt":

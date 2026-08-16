@@ -125,6 +125,51 @@ def sampler_args(sampling):
     return out
 
 
+# --reasoning replaces enable_thinking in --chat-template-kwargs, which current
+# builds accept and then warn about:
+#   Setting 'enable_thinking' via --chat-template-kwargs is deprecated.
+#   Use --reasoning on / --reasoning off instead.
+# "auto" is llama.cpp's own default and means "detect from the template".
+REASONING_MODES = ("auto", "on", "off")
+
+# Tri-state, and it has to be: --reasoning-preserve and --no-reasoning-preserve
+# are a pair whose default is "whatever the template says", which is a third
+# value a boolean cannot hold. "default" emits no flag at all.
+PRESERVE_MODES = ("default", "on", "off")
+
+
+def reasoning_args(reasoning=None, reasoning_preserve=None):
+    """Validate the two thinking knobs, returning (mode, preserve) or (None, None).
+
+    These are NOT template variables and cannot be reached through
+    --chat-template-kwargs, which is the trap worth naming. A Qwen3 template
+    reads `preserve_thinking`, so setting it there looks like it should work -
+    but llama-server strips the <think> blocks out of the message history
+    BEFORE the template is rendered, so by the time the variable is read there
+    is nothing left for it to preserve. The server says as much on startup:
+
+        chat template supports preserving reasoning,
+        consider enabling it via --reasoning-preserve
+
+    It only shows up from the second turn onward, which is exactly why it
+    survives a single-turn benchmark and then loses the reasoning trace in
+    everyday use."""
+    m = (reasoning or "").strip().lower() or None
+    if m is not None and m not in REASONING_MODES:
+        raise ValueError("--reasoning must be one of %s - got %r"
+                         % (", ".join(REASONING_MODES), reasoning))
+    p = reasoning_preserve
+    if isinstance(p, bool):
+        p = "on" if p else "off"
+    p = (p or "").strip().lower() or None
+    if p == "default":
+        p = None
+    if p is not None and p not in PRESERVE_MODES:
+        raise ValueError("--reasoning-preserve must be one of %s - got %r"
+                         % (", ".join(PRESERVE_MODES), reasoning_preserve))
+    return m, p
+
+
 def template_args(chat_template_file=None, chat_template_kwargs=None):
     """Validate the chat-template pair, returning (path, kwargs_json).
 
@@ -138,7 +183,17 @@ def template_args(chat_template_file=None, chat_template_kwargs=None):
     parsed the request body and re-serialising to make this re-parse it would be
     a round trip that could only lose. Keys are sorted so regenerating the same
     script twice produces the same bytes."""
-    f = (chat_template_file or "").strip() or None
+    # Surrounding quotes come off. Windows Explorer's "Copy as path" - the
+    # normal way anybody produces a Windows path to paste - ALWAYS wraps its
+    # result in double quotes, and they are not part of the filename. Left on,
+    # they end up inside the script's single-quoted default, Test-Path returns
+    # false for a file that plainly exists, and the launcher dies on its own
+    # guard with "No such chat template" naming a path you can see is there.
+    # The stray quote is visible in the header too, which is the only clue.
+    f = (chat_template_file or "").strip()
+    if len(f) >= 2 and f[0] == f[-1] and f[0] in "\"'":
+        f = f[1:-1].strip()
+    f = f or None
     kw = chat_template_kwargs
     if kw is None or (isinstance(kw, str) and not kw.strip()):
         return f, None
@@ -227,8 +282,72 @@ def _params_used(argv):
     return seen
 
 
+# Settings in which a launched config may differ from the measured row it cites.
+# Samplers matter for a SPECULATIVE row (greedy is speculation's best case) and
+# nothing for a bandwidth-bound decode, but the header cannot know which case
+# it is in, so any difference is named.
+_EVIDENCE_KEYS = ("ctx", "kv", "fa", "seq", "ub", "ngl", "ncmoe", "fill",
+                  "spec", "spec_n_max", "mmproj_offload")
+
+_SAMPLER_KEYS = ("temp", "top_k", "top_p", "min_p", "rep_pen", "pres_pen")
+
+# What a sweep row was ACTUALLY measured at when it names no sampler: greedy,
+# which is bench.sampling_of()'s default. Absent must not read as "unknown, skip
+# the comparison" - a config carries these keys only when someone swept them, so
+# skipping meant the divergence line went silent in exactly the ordinary case.
+#
+# It matters most for speculation, and bench.sampling_of() says why: llama.cpp
+# accepts a draft token when the target's own sampled token matches it, and
+# under greedy that comparison is deterministic. Greedy is speculation's BEST
+# case. A header that quotes 85% acceptance for a script running temp 1.0 is
+# quoting an upper bound as though it were the measurement.
+_MEASURED_SAMPLER_DEFAULTS = {"temp": 0.0, "top_k": 0, "top_p": 1.0,
+                              "min_p": 0.0, "rep_pen": 1.0, "pres_pen": 0.0}
+
+# A sweep config and the script form spell the last two differently.
+_SAMPLER_ALIAS = {"rep_pen": "repeat_penalty", "pres_pen": "presence_penalty"}
+
+
+def _config_divergence(c, measured, sampling=None):
+    """The settings in which a launched config differs from the row it cites.
+
+    The winner of a sweep was measured at one config, and the script built from
+    it may not launch that same config - the form can add a spec, a draft depth,
+    samplers, a deeper fill. The row's tok/s and fit evidence then belong to a
+    config this script does not run, which is the quiet failure mode the header
+    warning exists for: the numbers still look like they were measured for this.
+    Returns a short description, or "" when the configs match."""
+    mc = (measured or {}).get("config") or {}
+    if not mc:
+        return ""
+    diffs = []
+    for k in _EVIDENCE_KEYS:
+        a, b = c.get(k), mc.get(k)
+        if k == "fa":
+            a, b = bool(a), bool(b)
+        if k == "mmproj_offload":
+            a, b = a is not False, b is not False
+        if a is not None and b is not None and a != b:
+            diffs.append("%s %s->%s" % (k, b, a))
+    for k in _SAMPLER_KEYS:
+        # The two sides spell the last two differently: a sweep config says
+        # rep_pen/pres_pen, the script form says repeat_penalty/presence_penalty.
+        # Without the map, `sampling.get("rep_pen")` was always None and those
+        # two could never diverge however far apart they were set.
+        a = (sampling or {}).get(_SAMPLER_ALIAS.get(k, k))
+        # The measured side falls back to what the bench actually used, not to
+        # None. See _MEASURED_SAMPLER_DEFAULTS: a row that names no sampler was
+        # measured greedy, and that is a fact about the row, not a gap in it.
+        b = mc.get(k)
+        if b is None:
+            b = _MEASURED_SAMPLER_DEFAULTS.get(k)
+        if a is not None and b is not None and float(a) != float(b):
+            diffs.append("%s %s->%s" % (k, b, a))
+    return ", ".join(diffs)
+
+
 def _provenance(model_path, c, measured, backend, tmpl=(None, None),
-                path_resolved=True):
+                path_resolved=True, divergence=""):
     """Where these numbers came from - measured, or the planner's estimate."""
     out = ["Model    : %s" % os.path.basename(model_path or "?")]
     if not path_resolved:
@@ -273,6 +392,12 @@ def _provenance(model_path, c, measured, backend, tmpl=(None, None),
     if measured.get("spilled"):
         out.append("           !! this row SPILLED into shared memory - it loaded, but the")
         out.append("              GPU was over-committed. Treat the speed as suspect.")
+    if divergence:
+        out.append("           !! this config DIFFERS from the measured row: %s" % divergence)
+        out.append("              the tok/s and fit above belong to the row as measured,")
+        out.append("              not to what this script launches. A split that fits one")
+        out.append("              does not necessarily fit the other - re-measure, or")
+        out.append("              expect the numbers to change.")
     if measured.get("when"):
         out.append("           recorded %s"
                    % datetime.datetime.fromtimestamp(measured["when"]).strftime("%Y-%m-%d"))
@@ -283,17 +408,21 @@ def _provenance(model_path, c, measured, backend, tmpl=(None, None),
 # The two shells
 # ---------------------------------------------------------------------------
 def _powershell(model_path, c, argv, backend, mmproj, sampling, port, bind_host,
-                load_mode, log_dir, measured, params, tmpl, path_resolved):
+                load_mode, log_dir, measured, params, tmpl, path_resolved,
+                divergence=""):
     exe_name = EXE_BY_SHELL["powershell"]
     # PowerShell is case-insensitive about variables, but $model reading as $Model
     # in one place and not the other just looks like a bug to whoever edits this.
     var = lambda n: "$" + (n.lower() if n in _NOT_A_PARAM else n)
     body = _lines_from_argv(argv, var)
-    has_tmpl = bool(tmpl[0] or tmpl[1])
+    # Any of the four turns the block on: they share one runtime-built array,
+    # because every one of them has to be able to emit no flag at all.
+    has_tmpl = any(tmpl)
     L = []
     A = L.append
 
-    for line in _provenance(model_path, c, measured, backend, tmpl, path_resolved):
+    for line in _provenance(model_path, c, measured, backend, tmpl, path_resolved,
+                            divergence):
         A("# " + line)
     A("#")
     A("# Usage:  powershell -ExecutionPolicy Bypass -File .\\%s"
@@ -361,8 +490,27 @@ def _powershell(model_path, c, argv, backend, mmproj, sampling, port, bind_host,
         A("    # rejected, so a typo here is silent. These are SERVER defaults: a")
         A("    # client sending chat_template_kwargs in the request wins for that")
         A("    # request.")
-        A("    [string]$ChatTemplateKwargs = %s%s"
-          % (ps_quote(tmpl[1] or ""), "," if sampling else ""))
+        A("    [string]$ChatTemplateKwargs = %s," % ps_quote(tmpl[1] or ""))
+        A("")
+        A("    # Whether the model thinks at all. This REPLACES enable_thinking in")
+        A("    # the kwargs above, which current builds accept and then warn about:")
+        A("    #   Setting 'enable_thinking' via --chat-template-kwargs is")
+        A("    #   deprecated. Use --reasoning on / --reasoning off instead.")
+        A("    # 'auto' is llama.cpp's default and detects it from the template.")
+        A("    [ValidateSet(%s)]" % ",".join(ps_quote(m) for m in REASONING_MODES))
+        A("    [string]$Reasoning = %s," % ps_quote(tmpl[2] or "auto"))
+        A("")
+        A("    # Keep the thinking trace for the WHOLE history, not just the last")
+        A("    # assistant message. This one cannot be set from the template kwargs")
+        A("    # even when the template has a variable for it - llama-server strips")
+        A("    # <think> out of the history BEFORE rendering, so by the time the")
+        A("    # template reads the variable there is nothing left to preserve. It")
+        A("    # only shows from the second turn on, which is how it survives a")
+        A("    # benchmark and then quietly loses the trace in daily use.")
+        A("    # 'default' emits no flag and leaves the template's own answer.")
+        A("    [ValidateSet(%s)]" % ",".join(ps_quote(m) for m in PRESERVE_MODES))
+        A("    [string]$ReasoningPreserve = %s%s"
+          % (ps_quote(tmpl[3] or "default"), "," if sampling else ""))
     if sampling:
         A("")
         A("    # Sampling. These are SERVER DEFAULTS - a client that sends its own")
@@ -471,11 +619,18 @@ def _powershell(model_path, c, argv, backend, mmproj, sampling, port, bind_host,
         A("    }")
         A("    $tmplArgs += @('--chat-template-kwargs', $kwargs)")
         A("}")
+        A("if ($Reasoning -ne 'auto') { $tmplArgs += @('--reasoning', $Reasoning) }")
+        A("if ($ReasoningPreserve -ne 'default') {")
+        A("    $tmplArgs += $(if ($ReasoningPreserve -eq 'on')")
+        A("                   { '--reasoning-preserve' }")
+        A("                   else { '--no-reasoning-preserve' })")
+        A("}")
         A("")
     A("Write-Host \"model   : $(Split-Path $model -Leaf)\"")
     if has_tmpl:
         A("if ($ChatTemplateFile) { Write-Host \"template: $(Split-Path $ChatTemplateFile -Leaf)\" }")
         A("if ($ChatTemplateKwargs) { Write-Host \"tmpl-kw : $ChatTemplateKwargs\" }")
+        A("Write-Host \"thinking: $Reasoning  (preserve history: $ReasoningPreserve)\"")
     A("Write-Host \"log     : $(if ($LogFile) { $LogFile } else { 'console only (not saved)' })\"")
     A("Write-Host \"serving : http://${BindHost}:$Port  (OpenAI-compatible at /v1)\"")
     A("if ($BindHost -eq '0.0.0.0') {")
@@ -499,9 +654,12 @@ def _powershell(model_path, c, argv, backend, mmproj, sampling, port, bind_host,
 
 
 def _bash(model_path, c, argv, backend, mmproj, sampling, port, bind_host,
-          load_mode, log_dir, measured, params, tmpl, path_resolved):
+          load_mode, log_dir, measured, params, tmpl, path_resolved,
+          divergence=""):
     exe_name = EXE_BY_SHELL["bash"]
-    has_tmpl = bool(tmpl[0] or tmpl[1])
+    # Any of the four turns the block on: they share one runtime-built array,
+    # because every one of them has to be able to emit no flag at all.
+    has_tmpl = any(tmpl)
     # Paths come from the host, which may be Windows. Backslashes are an escape
     # character in sh, and every shell that runs this on Windows (Git Bash, MSYS)
     # takes forward slashes anyway.
@@ -513,7 +671,8 @@ def _bash(model_path, c, argv, backend, mmproj, sampling, port, bind_host,
 
     A("#!/usr/bin/env bash")
     A("# " + "-" * 68)
-    for line in _provenance(model_path, c, measured, backend, tmpl, path_resolved):
+    for line in _provenance(model_path, c, measured, backend, tmpl, path_resolved,
+                            divergence):
         A("# " + line)
     A("#")
     A("# Every setting below is an environment variable override, e.g.")
@@ -564,6 +723,23 @@ def _bash(model_path, c, argv, backend, mmproj, sampling, port, bind_host,
         A("# chat_template_kwargs in the request wins for that request.")
         A("_tmpl_kwargs_default=%s" % sh_quote(tmpl[1] or ""))
         A('CHATTEMPLATEKWARGS="${CHATTEMPLATEKWARGS-$_tmpl_kwargs_default}"')
+        A("")
+        A("# Whether the model thinks at all: auto|on|off. This REPLACES")
+        A("# enable_thinking in the kwargs above, which current builds accept and")
+        A("# then warn about - 'Setting enable_thinking via --chat-template-kwargs")
+        A("# is deprecated. Use --reasoning on / --reasoning off instead.' 'auto' is")
+        A("# llama.cpp's own default and detects it from the template.")
+        A('REASONING="${REASONING:-%s}"' % (tmpl[2] or "auto"))
+        A("")
+        A("# Keep the thinking trace for the WHOLE history, not just the last")
+        A("# assistant message: default|on|off. This one CANNOT be set from the")
+        A("# template kwargs even when the template has a variable for it -")
+        A("# llama-server strips <think> out of the history BEFORE rendering, so by")
+        A("# the time the template reads the variable there is nothing left to")
+        A("# preserve. It only shows from the second turn on, which is how it")
+        A("# survives a benchmark and then quietly loses the trace in daily use.")
+        A("# 'default' emits no flag and leaves the template's own answer.")
+        A('REASONINGPRESERVE="${REASONINGPRESERVE:-%s}"' % (tmpl[3] or "default"))
     if sampling:
         A("")
         A("# Sampling. These are SERVER DEFAULTS - a client that sends its own")
@@ -647,6 +823,18 @@ def _bash(model_path, c, argv, backend, mmproj, sampling, port, bind_host,
         A('if [ -n "$CHATTEMPLATEKWARGS" ]; then')
         A('  tmpl_args+=(--chat-template-kwargs "$CHATTEMPLATEKWARGS")')
         A("fi")
+        A('case "$REASONING" in')
+        A('  auto) ;;')
+        A('  on|off) tmpl_args+=(--reasoning "$REASONING") ;;')
+        A('  *) echo "REASONING must be auto|on|off, got: $REASONING" >&2; exit 1 ;;')
+        A('esac')
+        A('case "$REASONINGPRESERVE" in')
+        A('  default) ;;')
+        A('  on)  tmpl_args+=(--reasoning-preserve) ;;')
+        A('  off) tmpl_args+=(--no-reasoning-preserve) ;;')
+        A('  *) echo "REASONINGPRESERVE must be default|on|off, got: $REASONINGPRESERVE" >&2')
+        A('     exit 1 ;;')
+        A('esac')
         A("")
     A('echo "model   : $(basename "$MODEL")"')
     if has_tmpl:
@@ -659,6 +847,7 @@ def _bash(model_path, c, argv, backend, mmproj, sampling, port, bind_host,
         A('if [ -n "$CHATTEMPLATEKWARGS" ]; then')
         A('  echo "tmpl-kw : $CHATTEMPLATEKWARGS"')
         A("fi")
+        A('echo "thinking: $REASONING  (preserve history: $REASONINGPRESERVE)"')
     A('echo "log     : ${LOGFILE:-console only (not saved)}"')
     A('echo "serving : http://$BINDHOST:$PORT  (OpenAI-compatible at /v1)"')
     A("echo")
@@ -689,6 +878,7 @@ def launch_script(model_path, c, backend=None, mmproj=None, shell=None,
                   sampling=None, port=8080, bind_host="127.0.0.1",
                   load_mode="none", log_dir=None, measured=None,
                   chat_template_file=None, chat_template_kwargs=None,
+                  reasoning=None, reasoning_preserve=None,
                   path_resolved=True):
     """The text of a launcher for one config.
 
@@ -723,8 +913,14 @@ def launch_script(model_path, c, backend=None, mmproj=None, shell=None,
     # measurable and would be wrong in something you use every day.
     argv = build_argv("<exe>", model_path, c, port, probe=False, host=bind_host)[1:]
     samp = sampler_args(sampling)
-    tmpl = template_args(chat_template_file, chat_template_kwargs)
+    # One tuple, because these four flags share a fate: every one of them has to
+    # be built at script RUNTIME rather than written into the command, since an
+    # empty value must produce NO flag instead of an empty one.
+    tmpl = template_args(chat_template_file, chat_template_kwargs) \
+        + reasoning_args(reasoning, reasoning_preserve)
     params = _params_used(argv)
     fn = _powershell if shell == "powershell" else _bash
+    divergence = _config_divergence(c, measured, sampling)
     return fn(model_path, c, argv, backend, mmproj, samp, port, bind_host,
-              load_mode, log_dir, measured, params, tmpl, path_resolved)
+              load_mode, log_dir, measured, params, tmpl, path_resolved,
+              divergence)

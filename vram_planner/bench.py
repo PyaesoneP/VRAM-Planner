@@ -22,8 +22,8 @@ filter. compute.py has no term for a draft cache, so those megabytes would be
 absorbed into `floor` and `ctx` and quietly corrupt every future plan. Same
 format, same resume discipline, different tree.
 """
-import datetime, json, os, re, statistics, time, urllib.error, urllib.request
-from .gpu import get_gpu_processes, gpu_list
+import datetime, hashlib, json, os, re, socket, statistics, time, urllib.error, urllib.request
+from .gpu import get_gpu_processes, gpu_list, gpu_shared_mib
 from .lmstudio import default_models_dir
 from .paths import _data_dir
 from .sweep import (build_argv, discover_models, finish_row, model_facts,
@@ -31,6 +31,38 @@ from .sweep import (build_argv, discover_models, finish_row, model_facts,
 
 
 BENCH_PORT = 8232          # 8231 is the allocation sweep's; 1234 is LM Studio's
+
+
+def free_port(preferred=BENCH_PORT):
+    """A port llama-server can actually bind, right now.
+
+    One fixed port is not safe to reuse back to back. A campaign tears a server
+    down and starts the next within seconds, but the old socket sits in
+    TIME_WAIT for a minute or more afterwards, and llama-server does not set
+    SO_REUSEADDR - it prints "couldn't bind HTTP server socket" and exits.
+
+    That is not a hypothetical: it cost two rows of the 32k campaign, recorded
+    as EXIT. EXIT reads like a crash or a driver fault, so those configs looked
+    like evidence about the wall when they were nothing but a port collision -
+    a harness failure wearing a result's clothes.
+
+    Probing with bind() mirrors exactly what llama-server is about to attempt,
+    and a socket that never listened leaves no TIME_WAIT of its own. The
+    fallback asks the OS for any free port rather than guessing at offsets."""
+    s = socket.socket()
+    try:
+        s.bind(("127.0.0.1", int(preferred)))
+        return int(preferred)
+    except OSError:
+        pass
+    finally:
+        s.close()
+    s = socket.socket()
+    try:
+        s.bind(("127.0.0.1", 0))
+        return int(s.getsockname()[1])
+    finally:
+        s.close()
 
 N_PREDICT = 128            # tokens generated per measured pass
 
@@ -68,9 +100,20 @@ def n_tokens(url, text, timeout=120):
     return len(_post(url, "/tokenize", {"content": text}, timeout).get("tokens") or [])
 
 
-# The filler corpus is this repository: real prose and real Python, deterministic,
-# always on disk next to the code that reads it, and representative of the mixed
-# doc-and-source workload a coding daily-driver actually sees.
+# The filler corpus is a FROZEN snapshot of this repository: real prose and real
+# Python, deterministic, always on disk next to the code that reads it, and
+# representative of the mixed doc-and-source workload a coding daily-driver
+# actually sees.
+#
+# It is a snapshot, not a live read, and that is the point. The corpus used to
+# be re-read from the working tree, so a campaign spanning an edit - and the
+# harness and the files it reads live in the same repository, so edits happen -
+# quietly measured a different prompt before and after, with nothing on the row
+# to say so. Benchmarks need frozen inputs: the corpus only changes when
+# --refresh-corpus deliberately rebuilds it, which is a committed, visible
+# event. Rows carry prompt_identity(), the hash of exactly the bytes a prompt
+# is built from, so even a deliberate refresh can never be mistaken for the
+# campaign it replaced.
 #
 # This matters more than it looks. N-gram speculation predicts from repetition in
 # the text, so a prompt built by repeating one paragraph would hand ngram-* a
@@ -78,20 +121,13 @@ def n_tokens(url, text, timeout=120):
 # would deny it one it genuinely deserves. Neither is a measurement. Real files
 # are the only honest filler.
 _CORPUS = None
+_CORPUS_ID = None
+
+_CORPUS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_corpus.txt")
 
 
-def corpus_text(refresh=False):
-    """Read once per process, then cached.
-
-    The caching is not an optimisation, it is a correctness requirement. A
-    campaign spans hours and re-reads this between configs; if the working tree
-    is edited in the meantime - and it will be, since the harness and the files
-    it reads live in the same repository - then later configs get a different
-    prompt from earlier ones and the comparison quietly stops being one. Snapshot
-    at the start, use the same bytes for every row."""
-    global _CORPUS
-    if _CORPUS is not None and not refresh:
-        return _CORPUS
+def _live_corpus_text():
+    """README and this package's sources, joined exactly as the corpus always was."""
     here = os.path.dirname(os.path.abspath(__file__))
     parts = []
     readme = os.path.join(os.path.dirname(here), "README.md")
@@ -101,12 +137,134 @@ def corpus_text(refresh=False):
         if fn.endswith(".py"):
             parts.append(open(os.path.join(here, fn), encoding="utf-8",
                               errors="replace").read())
-    _CORPUS = "\n\n".join(parts)
+    return "\n\n".join(parts)
+
+
+def refresh_corpus():
+    """Rewrite the frozen corpus snapshot from the live sources.
+
+    The one way the corpus changes. Deliberate, committed, and visible in the
+    row store: the new bytes hash differently, so every row recorded against
+    the old snapshot stops being comparable to new ones and a resumed campaign
+    re-measures instead of reusing them."""
+    global _CORPUS, _CORPUS_ID
+    text = _live_corpus_text()
+    with open(_CORPUS_PATH, "w", encoding="utf-8", newline="\n") as fh:
+        fh.write(text)
+    _CORPUS = text
+    _CORPUS_ID = None
+    return _CORPUS_PATH
+
+
+def corpus_text(refresh=False):
+    """The frozen snapshot, read once per process, then cached.
+
+    The caching is not an optimisation, it is a correctness requirement. A
+    campaign spans hours and must use the same bytes for every row. If the
+    snapshot is missing - a fresh clone, or a package that never ran
+    --refresh-corpus - it is rebuilt from the live sources on the spot, so
+    nothing silently runs on an empty prompt."""
+    global _CORPUS
+    if _CORPUS is not None and not refresh:
+        return _CORPUS
+    if os.path.isfile(_CORPUS_PATH):
+        with open(_CORPUS_PATH, encoding="utf-8", errors="replace") as fh:
+            _CORPUS = fh.read()
+    else:
+        _CORPUS = _live_corpus_text()
     return _CORPUS
 
 
 INSTRUCTION = ("\n\nSummarise, in detail, what the code and documentation above "
                "do and how the pieces fit together.\n")
+
+# Bumped whenever the way a prompt is ASSEMBLED changes, not just its bytes.
+# "chat" is the move from raw /completion continuation to the model's own chat
+# template; rows measured either side of it are different experiments even
+# though the corpus is identical, and the id is what stops them merging.
+PROMPT_SCHEME = "chat"
+
+
+def apply_template(url, text, timeout=120):
+    """Wrap `text` as a user turn using the SERVER's own chat template.
+
+    /completion is a raw-continuation endpoint: it hands the model exactly these
+    bytes, with no role markers and nothing marking the text as a REQUEST. An
+    instruction-tuned model given a wall of source that happens to end in a
+    sentence has no signal that it was asked anything, so it does the only thing
+    the endpoint asks for - it continues the document. In practice that means
+    echoing the instruction back or copying the source, which is what every row
+    of the 32k campaign did. That was never the model failing at depth; it was
+    the benchmark measuring a base model that does not exist.
+
+    Templating is also the only way these numbers describe what actually runs:
+    production serves /v1/chat/completions with --jinja and a template.
+
+    Returns (prompt, applied). A build without /apply-template falls back to the
+    raw text rather than failing the campaign - visibly, because `applied` lands
+    in every row and the scheme lands in the prompt id."""
+    try:
+        d = _post(url, "/apply-template",
+                  {"messages": [{"role": "user", "content": text}]}, timeout)
+    except Exception:
+        return text, False
+    out = d.get("prompt") if isinstance(d, dict) else None
+    if isinstance(out, str) and out:
+        return out, True
+    return text, False
+
+
+def prompt_identity():
+    """The hash of exactly the bytes a prompt is built from: corpus + INSTRUCTION.
+
+    Two rows with the same prompt_id and the same fill were measured against
+    byte-identical prompts, whatever the working tree said when each was
+    measured - which is what makes deep-fill numbers comparable across sessions
+    at all. Rows without the field predate the freeze and are their own
+    experiment; they group separately and are never resumed as already done."""
+    global _CORPUS_ID
+    if _CORPUS_ID is None:
+        h = hashlib.sha256()
+        h.update(corpus_text().encode("utf-8"))
+        h.update(INSTRUCTION.encode("utf-8"))
+        h.update(PROMPT_SCHEME.encode("utf-8"))
+        _CORPUS_ID = h.hexdigest()
+    return _CORPUS_ID
+
+
+def template_identity(path=None, kwargs_json=None, reasoning=None,
+                      reasoning_preserve=None):
+    """The hash of the chat template a row was measured under, or None.
+
+    Sibling of prompt_identity(), and for the same reason: what the model was
+    asked is half of what a tok/s number means. A thinking template that emits a
+    reasoning block generates a different number of tokens per answer than one
+    that does not, so two rows measured under different templates are different
+    experiments even when every flag matches.
+
+    The FILE'S BYTES are hashed, not its path. Editing a template in place must
+    invalidate the rows measured against the old one - a path would not notice,
+    and the campaign would silently mix both halves. None means no template was
+    pinned and the GGUF's own metadata one was used, which is its own answer and
+    groups separately from every pinned template.
+
+    The thinking flags belong to the same identity: --reasoning off makes one
+    template produce a different answer of a different length, which is a
+    different measurement. They are appended only when SET, so a campaign that
+    does not use them hashes to the same bytes it did before they existed and
+    its rows keep resuming."""
+    if not (path or kwargs_json or reasoning or reasoning_preserve):
+        return None
+    h = hashlib.sha256()
+    if path:
+        with open(path, "rb") as fh:
+            h.update(fh.read())
+    h.update(b"\x00")
+    h.update((kwargs_json or "").encode("utf-8"))
+    if reasoning or reasoning_preserve:
+        h.update(("\x00%s\x00%s" % (reasoning or "",
+                                    reasoning_preserve or "")).encode("utf-8"))
+    return h.hexdigest()[:16]
 
 
 def build_prompt(url, fill_tokens, timeout=120):
@@ -116,10 +274,19 @@ def build_prompt(url, fill_tokens, timeout=120):
     characters and re-tokenises to land close. Exactness is not the point -
     knowing the number is, so it goes in the row."""
     if not fill_tokens:
-        return INSTRUCTION.strip(), None
+        p, applied = apply_template(url, INSTRUCTION.strip(), timeout)
+        return p, None, applied
     body = corpus_text()
     if not body.strip():
         body = "The quick brown fox jumps over the lazy dog. "
+    # The template's own markers cost tokens. Measured once against empty text
+    # and subtracted from the target, so `fill 32768` still means a 32768-token
+    # prompt rather than 32768 plus however many this model's template adds -
+    # otherwise the depth a row claims and the depth it measured would drift
+    # apart by a per-model constant.
+    shell, applied = apply_template(url, "", timeout)
+    overhead = n_tokens(url, shell, timeout) if applied else 0
+    fill_tokens = max(1, fill_tokens - overhead)
     per_char = max(1e-6, n_tokens(url, body[:20000], timeout) / 20000.0)
     want_chars = int(fill_tokens / per_char)
     # Past the length of the corpus there is nothing left to say, so the filler
@@ -144,7 +311,8 @@ def build_prompt(url, fill_tokens, timeout=120):
         if abs(got - fill_tokens) < max(32, fill_tokens * 0.01):
             best = body[:mid]
             break
-    return best + INSTRUCTION, repeated
+    prompt, applied = apply_template(url, best + INSTRUCTION, timeout)
+    return prompt, repeated, applied
 
 
 def sampling_of(c):
@@ -203,7 +371,8 @@ def generate(url, prompt, n_predict=N_PREDICT, timeout=1800, cache_prompt=False,
             "tokens_predicted": d.get("tokens_predicted"),
             "tokens_evaluated": d.get("tokens_evaluated"),
             "sample": txt[:600],
-            "distinct_ratio": _distinct_ratio(txt)}
+            "distinct_ratio": _distinct_ratio(txt),
+            "copyback_ratio": _copyback_ratio(txt, prompt)}
 
 
 def _distinct_ratio(text, n=8):
@@ -216,11 +385,42 @@ def _distinct_ratio(text, n=8):
     return round(len(set(grams)) / len(grams), 3)
 
 
+def _copyback_ratio(text, prompt, n=8):
+    """Fraction of n-word windows in the output that appear verbatim in the prompt.
+
+    Near 0.0 is a model doing its own work. Near 1.0 the model stopped
+    generating and is copying its context back at you - which distinct_ratio
+    cannot see, because a copy's windows are all distinct and it reads a clean
+    1.00. Copying inflates speculative acceptance exactly as much as looping
+    does: a drafter that predicts the next prompt word is trivially accepted by
+    a target that then samples the same prompt word. Two symptoms, one meaning."""
+    w = text.split()
+    pw = prompt.split()
+    if len(w) < n + 1 or len(pw) < n + 1:
+        return None
+    pgrams = set(zip(*(pw[i:] for i in range(n))))
+    hits = sum(1 for g in zip(*(w[i:] for i in range(n))) if g in pgrams)
+    return round(hits / (len(w) - n + 1), 3)
+
+
 # ---------------------------------------------------------------------------
 # One config
 # ---------------------------------------------------------------------------
+# Campaign-level, not points in the grid. They ride in the config dict because
+# build_argv reads from it, and are stripped back out of the stored row: an
+# absolute path is not a knob anyone sweeps over, and every comparison in this
+# module groups on config equality. template_id carries them instead.
+_TEMPLATE_KEYS = ("chat_template_file", "chat_template_kwargs",
+                  "reasoning", "reasoning_preserve")
+
+# The sampler names a sweep CONFIG uses - what sampling_of() reads and _key()
+# hashes. The launch-script form spells the last two out in full; web.py maps.
+_SWEEP_SAMPLER_KEYS = ("temp", "top_k", "top_p", "min_p", "rep_pen", "pres_pen")
+
+
 def bench_one(backend, model_path, c, port=BENCH_PORT, timeout=420.0,
-              n_predict=N_PREDICT, repeat=N_REPEAT, gen_timeout=1800, log=print):
+              n_predict=N_PREDICT, repeat=N_REPEAT, gen_timeout=1800, log=print,
+              on_server=None):
     """Load one config, measure it, tear it down.
 
     Two kinds of pass, because prefill and decode want opposite things from the
@@ -238,20 +438,83 @@ def bench_one(backend, model_path, c, port=BENCH_PORT, timeout=420.0,
     measured ~315 tok/s of prefill, a 120k-token prompt is six minutes; paying
     that four times per config would put a single row past twenty minutes."""
     log_dir = os.path.join(_data_dir(), "sweep-logs")
-    row = {"status": "error", "config": dict(c),
+    # The template is a property of the CAMPAIGN, not of one point in the grid,
+    # so it is stamped on the row beside prompt_id rather than left in the config
+    # dict: an absolute path is not a setting anyone is sweeping over, and every
+    # comparison in this file groups on config equality.
+    stored = {k: v for k, v in c.items() if k not in _TEMPLATE_KEYS}
+    row = {"status": "error", "config": stored,
            "model": os.path.basename(model_path), "backend": backend["build"],
            "speed": True, "n_predict": n_predict, "repeat": repeat}
+    tf, tk = c.get("chat_template_file"), c.get("chat_template_kwargs")
+    rea, rea_p = c.get("reasoning"), c.get("reasoning_preserve")
+    if tf or tk or rea or rea_p:
+        row["template_id"] = template_identity(tf, tk, rea, rea_p)
+        row["chat_template"] = os.path.basename(tf) if tf else None
+        row["template_kwargs"] = tk
+        row["reasoning"] = rea
+        row["reasoning_preserve"] = rea_p
+    # Which frozen corpus this row measured against. Everything a deep-fill
+    # number means lives or dies on this: two rows from different corpora are
+    # different experiments, and resume and every comparison below treat them
+    # that way. Stamped BEFORE the server starts, so a row that never loads -
+    # OOM, EXIT, genfail - still belongs to the campaign: resume must be able
+    # to skip a wall it already paid to discover.
+    row["prompt_id"] = prompt_identity()
     cfg = dict(c)
     cfg["warmup"] = True          # a speed run should not pay for lazy init
+    # Resolved per config, not once per campaign: the collision only appears
+    # BETWEEN rows, when the previous server's socket is still winding down.
+    port = free_port(port)
     with serve(backend, model_path, cfg, port=port, timeout=timeout,
                log_dir=log_dir, log_name="bench.log") as srv:
+        # Publish the live server so a hard stop has something to act on. Nearly
+        # all of a config's wall time is spent inside one blocking request to
+        # it - a 120k-token prefill is minutes - so a flag checked between
+        # configs cannot end a run promptly, and killing the server can.
+        if on_server:
+            on_server(srv.proc)
         if srv.ok:
             try:
-                prompt, repeated = build_prompt(srv.url, c.get("fill") or 0)
+                prompt, repeated, templated = build_prompt(srv.url,
+                                                           c.get("fill") or 0)
                 row["prompt_tokens"] = n_tokens(srv.url, prompt)
                 row["corpus_repeated"] = bool(repeated)
+                # False means this build has no /apply-template and the row was
+                # measured on raw continuation - the mode that produced 23
+                # unusable rows. Recorded per row because it is a property of
+                # the BACKEND, so it can differ between two rows in one file.
+                row["templated"] = bool(templated)
                 samp = sampling_of(c)
                 row["sampling"] = samp
+                # One throwaway pass on a TINY prompt, before anything is timed.
+                #
+                # llama-server's own --warmup does not cover what this does. The
+                # measured shape says so: at ncmoe 32-35 the ready line came
+                # 21-49s after launch and the first real request then spent
+                # 106-158s on a 2,065-token prompt - while the same model at
+                # 119,099 tokens managed 573s. A rate cannot do that. Solving
+                # the two gives ~253 tok/s plus ~100s of FIXED cost, and the
+                # fixed part is anti-correlated with load time: when loading
+                # took 21s the first request took 158s, when it took 49s the
+                # request took 116s, and the sum barely moved. That is paging.
+                # --n-cpu-moe puts ~20 GB of experts in system RAM, the plan
+                # already needs more RAM than is free, and whatever the load did
+                # not fault in the first forward pass does.
+                #
+                # bench_one already knew the first pass is contaminated - it
+                # throws the cold pass's DECODE away for exactly this reason,
+                # and the numbers agree, cold decode running 0.56-0.82x the warm
+                # figure. It just kept the same pass's PREFILL. So prefill_tok_s
+                # at shallow fill was measuring page faults.
+                #
+                # This costs nothing: the fault-in is paid once either way. It
+                # moves out of the number instead of being added to the run.
+                generate(srv.url, INSTRUCTION.strip(), 1, gen_timeout,
+                         cache_prompt=False, sampling=samp, seed=999)
+                # Rows recorded before this are not comparable on prefill and
+                # must not be silently averaged with these.
+                row["prefill_warm"] = True
                 cold = generate(srv.url, prompt, min(16, n_predict), gen_timeout,
                                 cache_prompt=False, sampling=samp, seed=1000)
                 row["cold"] = cold
@@ -269,6 +532,9 @@ def bench_one(backend, model_path, c, port=BENCH_PORT, timeout=420.0,
                 dr = [r.get("distinct_ratio") for r in runs
                       if r.get("distinct_ratio") is not None]
                 row["distinct_ratio"] = round(min(dr), 3) if dr else None
+                cb = [r.get("copyback_ratio") for r in runs
+                      if r.get("copyback_ratio") is not None]
+                row["copyback_ratio"] = round(min(cb), 3) if cb else None
                 # Acceptance is the number that explains a speculative result.
                 # Absent on non-speculative runs, and absent on builds that do
                 # not report it - both are fine, and both are visible as None
@@ -291,6 +557,16 @@ def bench_one(backend, model_path, c, port=BENCH_PORT, timeout=420.0,
             except Exception as e:
                 row["status"] = "genfail"
                 row["gen_error"] = "%s: %s" % (type(e).__name__, e)
+            # Read INSIDE the serve() block, while the process still exists:
+            # a demotion is a property of the running process and the counter
+            # instance disappears with it. gpu_free_after_mib is read after
+            # teardown and is identical on every row for exactly that reason.
+            try:
+                row["shared_mib"] = gpu_shared_mib(srv.proc.pid)
+            except Exception:
+                row["shared_mib"] = None
+    if on_server:
+        on_server(None)             # torn down; nothing left to kill
     finish_row(row, srv, log_dir=log_dir)
     # finish_row takes its verdict from the server, which came up fine; a
     # generation that then failed is still a failed measurement.
@@ -302,9 +578,56 @@ def bench_one(backend, model_path, c, port=BENCH_PORT, timeout=420.0,
     # The Windows failure mode is not an OOM. WDDM spills past dedicated VRAM
     # into system RAM and the load SUCCEEDS, so the row says "ok" and only the
     # numbers give it away: a negative floor, and decode falling off a cliff.
-    # Naming it on the row means the ngl ladder can be read without knowing that.
-    row["spilled"] = bool(row.get("suspect")) and row.get("status") == "ok"
+    #
+    # Only suspect_reason() can answer that from ONE row. The counter reading
+    # cannot - it needs the rest of the ladder to be excess over (see demoted())
+    # - so `demoted` is False here by construction and the verdict is re-decided
+    # in _infer_demotion() on the way back out of the store, where the ladder
+    # exists. Written anyway, so a row is never missing the field.
+    row["spilled"] = (row.get("status") == "ok"
+                      and (bool(row.get("suspect")) or demoted(row)))
     return row
+
+
+# Excess shared memory over a ladder's own baseline, above which the driver has
+# moved something. NOT an absolute reading - see demoted().
+SHARED_SPILL_MIB = 64.0
+
+
+def demoted(row):
+    """Did WDDM move part of this process into system RAM?
+
+    Only ever answers from `shared_excess`, which is measured against the row's
+    own ladder. The raw counter cannot answer it, and the first version of this
+    function - `shared_mib > 64` - was wrong for a reason worth writing down,
+    because it is the whole difference between the two.
+
+    `\\GPU Process Memory\\Shared Usage` counts every byte of host memory mapped
+    for GPU access. That includes memory that is in system RAM BY CHOICE:
+    llama.cpp's CUDA_Host pinned staging buffers, and `--no-mmproj-offload`,
+    which is a config knob this grid deliberately sweeps. So the counter has a
+    large baseline on a process that fits perfectly:
+
+        ngl 26/27/28 + draft-mtp 2, projector in RAM   shared 474.0 MiB, all three
+        ngl 31       + no spec,     projector in RAM   shared 238.0 MiB
+
+    Two things there. The reading does not move with ngl - 474.0 exactly, while
+    proc_vram climbs 10660 -> 11164 -> 11410 - and demotion under pressure is
+    precisely the thing that would. And the 474 MiB row at ngl 28 is the FASTEST
+    row ever measured on this model at this depth, 3.95 against 3.25 for the 238
+    MiB one. A threshold of 64 called all four spilled, which put every row of
+    the campaign outside trustworthy() and left best_config() with nothing to
+    pick - a detector that fires on everything reports nothing.
+
+    What separates a demotion from a deliberate placement is that a demotion
+    RESPONDS TO PRESSURE. So the signal is the excess over what the rest of the
+    ladder carries, exactly like the floor collapse in _infer_demotion(), and it
+    needs the same grouping to mean anything.
+
+    None means unmeasured, which is not evidence of absence: an unmeasured row
+    is not called clean, it is simply not called demoted either."""
+    x = row.get("shared_excess")
+    return x is not None and x > SHARED_SPILL_MIB
 
 
 # ---------------------------------------------------------------------------
@@ -551,6 +874,19 @@ _CONFIG_DEFAULTS = {"ncmoe": 0, "spec_n_max": 0, "fill": 0, "seq": 1,
 # `stage`, which is a label.
 CARRY_KEYS = ("ngl", "ncmoe", "ub", "mmproj_offload", "spec", "spec_n_max")
 
+# Below this fraction of unique 8-word windows the output is repetition, not
+# work. One constant because the run-time table and the trustworthy() gate must
+# agree: a row warned about while running and then kept for a conclusion - or
+# dropped without ever having been flagged - would be worse than either alone.
+LOOP_RATIO = 0.5
+
+# Above this fraction of 8-word windows that also appear in the prompt, the
+# output is a verbatim copy of the context - the second way a model can look
+# healthy while generating nothing new. distinct_ratio stays near 1.0 for a
+# copy, so the two gates are complements, and they share the marker-and-gate
+# rule above for the same reason.
+COPY_RATIO = 0.5
+
 
 def trustworthy(r):
     """May a conclusion be drawn from this row?
@@ -558,21 +894,40 @@ def trustworthy(r):
     A spilled row loaded and reported `ok`: WDDM put part of it in shared system
     memory instead of failing, so its speed is off a cliff for a reason that has
     nothing to do with the setting under test. A looping row generated the same
-    eight-word window over and over, which is not work.
+    eight-word window over and over. A copying row stopped generating and is
+    echoing its context back - distinct_ratio cannot see it (a copy's windows
+    are all distinct), but it inflates speculative acceptance exactly as much
+    as looping does.
 
-    Both still belong in the TABLE - they are evidence about where the wall is -
-    but neither may be the thing a baseline or an effect size is computed from.
-    Carrying a spilled row forward as a chained baseline would bend every stage
-    after it in the same direction, silently."""
+    All three still belong in the TABLE - they are evidence about where the
+    wall is - but none may be the thing a baseline or an effect size is
+    computed from. Carrying a spilled row forward as a chained baseline would
+    bend every stage after it in the same direction, silently.
+
+    A row recorded before the copy gate existed has no copyback_ratio and is
+    judged on the gates it does carry - history is not rewritten, it is just
+    labelled (see sweep_index's n_ungated)."""
     if r.get("status") != "ok" or not r.get("tok_s"):
         return False
     if r.get("spilled"):
         return False
     dr = r.get("distinct_ratio")
-    return not (dr is not None and dr < 0.5)
+    if dr is not None and dr < LOOP_RATIO:
+        return False
+    cb = r.get("copyback_ratio")
+    # Strict, mirroring LOOP_RATIO's: a row exactly at the line is not (yet) a copy.
+    if cb is not None and cb > COPY_RATIO:
+        return False
+    return True
 
 
-def comparable(r, model, base, n_predict=None, repeat=None):
+# None is a MEANINGFUL template_id - "no template pinned, the GGUF's own was
+# used" - so it cannot double as "do not filter on this". Hence a sentinel.
+_ANY = object()
+
+
+def comparable(r, model, base, n_predict=None, repeat=None, prompt_id=None,
+               template_id=_ANY):
     """Was this row measured under the same conditions as the campaign?
 
     Speed is conditional on all of these, so a row taken at another depth or with
@@ -581,12 +936,26 @@ def comparable(r, model, base, n_predict=None, repeat=None):
     A 2k-fill row must never set the baseline for a 32k campaign, and neither
     must a greedy row set it for a campaign sweeping real sampler settings -
     greedy is speculation's best case, so those are two experiments and not two
-    configs."""
+    configs.
+
+    `prompt_id` is the frozen corpus a campaign is measuring against. A row from
+    another corpus - or from before the corpus was frozen at all - is a
+    different experiment for exactly the same reason, so when the campaign
+    passes its own id, the row must carry that same id."""
     if model and r.get("model") != model:
         return False
     if n_predict is not None and r.get("n_predict") != n_predict:
         return False
     if repeat is not None and r.get("repeat") != repeat:
+        return False
+    if prompt_id is not None and r.get("prompt_id") != prompt_id:
+        return False
+    # A template changes the ANSWER, so it changes tok/s: a thinking template
+    # spends tokens on a reasoning block before it says anything. Filtered in
+    # both directions - a campaign that pinned none must not inherit a baseline
+    # from one that did, which is why None here means "no template" and the
+    # sentinel means "do not filter".
+    if template_id is not _ANY and r.get("template_id") != template_id:
         return False
     c = r.get("config") or {}
     if not (c.get("ctx") == base.get("ctx")
@@ -604,14 +973,16 @@ def comparable(r, model, base, n_predict=None, repeat=None):
 
 
 def best_config(rows, model, base, n_predict=None, repeat=None,
-                incumbent_tok_s=None, margin=CHAIN_MARGIN):
+                incumbent_tok_s=None, margin=CHAIN_MARGIN, prompt_id=None,
+                template_id=_ANY):
     """The baseline for the next stage: (config, row) or (None, None).
 
     Reads rows that are already on DISK, not just the ones this process has in
     memory, so a campaign stopped after stage A and restarted tomorrow picks its
     winner back up instead of falling back to the planner's guess."""
     cand = [r for r in rows
-            if trustworthy(r) and comparable(r, model, base, n_predict, repeat)]
+            if trustworthy(r) and comparable(r, model, base, n_predict, repeat,
+                                             prompt_id, template_id)]
     if not cand:
         return None, None
     win = max(cand, key=lambda r: r["tok_s"])
@@ -626,10 +997,112 @@ def best_config(rows, model, base, n_predict=None, repeat=None,
     return c, win
 
 
+def resolve_search(axes, chain):
+    """(chain, note) - which search actually runs when both were asked for.
+
+    Chaining rebuilds each STAGE against the previous stage's winner, and an
+    explicit --speed-axes ladder has no stages, so the two cannot both apply.
+    The ladder is the more specific instruction and wins.
+
+    Pulled out as its own function because the failure it prevents is silent:
+    with both set, the campaign would take exactly the same hours and measure
+    the staged grid instead of the ladder that was asked for, with nothing in
+    the output to say so. A precedence rule worth stating out loud is worth
+    being able to test."""
+    if axes and chain:
+        return False, ("note    : --speed-axes given, so chaining is off - an "
+                       "explicit ladder has no stages to chain")
+    return chain, None
+
+
+def resolve_rounds(chain, rounds):
+    """Rounds only means something with chaining on. Returns (rounds, note).
+
+    A round re-runs the stages from the WINNER, and without chaining there is no
+    winner to re-run them from - every stage is built off the same fixed
+    baseline, so round two re-derives an identical grid and skips all of it as
+    already recorded. The setting was accepted in that state and did precisely
+    nothing, with nothing said. Same reasoning as resolve_search(): a knob that
+    silently does not apply is worse than one that is refused."""
+    rounds = max(1, int(rounds or 1))
+    if rounds > 1 and not chain:
+        return 1, ("note    : rounds=%d ignored - a round re-runs the stages from "
+                   "the winner, and without chaining there is no winner to re-run "
+                   "them from" % rounds)
+    return rounds, None
+
+
 def _carry_summary(c):
     return ("ngl %s ncmoe %s ub %s spec %s"
             % (c.get("ngl"), c.get("ncmoe") or 0, c.get("ub"),
                c.get("spec") or "none"))
+
+
+def verify_config(win_c, overrides=None):
+    """The exact config one verification load measures: the winner plus overrides.
+
+    The winner carries the knobs the search settled on; the overrides carry
+    everything that makes the config you actually run different - the spec, the
+    draft depth, the samplers. Pure, so the campaign and the self-test agree on
+    what gets loaded."""
+    c = dict(win_c or {})
+    c.pop("stage", None)
+    for k, vals in (overrides or {}).items():
+        if vals:
+            c[k] = vals[-1]
+    return c
+
+
+def _verify_step(backend, model_path, facts, name, base, path, pid, gpu,
+                 overrides=None, port=BENCH_PORT, timeout=420.0,
+                 n_predict=N_PREDICT, repeat=N_REPEAT, log=print,
+                 template=(None, None, None, None), template_id=_ANY):
+    """Load the campaign's winner at the PRODUCTION config, exactly once.
+
+    The staged search measures each knob at the config the grid asked for, and
+    the winner is the fastest row that fitted THOSE settings. The config a
+    person actually launches can differ - the MTP draft cache, real samplers, a
+    deeper fill - and a split that fitted one does not necessarily fit the
+    other; a launcher carrying the winner's ngl into a config that OOMs on it
+    is the quiet failure this exists for. One verification load settles it, and
+    the row lands in the same file with the same prompt_id, so the certified
+    answer is recorded data rather than a claim."""
+    win_c, win_r = best_config(load_rows(path), name, base, n_predict=n_predict,
+                               repeat=repeat, prompt_id=pid,
+                               template_id=template_id)
+    if win_c is None:
+        log("verify  : nothing to certify - no trustworthy row at this campaign's settings")
+        return None
+    c = verify_config(win_c, overrides)
+    # The winner came back off DISK, where template keys are deliberately not
+    # stored. Re-attach them, or the one load that certifies the campaign would
+    # be the only load in it measured against a different template.
+    for k, v in zip(_TEMPLATE_KEYS, template):
+        if v:
+            c[k] = v
+    log("verify  : the winner (%s) does not know the config you actually run -" % _carry_summary(win_c))
+    log("          loading %s%s once"
+        % (_carry_summary(c),
+           "  fill %s" % (c.get("fill") or 0)
+           if c.get("fill") else ""))
+    row = bench_one(backend, model_path, c, port=port, timeout=timeout,
+                    n_predict=n_predict, repeat=repeat, log=log)
+    row.update({"arch": facts["arch"], "n_layers": facts["n_layers"],
+                "when": int(time.time()), "gpu": gpu})
+    with open(path, "a", encoding="utf-8") as fh:
+        fh.write(json.dumps(row) + "\n")
+        fh.flush()
+        os.fsync(fh.fileno())
+    good = row.get("status") == "ok" and trustworthy(row)
+    if good:
+        log("verify  : OK - the winner loads at your production config and is certified")
+    else:
+        log("verify  : FAILED - the winner does not fit your production config (%s%s)"
+            % (row.get("status"), row.get("gen_error") or row.get("error") or ""))
+        log("          the tok/s and VRAM evidence above apply to the config as MEASURED,")
+        log("          not to this one. Lower ngl / draft depth, or drop the projector")
+        log("          offload, before launching.")
+    return {"ok": good, "row": _slim(row), "config": c}
 
 
 # ---------------------------------------------------------------------------
@@ -694,7 +1167,11 @@ def speed_sweep(models=None, backend=None, dry_run=False, timeout=420.0,
                 ctx=None, kv=None,
                 n_predict=N_PREDICT, repeat=N_REPEAT, log=print, skip_preflight=False,
                 on_row=None, should_stop=None, on_total=None,
-                chain=False, rounds=1):
+                should_abort=None, on_server=None,
+                chain=False, rounds=1, verify=False, verify_overrides=None,
+                chat_template_file=None, chat_template_kwargs=None,
+                reasoning=None, reasoning_preserve=None, sampling=None,
+                mmproj_offload=None):
     """Run the speed grid and append one row per config. Resumable like --sweep.
 
     `on_row` is called with each finished row, `on_total` when the number of
@@ -732,33 +1209,127 @@ def speed_sweep(models=None, backend=None, dry_run=False, timeout=420.0,
     facts = model_facts(mp)
     mmproj = find_mmproj_for(mp)
 
+    # Validated before a single server is launched. A bad kwargs string is a
+    # four-hour campaign that dies on config one, or worse - a template path with
+    # a typo is not an error at all, just a silent fallback to the GGUF's own.
+    from .launch import template_args, reasoning_args
+    try:
+        tmpl_f, tmpl_k = template_args(chat_template_file, chat_template_kwargs)
+        rea, rea_p = reasoning_args(reasoning, reasoning_preserve)
+    except ValueError as e:
+        log("template: %s" % e)
+        return None
+    if tmpl_f and not os.path.isfile(tmpl_f):
+        log("template: no such file - %s" % tmpl_f)
+        return None
+    # The thinking flags are part of the template's identity, not separate from
+    # it: --reasoning off makes the same template produce a different answer of
+    # a different length, which is a different measurement.
+    tmpl_id = template_identity(tmpl_f, tmpl_k, rea, rea_p)
+
     base = dict(SPEED_BASE)
+    if tmpl_f:
+        base["chat_template_file"] = tmpl_f
+    if tmpl_k:
+        base["chat_template_kwargs"] = tmpl_k
+    if rea:
+        base["reasoning"] = rea
+    if rea_p:
+        base["reasoning_preserve"] = rea_p
+    # Samplers, frozen across the campaign rather than swept - the same standing
+    # as ctx and kv. They belong in the config dict because sampling_of() reads
+    # them from there and _key() includes them, so a campaign re-run at real
+    # settings does not resume greedy rows as though they were the same
+    # measurement. Which they are not, and the difference is largest exactly
+    # where it is least obvious: greedy makes the target's token deterministic,
+    # so it is speculation's best case, and an acceptance rate measured there is
+    # an upper bound rather than a result.
+    for k, v in (sampling or {}).items():
+        if k in _SWEEP_SAMPLER_KEYS and v is not None and v != "":
+            base[k] = float(v) if k != "top_k" else int(v)
+    # Pinned for the campaign rather than swept. None keeps stage B's job as it
+    # was; True/False fix the placement and make stage B a no-op, which is said
+    # out loud below rather than left as four configs that measure one thing.
+    if mmproj_offload is not None:
+        base["mmproj_offload"] = bool(mmproj_offload)
     if fill is not None:
         base["fill"] = fill
     if ctx is not None:
         base["ctx"] = ctx
     if kv is not None:
         base["kv"] = kv
+    # Stage B IS the projector sweep. Pinning the placement and then running it
+    # anyway would re-measure the axis that was just fixed - the configs would
+    # all carry the pinned value, so the stage would spend loads proving one
+    # thing four times. Dropped, and said, rather than silently wasting them.
+    if mmproj_offload is not None and "b" in (stages or ""):
+        stages = (stages or "").replace("b", "")
+        log("note    : projector pinned to %s, so stage B is dropped - that stage "
+            "IS the projector sweep"
+            % ("VRAM" if mmproj_offload else "system RAM"))
     cfgs = build_speed_grid(facts, mmproj=mmproj, base=base, stages=stages,
                             model_path=mp)
     if axes:
         # An explicit ladder replaces the staged grid: this is how a stage gets
         # re-run at the ngl the previous stage actually settled on.
-        combos = [dict(base, **({"mmproj": mmproj} if mmproj else {}))]
+        #
+        # It starts from the RESOLVED base, not from SPEED_BASE. Those differ in
+        # the one place it matters most: SPEED_BASE carries ngl 26, a value that
+        # belongs to no model, while grid_context() asks the planner where the
+        # layers actually land - ngl 41 on the MoE this was found on. A ladder
+        # over ncmoe anchored at ngl 26 puts fifteen whole blocks on the CPU and
+        # measures a config nobody asked about, next to stage rows that used 41.
+        # It also clamps ctx to what the model was trained on, which the staged
+        # path has always done and this one silently did not.
+        gbase = grid_context(facts, mmproj=mmproj, base=base, model_path=mp)[0]
+        combos = [dict(gbase, **({"mmproj": mmproj} if mmproj else {}))]
         for k, vals in axes.items():
             combos = [dict(c, **{k: v}) for c in combos for v in vals]
         cfgs = combos
+    chain, note = resolve_search(axes, chain)
+    if note:
+        log(note)
+    rounds, rnote = resolve_rounds(chain, rounds)
+    if rnote:
+        log(rnote)
 
     gpu = (gpu_list(fresh=True) or [{}])[0].get("name") or ""
     path = bench_path(gpu, b["build"])
+    # The frozen corpus every row of this campaign measures against. A row
+    # recorded under a different prompt_id - another corpus, or before the
+    # corpus was frozen at all - is a different experiment, and resuming it as
+    # already done would mix two prompts into one campaign with no sign.
+    pid = prompt_identity()
+    # A missing snapshot degrades to "different experiment", not to corruption:
+    # the rebuild hashes differently, so these rows refuse to merge with any
+    # other checkout's. But it must be said out loud - silently re-basing a
+    # campaign's identity on the working tree is the exact failure the freeze
+    # exists to catch.
+    if not os.path.isfile(_CORPUS_PATH):
+        log("corpus  : _corpus.txt is MISSING - rebuilt from this working tree, "
+            "so this campaign is its own experiment and its rows will not merge "
+            "with another clone's. Commit the snapshot (python -m vram_planner "
+            "--refresh-corpus).")
     # Resume must also match how the row was MEASURED, not just what was
     # configured. A row taken at n_predict 32 / repeat 1 - a smoke test - is not
     # the same measurement as one taken at 128 / 3, and silently accepting it as
     # already-done would put a noisier number into the comparison than every
     # other row and give no sign it had happened.
-    done = {_key(r["model"], r["config"]) for r in load_rows(path)
-            if r.get("config") and r.get("status") in ("ok", "oom")
-            and r.get("n_predict") == n_predict and r.get("repeat") == repeat}
+    # Keep the ROW, not just the key. A resumed config is not a gap in the
+    # ladder, it is a rung that was already climbed - and printing only a count
+    # of them turned a complete six-rung ladder into three rows with the OOM
+    # boundary missing, which reads as the tool ignoring what was asked for.
+    recorded = {}
+    for r in load_rows(path):
+        if (r.get("config") and r.get("status") in ("ok", "oom")
+                and r.get("n_predict") == n_predict and r.get("repeat") == repeat
+                and r.get("prompt_id") == pid
+                # ...and under the same chat template. A thinking template
+                # answers at a different length than a terse one, so a row
+                # measured without one is not this campaign's row already done.
+                and r.get("template_id") == tmpl_id):
+            recorded[_key(r["model"], r["config"])] = r
+    done = set(recorded)
     plan = [c for c in cfgs if _key(os.path.basename(mp), c) not in done]
     skipped = len(cfgs) - len(plan)
     if limit:
@@ -769,6 +1340,24 @@ def speed_sweep(models=None, backend=None, dry_run=False, timeout=420.0,
     log("model   : %s  (%d blocks, %s)" % (os.path.basename(mp), facts["n_layers"],
                                            facts["arch"]))
     log("mmproj  : %s" % (os.path.basename(mmproj) if mmproj else "none"))
+    log("prompt  : %s (frozen corpus; rows are keyed on it, so a refresh re-measures)" % pid[:12])
+    if tmpl_id:
+        log("template: %s %s  (%s, hashed by content - editing it re-measures)"
+            % (os.path.basename(tmpl_f) if tmpl_f else "(kwargs only)",
+               tmpl_k or "", tmpl_id[:12]))
+    else:
+        log("template: none pinned - the GGUF's own metadata template")
+    if rea or rea_p:
+        log("thinking: --reasoning %s, preserve history %s"
+            % (rea or "auto", rea_p or "template default"))
+    # Said out loud either way. Greedy is the default and it is speculation's
+    # best case, so a campaign that never mentions its samplers is the one whose
+    # acceptance rate is most likely to be read as a result rather than a bound.
+    samp_set = [(k, base[k]) for k in _SWEEP_SAMPLER_KEYS if k in base]
+    log("sampling: %s" % (" ".join("%s %s" % kv for kv in samp_set) if samp_set
+                          else "greedy (temp 0) - reproducible across configs, and "
+                               "speculation's BEST case, so read acceptance as an "
+                               "upper bound"))
     log("output  : %s" % path)
     log("configs : %d to run, %d already recorded" % (len(plan), skipped))
     log("estimate: ~%.1f h  (load + %d warm + %d x %d tokens per config)"
@@ -808,6 +1397,13 @@ def speed_sweep(models=None, backend=None, dry_run=False, timeout=420.0,
         if chain and len(shown) < len(plan):
             log("  .. and %d more in later stages, built from what the ones above find"
                 % (len(plan) - len(shown)))
+        if verify:
+            log("verify  : after the campaign, the winner is loaded once more at the")
+            extra = (" (" + " ".join("%s=%s" % (k, ",".join(map(str, v)))
+                                     for k, v in sorted(verify_overrides.items()))
+                     + ")") if verify_overrides else ""
+            log("          production config%s - a split that fits the grid is not"
+                " automatically one that fits what you actually run" % extra)
         # The config list rides along so the UI can show the same preview the CLI
         # prints, rather than parsing the lines above back out of a log.
         return {"planned": len(plan), "path": path, "dry_run": True,
@@ -818,35 +1414,69 @@ def speed_sweep(models=None, backend=None, dry_run=False, timeout=420.0,
                 "chained": bool(chain), "rounds": int(rounds or 1),
                 "provisional": bool(chain) and len(shown) < len(plan),
                 "stage_sizes": sizes,
+                "verify": bool(verify),
                 "estimate_h": round(len(plan) * (60.0 + repeat * n_predict / 4.0)
                                     / 3600.0, 2)}
     if not skip_preflight and not preflight(log=log):
         return None
 
     log("")
-    log("%-2s %-4s %-5s %-5s %-8s %-13s %-4s %-6s | %8s %9s %7s %6s"
+    log("%-2s %-4s %-5s %-5s %-8s %-13s %-4s %-6s | %8s %9s %7s %6s %6s"
         % ("st", "ngl", "ncmoe", "ub", "fill", "spec", "nmax", "mmproj",
-           "tok/s", "prefill", "VRAM", "accept"))
+           "tok/s", "prefill", "VRAM", "accept", "distin"))
+    # The rungs already climbed, printed in place before the new ones. Resume
+    # exists so a stopped campaign is not re-paid for, but a ladder is read as a
+    # ladder: where it OOMs and where it starts working is the whole finding,
+    # and half of it missing looks like the request was ignored rather than
+    # already answered. Marked "was" so nothing here reads as measured just now.
+    name = os.path.basename(mp)
+    for c in cfgs:
+        r = recorded.get(_key(name, c))
+        if r is not None:
+            log(_fmt_row(c, r) + "   (recorded earlier)")
     out, stopped = [], False
     total = [len(plan)]                 # a list so run_group can revise it
+    # The campaign's own estimate, which under a chained search is NOT the same
+    # number as the bar's denominator: chaining measures one stage at a time and
+    # only the running stage has a known config list. Reported separately rather
+    # than reconciled, because they are answers to two different questions and
+    # picking one to show made the other look like a mistake.
+    planned = len(plan)
     if on_total:
-        on_total(total[0])
-    name = os.path.basename(mp)
+        on_total(total[0], stage=None, planned=planned)
 
     with open(path, "a", encoding="utf-8") as fh:
 
         def run_group(cfgs):
             """Measure a list of configs. Returns False if asked to stop."""
-            for c in cfgs:
+            queue = list(cfgs)
+            tries = {}
+            i = -1
+            while True:
+                i += 1
+                if i >= len(queue):
+                    return True
+                c = queue[i]
                 if should_stop and should_stop():
                     log("stopped after %d of %d configs. The rows already written "
                         "are keyed, so re-running resumes here."
                         % (len(out), total[0]))
                     return False
                 row = bench_one(b, mp, c, port=port, timeout=timeout,
-                                n_predict=n_predict, repeat=repeat, log=log)
+                                n_predict=n_predict, repeat=repeat, log=log,
+                                on_server=on_server)
                 row.update({"arch": facts["arch"], "n_layers": facts["n_layers"],
                             "when": int(time.time()), "gpu": gpu})
+                # A hard stop kills the server mid-request, so this row failed
+                # because it was ABANDONED, not because the config cannot run.
+                # Writing it would record a fabricated wall - and worse, a
+                # `genfail` here is indistinguishable on disk from a real one,
+                # so the next campaign would carry the lie forward. Dropped, so
+                # the config is simply re-measured.
+                if should_abort and should_abort() and row.get("status") != "ok":
+                    log("abandoned %s - not recorded, so it will be re-measured"
+                        % _carry_summary(c))
+                    return False
                 fh.write(json.dumps(row) + "\n")
                 fh.flush()
                 os.fsync(fh.fileno())
@@ -858,7 +1488,33 @@ def speed_sweep(models=None, backend=None, dry_run=False, timeout=420.0,
                 log(_fmt_row(c, row, len(out), total[0]))
                 if on_row:
                     on_row(row)
-            return True
+                # A speculative config that OOMs gets ONE MORE RUNG, repeatedly.
+                #
+                # This is the fix for a stage that could not succeed. Stages A
+                # and B choose the fastest split that FITS, which is by
+                # construction the one with the least headroom left. Stage D
+                # then asks for a draft KV cache that llama.cpp keeps at f16
+                # whatever -ctk says. So the speculative rows OOM, and the
+                # campaign concludes speculation does not work on this model.
+                #
+                # It concluded that twice this week and was wrong both times.
+                # draft-mtp OOMed at ngl 31 and was the best config measured at
+                # ngl 28 (3.95 vs 3.25); it OOMed at ncmoe 29 and was the best
+                # config measured at ncmoe 34 (54.87 vs 47.17). A stage whose
+                # design guarantees the answer "no" is not measuring anything.
+                #
+                # An OOM is cheap - it fails during load, before a single token
+                # - so walking a few rungs costs far less than the finding is
+                # worth. Bounded, because an OOM that is NOT about the draft
+                # cache would otherwise walk the whole ladder.
+                nxt = _spec_retry(c, row, facts, tries)
+                if nxt is not None and _key(name, nxt) not in done:
+                    log("          ^ that OOM is the draft cache, not the model. "
+                        "Retrying one rung freer: %s" % _carry_summary(nxt))
+                    queue.append(nxt)
+                    total[0] = len(out) + (len(queue) - i - 1)
+                    if on_total:
+                        on_total(total[0], planned=max(planned, total[0]))
 
         if not chain:
             stopped = not run_group(plan)
@@ -894,17 +1550,23 @@ def speed_sweep(models=None, backend=None, dry_run=False, timeout=420.0,
                         % (tag, len(todo), "" if len(todo) == 1 else "s",
                            _carry_summary(gb)))
                     total[0] = len(out) + len(todo)
+                    # The campaign estimate was built from the unchained grid, so
+                    # a rebased stage can outgrow it. Never let it claim fewer
+                    # configs than have already been measured.
+                    planned = max(planned, total[0])
                     if on_total:
-                        on_total(total[0])
+                        on_total(total[0], stage=tag, planned=planned)
                     if not run_group(todo):
                         stopped = True
                         break
+                    _spec_wall_note(out, todo, gb, log)
                     # Re-read from DISK, not from `out`: a campaign resumed after a
                     # stop has rows this process never saw, and they are exactly
                     # the ones that say where the previous stage got to.
                     nxt, win = best_config(load_rows(path), name, base,
                                            n_predict=n_predict, repeat=repeat,
-                                           incumbent_tok_s=best_tok)
+                                           incumbent_tok_s=best_tok, prompt_id=pid,
+                                           template_id=tmpl_id)
                     if nxt is None:
                         log("  baseline unchanged: nothing beat %s by more than %.0f%%"
                             % ("%.2f tok/s" % best_tok if best_tok
@@ -918,8 +1580,105 @@ def speed_sweep(models=None, backend=None, dry_run=False, timeout=420.0,
                     break
     log("")
     log("%d rows -> %s" % (len(out), path))
+    verified = None
+    if verify and not dry_run and not stopped:
+        # Cancellation lands between configs: the verify step is a config load,
+        # and a campaign the user stopped mid-way must not start loading again.
+        verified = _verify_step(b, mp, facts, name, base, path, pid, gpu,
+                                overrides=verify_overrides, port=port,
+                                timeout=timeout, n_predict=n_predict,
+                                repeat=repeat, log=log,
+                                template=(tmpl_f, tmpl_k, rea, rea_p), template_id=tmpl_id)
     return {"rows": out, "path": path, "stopped": stopped, "planned": total[0],
-            "chained": bool(chain)}
+            "chained": bool(chain), "verified": verified}
+
+
+# How far a speculative config may walk looking for room. Four rungs was enough
+# for both models it was needed on - draft-mtp fitted 3 rungs down on a dense
+# model and 5 up on an MoE, the latter found because the ladder was written by
+# hand. Bounded because an OOM that is not about the draft cache would otherwise
+# march the whole ladder proving the model does not fit at all.
+SPEC_RETRY_RUNGS = 5
+
+
+def _spec_retry(c, row, facts, tries):
+    """The next config to try when a speculative one OOMs, or None.
+
+    Only for a draft model. The n-gram speculators build their drafts from the
+    context that is already there and allocate no second cache, so an OOM from
+    one of them is about the model, not about speculation, and walking would
+    only prove it more slowly.
+
+    Direction is per-architecture and they are opposites: on an MoE, raising
+    n_cpu_moe moves more experts to the CPU and FREES VRAM; on a dense model,
+    lowering ngl moves whole blocks off the GPU and frees it. Getting this
+    backwards would walk straight into the wall."""
+    if row.get("status") != "oom":
+        return None
+    spec = (c.get("spec") or "none")
+    if not spec.startswith("draft"):
+        return None
+    k = (spec, c.get("spec_n_max") or 0)
+    n = tries.get(k, 0)
+    if n >= SPEC_RETRY_RUNGS:
+        return None
+    nl = facts.get("n_layers") or 0
+    d = dict(c)
+    if facts.get("is_moe"):
+        d["ncmoe"] = (c.get("ncmoe") or 0) + 1
+        if nl and d["ncmoe"] > nl:
+            return None
+    else:
+        d["ngl"] = (c.get("ngl") or 0) - 1
+        if d["ngl"] < 1:
+            return None
+    tries[k] = n + 1
+    return d
+
+
+def _spec_wall_note(out, todo, base, log):
+    """Say what an all-OOM speculation stage actually means.
+
+    A draft model needs its own KV cache, and llama.cpp keeps it at f16 whatever
+    the main cache is quantised to - so speculation costs several hundred MiB
+    that the split it is being tried at was never chosen to leave room for.
+
+    Stage D only ever tries it at the split stage A/B settled on, and that split
+    is by construction the FASTEST one that fits, which usually means the one
+    with the least headroom left. So every draft row OOMs, and the campaign
+    reads as "speculation does not work on this model" when what it measured is
+    "speculation does not fit at this particular split". Those are different
+    findings and only one of them is true.
+
+    The remedy is an interaction the staged grid cannot express - vary the split
+    AND the speculation together - so this prints the ladder to run rather than
+    leaving it to be deduced from four OOM lines."""
+    keys = {(c.get("spec") or "none") for c in todo}
+    drafts = [c for c in todo if (c.get("spec") or "none").startswith("draft")]
+    if not drafts or len(keys) < 2:
+        return
+    ran = [r for r in out if (r.get("config") or {}).get("spec", "").startswith("draft")]
+    if not ran or any(r.get("status") == "ok" for r in ran):
+        return
+    moe = base.get("ncmoe") is not None and base.get("ncmoe") != 0
+    axis, cur = ("ncmoe", base.get("ncmoe")) if moe else ("ngl", base.get("ngl"))
+    if cur is None:
+        return
+    # More ncmoe means MORE on the CPU and less in VRAM; more ngl means the
+    # opposite. Either way, walk in the direction that frees memory.
+    rungs = [cur + i for i in range(1, 5)] if moe else \
+            [cur - i for i in range(1, 5) if cur - i >= 0]
+    log("")
+    log("note    : every draft-* row OOMed at %s %s. That is not a verdict on"
+        % (axis, cur))
+    log("          speculation - the draft KV cache is f16 whatever -ctk says, and")
+    log("          this split was picked as the fastest that FITS, so it had no room")
+    log("          spare. Vary the split and the speculation together:")
+    log("            --speed-axes %s=%s spec=draft-mtp spec_n_max=2%s"
+        % (axis, ",".join(str(v) for v in sorted(rungs)),
+           " mmproj_offload=false" if base.get("mmproj_offload") is False else ""))
+    log("          or paste that into 'Sweep exact values instead of the stages'.")
+    log("")
 
 
 def _fmt_row(c, row, i=None, n=None):
@@ -931,14 +1690,89 @@ def _fmt_row(c, row, i=None, n=None):
     if row.get("status") != "ok":
         return head + "%s %s" % (row["status"].upper(),
                                  row.get("gen_error") or row.get("error") or "")
-    return head + "%8.2f %9.1f %7.0f %6s%s" % (
+    dr = row.get("distinct_ratio")
+    return head + "%8.2f %9.1f %7.0f %6s %6s%s" % (
         row.get("tok_s") or 0.0, row.get("prefill_tok_s") or 0.0,
         row.get("proc_vram_mib") or 0.0,
         ("%.0f%%" % (100 * row["accept_rate"])) if row.get("accept_rate") else "-",
-        ("  SPILLED" if row.get("spilled") else "")
-        + ("  [filler repeats - speculative rate inflated]"
-           if row.get("corpus_repeated") and row["config"].get("spec") not in (None, "none")
-           else ""))
+        ("%.2f" % dr) if dr is not None else "-",
+        # _degenerate_note carries the spill line now, with the megabytes and
+        # the evidence behind them, so a bare "SPILLED" here would repeat it
+        # while saying strictly less.
+        ("  [filler repeats - speculative rate inflated]"
+         if row.get("corpus_repeated") and row["config"].get("spec") not in (None, "none")
+         else "")
+        + _degenerate_note(row))
+
+
+def _degenerate_note(row):
+    """The warning for a row that measured a model talking to itself.
+
+    distinct_ratio and copyback_ratio are already recorded and already gate
+    trustworthy(), so a degenerate row is silently dropped from every conclusion
+    later. Printing the numbers at run time is what makes that visible while the
+    campaign is still worth stopping - a whole grid can otherwise complete, look
+    ordinary, and contribute nothing.
+
+    The two symptoms point opposite ways on the distinct_ratio scale: a loop
+    repeats a few windows, while a copy of the context produces nothing but
+    distinct ones - which is exactly why the copy went unread until the second
+    gate existed. The speculative case gets its own sentence in both because the
+    symptom misreads the same way: an acceptance rate near 100% looks like the
+    draft model excelling, when repeated output is precisely what makes any
+    draft trivially correct. High acceptance ON degenerate text is evidence of
+    the degeneration, not of speculation working."""
+    dr = row.get("distinct_ratio")
+    cb = row.get("copyback_ratio")
+    spec = (row.get("config") or {}).get("spec") not in (None, "none")
+    loop = dr is not None and dr < LOOP_RATIO
+    copy = cb is not None and cb > COPY_RATIO
+    # An untemplated row is the KNOWN-BAD mode rather than a symptom of it: the
+    # backend had no /apply-template, so the model was handed raw text with
+    # nothing marking it as a request. Said even when the output happens to look
+    # fine, because the failure is in how the row was produced.
+    raw = ("  RAW - no chat template on this build, so the model was asked "
+           "nothing and merely continued the text"
+           if row.get("templated") is False else "")
+    if not (loop or copy):
+        return spill_note(row) + raw
+    if copy:
+        what = "COPYING - %.0f%% of the output is a verbatim copy of the prompt, so" \
+               % (100 * cb)
+    else:
+        what = "LOOPING - output is %.0f%% repetition, so" % (100 * (1 - dr))
+    if spec and (row.get("accept_rate") or 0) >= 0.95:
+        return ("  %s the %.0f%% acceptance is the %s, not the drafter; "
+                "excluded from conclusions%s%s"
+                % (what, 100 * row["accept_rate"], "copy" if copy else "loop",
+                   spill_note(row), raw))
+    return "  %s excluded from conclusions%s%s" % (what, spill_note(row), raw)
+
+
+def spill_note(row):
+    """Say WHICH kind of spill, and on what evidence.
+
+    A measured reading and an inference from the campaign's shape are both worth
+    printing, but they are not the same claim, and a row that says "SPILLED"
+    without saying why invites the reader to trust a deduction as a
+    measurement."""
+    x = row.get("shared_excess")
+    if x is not None and x > SHARED_SPILL_MIB:
+        return ("  SPILLED - %.0f MiB more host memory than the rest of this "
+                "ladder, so every token that touches it crosses PCIe" % x)
+    if row.get("spill_inferred"):
+        return ("  SPILLED - floor fell %.0f MiB below the rest of this campaign, "
+                "which is memory the driver moved out of VRAM"
+                % row["spill_inferred"])
+    sh = row.get("shared_mib")
+    if x is None and sh is not None and sh > SHARED_SPILL_MIB:
+        # Mid-campaign there is no ladder yet, so the counter has no baseline to
+        # be excess OVER. Report the number as a fact and pass no verdict: every
+        # llama.cpp process carries hundreds of MiB here by design, and calling
+        # that a spill is the mistake this whole function was rewritten to stop
+        # making. It resolves into a verdict once the group exists.
+        return ("  host memory %.0f MiB (no ladder yet to compare it against)" % sh)
+    return ""
 
 
 # ---------------------------------------------------------------------------
@@ -958,7 +1792,119 @@ def load_speed_rows(path=None):
             # across them. Read-only: nothing writes these rows back.
             r["_file"] = f
             rows.append(r)
+    _infer_demotion(rows)
     return rows
+
+
+# How far a row's floor must fall below its own campaign's before the gap is a
+# demotion rather than allocator noise. The observed collapse was 246 MiB
+# against neighbours that agreed within 12 MiB of each other, so this sits well
+# clear of the noise and well under the signal.
+FLOOR_DROP_MIB = 100.0
+
+
+def _infer_demotion(rows):
+    """Mark pre-counter rows whose floor collapsed against their own campaign.
+
+    `floor` is the CUDA context plus whatever the allocator holds that llama.cpp
+    does not report, and within one campaign it is nearly constant - it moved by
+    12 MiB across five rungs of the ngl ladder. When the process hits the
+    driver's dedicated-memory budget, the next rung cannot grow: alloc_gpu rises
+    by a layer while proc_vram does NOT, and the difference comes out of floor.
+    That collapse is the demotion, visible without any counter.
+
+    The counter reading gets the SAME treatment, for the reason set out in
+    demoted(): `Shared Usage` counts deliberate host placement - pinned staging
+    buffers, `--no-mmproj-offload` - as well as demotion, so its absolute value
+    says nothing on its own. Only its excess over the ladder's own baseline
+    does. Two signals, one grouping, because both mean "this rung is carrying
+    something the others are not".
+
+    What the grouping has to hold constant is everything that moves the floor
+    for a legitimate reason, and speculation is the big one: llama.cpp does not
+    report the draft KV cache in alloc_gpu, so it lands in floor and puts a
+    draft-mtp row near 1050 MiB where its non-speculative twin sits at 230. Mix
+    them and the median lands between, and EVERY ordinary row reads as a 380 MiB
+    collapse - which is exactly what the first version of this did. The
+    projector placement is the same story at ~1100 MiB, and the draft depth
+    scales the cache, so spec_n_max belongs here too.
+
+    prompt_id is in the key for the same reason it is in comparable(): a median
+    has to come from ONE campaign. Without it a fill-32768 group merged rows
+    from three separate runs - pre-freeze, the raw-continuation campaign, and a
+    smoke test - and took its baseline from all of them. floor is a memory fact
+    rather than a prompt fact, so it survives that better than tok/s would, but
+    "better" is not the standard the rest of this module holds. Note this still
+    does not isolate two campaigns that share a prompt_id on different days;
+    driver state can move the floor between them.
+
+    In memory only - nothing is written back to the store."""
+    groups = {}
+    for r in rows:
+        if r.get("status") != "ok" or r.get("floor_mib") is None:
+            continue
+        c = r.get("config") or {}
+        groups.setdefault((r.get("model"), r.get("gpu"), r.get("_file"),
+                           r.get("prompt_id"), r.get("template_id"),
+                           c.get("ctx"), c.get("kv"), c.get("ub"),
+                           c.get("mmproj_offload") is not False,
+                           c.get("spec") or "none", c.get("spec_n_max") or 0,
+                           c.get("fill")), []).append(r)
+    def _median(vals):
+        v = sorted(vals)
+        return v[len(v) // 2] if len(v) % 2 else (v[len(v) // 2 - 1]
+                                                  + v[len(v) // 2]) / 2.0
+
+    for grp in groups.values():
+        if len(grp) < 3:            # two rows cannot say which one is anomalous
+            continue
+        # The counter, made relative. A row that reads the SAME as its ladder is
+        # carrying the baseline every rung carries and has been demoted by
+        # nothing; only the excess is the driver moving something. Recorded as 0
+        # rather than dropped, because "measured, and it was normal" is a
+        # different statement from "not measured".
+        sh = [x["shared_mib"] for x in grp if x.get("shared_mib") is not None]
+        if len(sh) >= 3:
+            base_sh = _median(sh)
+            for r in grp:
+                if r.get("shared_mib") is not None:
+                    r["shared_excess"] = round(
+                        max(0.0, r["shared_mib"] - base_sh), 1)
+        # ...and the floor collapse, which is the only signal a row recorded
+        # before the counter existed can offer.
+        mid = _median([x["floor_mib"] for x in grp])
+        for r in grp:
+            if r.get("shared_mib") is None and mid - r["floor_mib"] > FLOOR_DROP_MIB:
+                # Annotated, deliberately NOT gated. Two reasons, and the second
+                # one is the important one.
+                #
+                # It is the weaker evidence: a deduction from three floors, not
+                # a reading. And it can be right about the memory while being
+                # wrong about the row - the ngl 26 draft-mtp row here shows the
+                # exact collapse signature and is still the FASTEST row in its
+                # group, because one more layer on the GPU bought more than the
+                # displaced 240 MiB cost. Gating it would have thrown away the
+                # best config in the campaign.
+                #
+                # More generally, a ladder that slows down at its top rung is
+                # the wall being FOUND. Excluding those rows would hide the very
+                # thing an ngl sweep exists to locate.
+                r["spill_inferred"] = round(mid - r["floor_mib"], 1)
+
+    # Every row that carries a counter reading gets its verdict re-decided, and
+    # the ones OUTSIDE any usable group matter most. Rows written by the first
+    # version of demoted() carry a stored `spilled: true` that came from the raw
+    # counter clearing 64 MiB - which every llama.cpp process does - and a lone
+    # measured row has no ladder to be excess over, so nothing in the loop above
+    # would ever reach it. It would keep a verdict from a detector that no
+    # longer exists, permanently outside trustworthy(). That is what happened to
+    # the ngl 31 reference row: one measured row in its group, still flagged.
+    #
+    # demoted() answers from shared_excess, which is None here, so the verdict
+    # falls back to suspect_reason() alone - the one test a single row supports.
+    for r in rows:
+        if r.get("status") == "ok" and r.get("shared_mib") is not None:
+            r["spilled"] = bool(r.get("suspect")) or demoted(r)
 
 
 def rank_rows(rows):
@@ -1036,7 +1982,12 @@ def _control(r, owned=()):
     c = r.get("config") or {}
     ctl = [("model", r.get("model")), ("gpu", r.get("gpu")),
            ("file", r.get("_file")), ("n_predict", r.get("n_predict")),
-           ("repeat", r.get("repeat"))]
+           ("repeat", r.get("repeat")), ("prompt_id", r.get("prompt_id")),
+           # What the model was ASKED is held constant too. A thinking template
+           # spends tokens reasoning before it answers, so a row measured under
+           # one is not a faster or slower version of a row measured without -
+           # it is a different question.
+           ("template_id", r.get("template_id"))]
     for k in _CONFIG_KEYS:
         if k in owned:
             continue
@@ -1062,22 +2013,44 @@ def _slim(r):
             "proc_vram_mib": r.get("proc_vram_mib"),
             "accept_rate": r.get("accept_rate"), "draft_n": r.get("draft_n"),
             "spilled": r.get("spilled"), "corpus_repeated": r.get("corpus_repeated"),
-            "distinct_ratio": r.get("distinct_ratio"), "when": r.get("when"),
+            "shared_mib": r.get("shared_mib"),
+            "shared_excess": r.get("shared_excess"),
+            "spill_inferred": r.get("spill_inferred"),
+            "templated": r.get("templated"),
+            "prefill_warm": r.get("prefill_warm"),
+            "template_id": r.get("template_id"),
+            "chat_template": r.get("chat_template"),
+            "template_kwargs": r.get("template_kwargs"),
+            "distinct_ratio": r.get("distinct_ratio"),
+            "copyback_ratio": r.get("copyback_ratio"),
+            "prompt_id": r.get("prompt_id"), "when": r.get("when"),
             "n_predict": r.get("n_predict"), "repeat": r.get("repeat"),
             "status": r.get("status")}
 
 
 def sweep_index(rows):
-    """One entry per (model, GPU, backend build) - the browsable list of campaigns.
+    """One entry per EXPERIMENT - the browsable list of campaigns.
 
     Split by build as well as by card, because a llama.cpp version bump moves
-    these numbers and merging two builds into one campaign would hide that."""
+    these numbers and merging two builds into one campaign would hide that.
+
+    And split by prompt_id and template_id, for the reason the rest of this
+    module already splits on them: they are what the model was ASKED. Keying on
+    (model, gpu, build) alone collapsed 145 rows spanning three prompts and two
+    templates into a single line, headlined by whichever prompt_id happened to
+    come first and a best_tok_s taken from a 2k-fill row of an experiment nobody
+    was looking at. The campaign run that morning was inside it and could not be
+    found - which is the whole job of a browsable index.
+
+    The tradeoff is that a campaign whose corpus was refreshed mid-run now shows
+    as two entries. That is the honest shape: it WAS two experiments."""
     groups = {}
     for r in rows:
-        k = (r.get("model") or "?", r.get("gpu") or "", r.get("_file") or "")
+        k = (r.get("model") or "?", r.get("gpu") or "", r.get("_file") or "",
+             r.get("prompt_id") or "", r.get("template_id") or "")
         groups.setdefault(k, []).append(r)
     out = []
-    for (model, gpu, f), rs in groups.items():
+    for (model, gpu, f, pid, tid), rs in groups.items():
         ok = [r for r in rs if trustworthy(r)]
         when = [r.get("when") for r in rs if r.get("when")]
         fills = sorted({(r.get("config") or {}).get("fill") or 0 for r in rs})
@@ -1091,6 +2064,19 @@ def sweep_index(rows):
             "n_failed": sum(1 for r in rs if r.get("status") != "ok"),
             "n_untrusted": sum(1 for r in rs
                                if r.get("status") == "ok" and not trustworthy(r)),
+            # Rows recorded before the copy-back gate existed: they carry no
+            # copyback_ratio, so a verbatim-copying model could not be detected
+            # in them. The campaign is real; it is just not fully gated.
+            "n_ungated": sum(1 for r in rs if r.get("status") == "ok"
+                             and r.get("copyback_ratio") is None),
+            # Now a property of the GROUP rather than of whichever row came
+            # first, because the group is keyed on it.
+            "prompt_id": pid or None,
+            "template_id": tid or None,
+            "chat_template": next((r.get("chat_template") for r in rs
+                                   if r.get("chat_template")), None),
+            "template_kwargs": next((r.get("template_kwargs") for r in rs
+                                     if r.get("template_kwargs")), None),
             "first": min(when) if when else None,
             "last": max(when) if when else None,
             "fills": fills, "stages": stages,
@@ -1249,6 +2235,11 @@ def report_insights(path=None, log=print):
             % (g["model"][:34], (g["gpu"] or "?")[:24], g["backend"][-8:],
                g["n_rows"], g["n_ok"],
                ("%.2f tok/s" % g["best_tok_s"]) if g["best_tok_s"] else "-", span))
+    ung = [g for g in sweep_index(rows) if g["n_ungated"]]
+    if ung:
+        log("  %d campaign(s) were recorded before the copy-back gate: their rows carry")
+        log("  no copyback_ratio, so a model copying its context back could not be")
+        log("  detected in them. Deep-fill numbers there are not usable for tuning.")
 
     ax = axis_effects(rows)
     log("")
@@ -1256,7 +2247,8 @@ def report_insights(path=None, log=print):
     log("model, GPU, backend, context, KV quant, depth or pass count never meet)")
     if ax["n_excluded"]:
         log("  %d row%s excluded from every conclusion below - spilled into shared "
-            "memory, or looping" % (ax["n_excluded"], "" if ax["n_excluded"] == 1 else "s"))
+            "memory, looping, or copying the prompt back"
+            % (ax["n_excluded"], "" if ax["n_excluded"] == 1 else "s"))
     for e in ax["effects"]:
         if e.get("single"):
             log("  %-20s only one value ever tried (%s) - nothing to compare"
@@ -1322,5 +2314,10 @@ def report(path=None, log=print):
                r["tok_s"], r.get("prefill_tok_s") or 0.0,
                r.get("proc_vram_mib") or 0.0,
                ("%.0f%%" % (100 * r["accept_rate"])) if r.get("accept_rate") else "-",
-               "  SPILLED" if r.get("spilled") else ""))
+               # Ranked fastest-first, and a looping row can WIN that ranking:
+               # repetition is cheap to generate, and so is copying the prompt
+               # back. Marked here for the same reason SPILLED is - the row is
+               # real evidence, it just is not evidence about the setting in its
+               # own columns.
+               _degenerate_note(r)))
     return True

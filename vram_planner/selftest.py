@@ -1913,6 +1913,84 @@ def _run_suite(require_refs, tmp, skipped_real):
         print("  RECOMMEND raised %s: %s  FAIL" % (type(e).__name__, e))
     ok = ok and rec_all
 
+    # ---- forgetting a campaign -------------------------------------------
+    #
+    # Destructive, and what it destroys is hours of GPU time. Every guarantee it
+    # makes is pinned here: it takes only its own campaign, it never unlinks the
+    # file that campaign shares with others, and it leaves the removed rows
+    # somewhere they can be moved back from.
+    print("\n  Forgetting a campaign")
+    try:
+        import json as _json
+        from vram_planner import bench as _b
+        from vram_planner.bench import campaign_match, delete_campaign, sweep_index
+
+        store = os.path.join(tmp, "speed")
+        os.makedirs(store, exist_ok=True)
+        _real_dir = _b.bench_dir
+        _b.bench_dir = lambda: store
+        try:
+            fn = "GPU_A__build-1.jsonl"
+            def _row(model, pid, tid, tok):
+                return {"model": model, "gpu": "GPU A", "prompt_id": pid,
+                        "template_id": tid, "status": "ok", "tok_s": tok,
+                        "when": 1000 + tok, "n_predict": 128, "repeat": 3,
+                        "config": {"ctx": 4096, "kv": "f16", "fa": True, "seq": 1,
+                                   "ngl": int(tok), "ub": 512, "fill": 0}}
+            # Three campaigns in ONE file: same model under two prompts, plus a
+            # second model. Deleting the first must leave the other two intact -
+            # a file is one GPU and one build, never one campaign.
+            rows = ([_row("a.gguf", "p1", "t1", 1.0), _row("a.gguf", "p1", "t1", 2.0)]
+                    + [_row("a.gguf", "p2", "t1", 3.0)]
+                    + [_row("b.gguf", "p1", "t1", 4.0)])
+            with open(os.path.join(store, fn), "w", encoding="utf-8", newline="\n") as f:
+                for r in rows:
+                    f.write(_json.dumps(r) + "\n")
+            # A line this tool did not write is not this tool's to discard.
+            with open(os.path.join(store, fn), "a", encoding="utf-8", newline="\n") as f:
+                f.write("{not json at all}\n")
+
+            before = sweep_index(_b.load_speed_rows())
+            res = delete_campaign(model="a.gguf", gpu="GPU A", file=fn,
+                                  prompt_id="p1", template_id="t1")
+            after = sweep_index(_b.load_speed_rows())
+            left = {(g["model"], g["prompt_id"]) for g in after}
+            del_ok = (len(before) == 3 and res.get("ok") and res["removed"] == 2
+                      # the file survives, carrying the campaigns it shared with
+                      and os.path.isfile(os.path.join(store, fn))
+                      and len(after) == 2
+                      and ("a.gguf", "p2") in left and ("b.gguf", "p1") in left
+                      and ("a.gguf", "p1") not in left
+                      # ...and the rows are recoverable, not gone
+                      and res["backup"] and os.path.isfile(res["backup"])
+                      and len(open(res["backup"], encoding="utf-8")
+                              .read().strip().splitlines()) == 2
+                      # the unparseable line was left exactly where it was
+                      and "{not json at all}" in open(os.path.join(store, fn),
+                                                      encoding="utf-8").read())
+            # An empty prompt_id is a VALUE - the campaigns that pinned none -
+            # and must never widen to every campaign of that model.
+            wide = delete_campaign(model="b.gguf", gpu="GPU A", file=fn,
+                                   prompt_id="", template_id="")
+            del_ok = del_ok and not wide.get("ok") and wide.get("removed") == 0
+            del_ok = del_ok and campaign_match(
+                {"model": "b.gguf", "prompt_id": "p1"}, model="b.gguf", prompt_id="p1")
+            # A name that matches nothing changes nothing.
+            miss = delete_campaign(model="nope.gguf", gpu="GPU A", file=fn)
+            del_ok = del_ok and not miss.get("ok") and len(sweep_index(
+                _b.load_speed_rows())) == 2
+            # ...and neither does one naming a file that is not there.
+            gone = delete_campaign(model="a.gguf", gpu="GPU A", file="no-such.jsonl")
+            del_ok = del_ok and not gone.get("ok")
+            print("  FORGET takes one campaign, keeps the file, keeps a copy back  %s"
+                  % ("OK" if del_ok else "FAIL"))
+        finally:
+            _b.bench_dir = _real_dir
+    except Exception as e:
+        del_ok = False
+        print("  FORGET raised %s: %s  FAIL" % (type(e).__name__, e))
+    ok = ok and del_ok
+
     if skipped_real:
         print("\n  %d real-measurement section(s) did not run: %s"
               % (len(skipped_real), ", ".join(skipped_real)))

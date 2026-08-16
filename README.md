@@ -14,18 +14,51 @@ length and KV-cache quant:
 - The one estimated term (the compute buffer) can be re-fitted to **your** machine
   with a `--sweep`/`--fit` harness — see **Measuring it yourself**.
 
-It serves its own web UI, so you never type these commands by hand.
+It serves its own web UI, so you never type these commands by hand. The UI opens on
+a single recommended config, says whether that came from **measurement** or from the
+planner's **estimate**, and — when the two disagree — names every reason why. See
+**"Largest that fits" is not "fastest"**.
 
-## Demo
+## Using the interface
 
-**Planning a fit.** A full pass over Qwen3.6-35B-A3B at its 262,144-token context on a
-12 GB card — the verdict and memory split, the settings and `llama-server` command, the
-KV-cache-vs-context table, the full memory breakdown, and the speed estimate going from
-an uncalibrated bracket to a single measured figure:
+Four controls and a button get you an answer. Everything else is behind two
+disclosures, and the results column shows **one thing at a time**.
 
-![Planning a Qwen3.6-35B-A3B fit at 262k context](docs/demo-planner.gif)
+**The recommendation, at the top.** One config to run, badged `● measured` or
+`estimated`. A trustworthy measured row supersedes the planner's arithmetic; rows that
+spilled into shared memory, looped, or copied the prompt back are never eligible however
+fast they read. When the measured answer and the estimate disagree, the card names each
+reason rather than leaving you to spot it — see
+[**"Largest that fits" is not "fastest"**](#largest-that-fits-is-not-fastest--and-the-two-used-to-disagree-silently).
 
-**Checking it against reality.** The same configuration loaded in LM Studio, with Task
+**Three steps, in the order they depend on each other.** Only the open one renders; the
+other two carry their answer on the tab, so nothing is hidden that you would have to go
+looking for.
+
+| step | answers | tab reads |
+|---|---|---|
+| **1 · Does it fit** | the verdict, the memory bars, and behind one disclosure everything the planner *derives* — suggested settings, the `llama-server` command, the speed estimate, the KV-vs-context table, the full breakdown | `fits, barely · 10.75 GiB` |
+| **2 · Measure real speed** | the grid, a preview of what it will cost in hours, live rows as they land, and **Past sweeps** — every campaign ever recorded on this machine | `63.64 tok/s best` |
+| **3 · Launch script** | a complete `.ps1`/`.sh` for the selected row, with template, sampler and load-mode controls | `ngl 41 · draft-mtp` |
+
+Steps 2 and 3 need **no model analyzed and touch no GPU** — reading a recorded campaign
+and building a script from one of its rows is what the page offers before you have
+pressed Analyze at all.
+
+**Three tiers of control.** *Model* holds the four things every plan needs. *Tune* holds
+ubatch, sequences, flash attention and the vision projector. *Expert* holds the budgets,
+the layer overrides, the bandwidth figures and calibration. Nothing was removed — the
+long explanations that used to sit under every field are one click away under a dotted
+**why**, so the page answers first and explains on request.
+
+**A glossary** under the steps defines the six abbreviations that head every row table
+(`ngl`, `ncmoe`, `ub`, `fill`, `spec`, `proj`); the same text is the `title` on each
+column header.
+
+The page is theme-aware: it follows your OS setting, and the ◐ button in the header
+overrides it in both directions.
+
+**Checking a plan against reality.** A configuration loaded in LM Studio, with Task
 Manager showing what the engine actually allocates:
 
 ![The same config running in LM Studio](docs/demo-lmstudio.gif)
@@ -46,9 +79,9 @@ Metal/ROCm allocate their graphs differently — so on those the total is indica
 until you calibrate it. The tool detects this and says so in the terminal and the UI
 rather than quietly reporting a confident wrong number.
 
-Per-process VRAM measurement (the **Measure** button) additionally needs `nvidia-smi`
-or Windows GPU performance counters, and reading LM Studio's *resolved* config needs
-its Windows log path.
+Per-process VRAM measurement (**Measure running model**, under *Expert*) additionally
+needs `nvidia-smi` or Windows GPU performance counters, and reading LM Studio's
+*resolved* config needs its Windows log path.
 
 ## Requirements
 - Python 3.8+ (standard library only — nothing to `pip install`).
@@ -66,20 +99,68 @@ A browser opens at http://localhost:8121. Point the **Models folder** at your
 LM Studio models dir (defaults to `%USERPROFILE%\.lmstudio\models`), pick a model,
 set context + KV quant, and press **Analyze fit**.
 
-Other flags:
-```
-python -m vram_planner --port 8100 --no-browser
-python -m vram_planner --self-test        # validates the parser + math
-python -m vram_planner --self-test --require-refs
-                                          # ...and fail if a real-load check is skipped
-python -m vram_planner --version
-python -m vram_planner --sweep --dry-run  # what --sweep would run (see Measuring it yourself)
-python -m vram_planner --speed-sweep      # measure tok/s across configs (see Measuring speed)
-python -m vram_planner --speed-report     # every measured config, fastest first
-```
-
-Calibration and benchmark history live in `%LOCALAPPDATA%\vram-planner\`
+Calibration, model cards and measured rows live in `%LOCALAPPDATA%\vram-planner\`
 (`~/.local/share/vram-planner/` elsewhere), not next to the script.
+
+### Command-line reference
+
+Nothing below is required to use the tool — the web UI drives all of it. `--self-test`
+is the one worth running after a change.
+
+**Serving and testing**
+
+| flag | |
+|---|---|
+| `--port N` / `--host H` / `--no-browser` | defaults `8121`, `127.0.0.1`, opens a browser |
+| `--self-test` | synthetic GGUFs, the planner math, and every invariant the modules promise |
+| `--require-refs` | with `--self-test`: fail rather than skip when a real-load section cannot run |
+| `--version` | |
+
+**Allocation sweep** — fitting the compute buffer (see [Measuring it yourself](#measuring-it-yourself))
+
+| flag | |
+|---|---|
+| `--sweep` | drive `llama-server` across a config grid, recording what it allocates |
+| `--dry-run` | with `--sweep`: print the configs and the estimate, run nothing |
+| `--models NAME…` | only models whose file name contains one of these |
+| `--backend BUILD` | llama.cpp build to drive (default: newest CUDA build found) |
+| `--limit N` | stop after this many configs |
+| `--sweep-timeout SECONDS` | per-load timeout, default 420 |
+| `--probe MODEL AXIS=V,V` | one-off: run named values without recording a campaign |
+| `--fit` | score the compute-buffer model against recorded rows, **held out** |
+| `--recalibrate` | refit the coefficients from stored rows, save, exit |
+| `--show-calibration` | the stored fit and where it came from |
+
+**Speed sweep** — measuring tok/s (see [Measuring speed](#measuring-speed) and
+[docs/speed-sweep.md](docs/speed-sweep.md))
+
+| flag | |
+|---|---|
+| `--speed-sweep` | drive `llama-server` across a grid, recording how fast it generates |
+| `--speed-stages LETTERS` | which stages run, default `abcd` — A layer wall, B projector, C ubatch, D speculation |
+| `--speed-axes AXIS=V,V` | sweep exact values as a cross product instead of the stages |
+| `--speed-ctx N` / `--speed-kv TYPE` | freeze context and KV quant for the campaign |
+| `--speed-fill TOKENS` | prompt depth to measure at — decode slows as context fills, so this conditions every row |
+| `--speed-chain` | build each stage from the previous stage's winner rather than one fixed baseline |
+| `--speed-rounds N` | with `--speed-chain`: re-run the stages from the winner |
+| `--speed-verify` | after the campaign, load the winner at the production config |
+| `--speed-verify-overrides AXIS=V,V` | what "production" means, e.g. `spec=draft-mtp spec_n_max=2` |
+| `--n-predict N` / `--repeat N` | tokens per pass (128) and passes per config (3, median) |
+| `--chat-template-file PATH` | pin the template — a row measured under another one is a different experiment |
+| `--chat-template-kwargs JSON` | template variables, e.g. `{"reasoning_effort":"xhigh"}` |
+| `--reasoning {auto,on,off}` / `--reasoning-preserve {default,on,off}` | thinking, and whether it survives the history |
+| `--refresh-corpus` | rebuild the frozen filler corpus (see [Measuring speed](#measuring-speed) before you do) |
+
+**Reading and forgetting**
+
+| flag | |
+|---|---|
+| `--speed-report` | every recorded row, fastest first |
+| `--insights` | with `--speed-report`: what the campaigns *found* instead of the flat ranking |
+| `--forget-sweep MODEL…` | forget recorded campaigns — lists what matches, then asks |
+| `--yes` | with `--forget-sweep`: skip the prompt |
+| `--cards` | list stored model cards |
+| `--add-card GGUF…` / `--forget-card NAME…` | record or drop one explicitly |
 
 ## Layout
 Each module imports only from those above it, so the import graph is a DAG and
@@ -102,6 +183,7 @@ every number has one home:
 | `bench` | driving it across a grid and recording how fast it **generates** |
 | `_corpus.txt` | the frozen benchmark filler, committed on purpose — never delete (see *Measuring speed*) |
 | `fit` | scoring `compute` against sweep data, held out |
+| `recommend` | one config to run — reconciling `plan`'s estimate against `bench`'s measured rows, and naming every reason the two differ |
 | `launch` | turning a config into a runnable `llama-server` launch script |
 | `job` | the one background campaign the web UI can start and watch |
 | `web` | JSON endpoints and static file serving |
@@ -195,7 +277,8 @@ For Qwen3.6-27B-UD-Q4_K_XL:
 
 The planner now finds the sibling projector, charges its **1,758 MiB** to VRAM
 before planning the layer split, and shows both the model and the bundle size in
-GiB and GB. Untick **Load vision projector (mmproj)** if you run text-only.
+GiB and GB. Untick **Load vision projector (mmproj)**, under **Tune**, if you run
+text-only.
 
 ## MoE models: two different knobs, and LM Studio may ignore both
 
@@ -221,7 +304,7 @@ GPU offload layers was adjusted from 'max' to '16' to respect the strict GPU VRA
 ```
 
 Put those two resolved numbers into **GPU layers** and **CPU expert layers** under
-Advanced to reproduce a run exactly, instead of what the UI displays.
+**Expert** to reproduce a run exactly, instead of what the UI displays.
 
 ## Generation speed
 
@@ -242,7 +325,8 @@ The bracket is wide for a reason: scattered MoE expert gathers over system RAM r
 far below peak, while contiguous streaming runs near it. One measurement collapses
 it. Three sources, in order of usefulness:
 
-1. **Benchmark the loaded model.** Press the button; it runs one short generation
+1. **Benchmark the loaded model.** In step 1, under *Settings the planner suggests…*,
+   press **Benchmark the loaded model**; it runs one short generation
    against `localhost:1234` and reads `tokens_per_second` out of LM Studio's native
    `/api/v0/chat/completions` stats block. Results are appended to
    `speed_history.json` next to the script. **This is the one that works in server
@@ -261,6 +345,63 @@ it. Three sources, in order of usefulness:
 **Prompt processing is not modelled.** It is compute bound rather than bandwidth
 bound and needs a device FLOPS figure plus a kernel-efficiency factor that varies
 too much to be worth pretending about.
+
+## "Largest that fits" is not "fastest" — and the two used to disagree silently
+
+The planner and the speed sweep answer different questions, and for a long time
+neither of them said so.
+
+**The planner returns the largest split that fits.** `_plan_dense` searches down
+from every layer for the first `-ngl` whose total lands under the budget;
+`_plan_moe` searches up from `--n-cpu-moe 0` for the first that does. Both stop
+at the first feasible config. That is a **memory** answer.
+
+**The sweep returns the fastest row it measured.** That is a **speed** answer,
+and the two coincide only if throughput rises monotonically with offload. It
+does not:
+
+- a row that spills into shared system memory *loads*, reports `ok`, and runs
+  off a cliff — so the biggest thing that "fits" can be the slowest thing you
+  can run;
+- MTP's draft cache costs VRAM the plan was not asked to price, and on one model
+  moved the OOM wall a whole `-ngl` rung;
+- `ubatch` and speculation move tokens/second without moving any number the
+  planner computes at all.
+
+On top of that, the two used to be handed **different budgets**. The browser
+prefilled its VRAM budget from *free VRAM at page load* with a zero reserve,
+while `bench.planner_split()` seeded the sweep's ladder from *card total* minus
+512 MiB. On a 12 GB card with something already loaded that is the difference
+between 299 MiB and 11,715 MiB — several rungs, for a reason nothing on the page
+mentioned.
+
+Three things changed:
+
+1. **One budget rule.** `plan.default_vram_budget()` is the only definition, and
+   both callers use it. The web UI's *Expert* tier exposes the basis as a
+   control — *card total* (the default, and what a campaign measures under) or
+   *free right now* — and says plainly when you have picked the one that will
+   disagree with your measurements.
+2. **The verdict is computed once**, server-side, in `plan._verdict()`, and
+   reported on the same basis the memory bar draws. The browser used to derive
+   its own reading of the same fields, and the step tab's copy of that logic read
+   two keys the API has never returned — so it announced "fits" for **every**
+   plan, including the ones that did not.
+3. **`recommend.recommend()` reconciles the two.** A trustworthy measured row
+   supersedes the estimate; rows that spilled, looped or copied the prompt back
+   are never eligible however fast they read. When the two answers differ, the
+   card at the top of the page names each reason — `objective`, `budget`,
+   `axis` (knobs no plan can predict), `depth` and `stale` — instead of leaving
+   you to notice that step 1 said `ncmoe 32` and step 2's best row said
+   `ncmoe 31`.
+
+That is a real reconciliation on a real store — the planner's own answer for this model
+is `ncmoe 32`, the fastest row it can stand behind is `ncmoe 31` with speculation on and
+the projector in system RAM, and every reason for the gap is named.
+
+If nothing has been measured, the card says `estimated` and shows the planner's
+config. That is the right answer before you have spent the two hours; it is just
+not the same claim.
 
 ## What is exact vs estimated
 
@@ -331,7 +472,8 @@ rather than a sum. It fits better in sample and generalises **worse** — 11.7% 
 against 28.2% held out, where the additive form gets 21.7% and 21.8%. It is not in the
 tool because the data does not support it yet, not because it was not tried.
 
-Press **Measure** to pin the machine-dependent coefficients for your card (see below).
+Press **Measure running model** — under **Expert** — to pin the machine-dependent
+coefficients for your card (see below).
 
 - **Parallel seqs** should match LM Studio's "Parallel" / llama.cpp `-np`. It sizes the
   recurrent state on hybrid models and the sliding-window cache on SWA models.
@@ -456,8 +598,7 @@ tok/s a long way and are invisible to it, so there is a second harness for them:
   `--cache-type-k` says — and nothing of what it saves.
 - **Prompt processing**, which is not modelled anywhere here on purpose.
 
-Run it **from the web UI** — the *Measure real speed* card under the plan — or from the
-command line:
+Run it **from the web UI** — step 2, *Measure real speed* — or from the command line:
 
 ```
 python -m vram_planner --speed-sweep --dry-run     # the grid and the estimate
@@ -552,6 +693,37 @@ incomparable. And each row records a sample of what was generated plus a
 put a model in a repetition loop, which is exactly what n-gram speculation predicts
 perfectly — the ratio is how you tell a real speculative win from an artefact of the
 harness.
+
+### Forgetting a campaign
+
+Press **✕** on a row in **Past sweeps**, or:
+
+```bash
+python -m vram_planner --forget-sweep Qwen3.6-35B-A3B   # lists, then asks
+python -m vram_planner --forget-sweep Qwen3.6 --yes     # no prompt
+```
+
+A model name matches on substring and case-insensitively, so the CLI prints every
+campaign that matched — model, GPU, row count, best tok/s, date — and asks before it
+removes anything. The browser asks twice for the same reason. What a campaign cost is
+the two hours of GPU time that produced it, and a mistyped name is cheap.
+
+Three things it is careful about:
+
+- **The file is never unlinked.** A `.jsonl` under `speed/` is one GPU and one llama.cpp
+  build, so it holds every campaign ever measured on that pair. Removing one model's rows
+  by deleting the file would take the rest with it; the file is rewritten without those
+  rows instead, and lines the tool cannot parse are left exactly where they were.
+- **The removed rows are moved, not dropped.** They land in `speed/deleted/` under the
+  original name plus a timestamp, so a delete is undone by moving one file back. If the
+  backup cannot be written, nothing is deleted — a delete that cannot be undone is a
+  different operation from the one that was asked for.
+- **The rewrite is atomic**, and is refused outright while a campaign is running: the job
+  appends to these files as it measures, so a rewrite underneath it would drop whatever
+  landed in between.
+
+Deleting rows can change what the recommendation card shows — including back to the
+planner's estimate, if what went was the only trustworthy campaign for that model.
 
 ## The launch script
 

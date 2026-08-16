@@ -121,7 +121,7 @@ function renderIdle(){
   }else{
     panel = renderScriptStep();
   }
-  $("out").innerHTML = renderStepper(null) + panel;
+  $("out").innerHTML = renderStepper(null) + renderGlossary() + panel;
   drawSweep({ grid: busy, results: busy, script: true, history: true });
 }
 
@@ -396,12 +396,148 @@ function bar(title, capMib, used, segs){
     <div class="legend">${raw(legend)}</div></div>`;
 }
 
+/* ------------------------------------------------------- the recommendation
+ *
+ * The one thing the page is for: what should I actually run. It sits above the
+ * steps because it is the answer all three of them are working towards, and
+ * because the two sources of that answer used to be three clicks apart with
+ * nothing anywhere saying they disagreed.
+ *
+ * The planner returns the LARGEST SPLIT THAT FITS. The sweep returns the
+ * FASTEST ROW MEASURED. Those are different questions. When they give different
+ * answers this card names every reason, rather than leaving the user to notice
+ * that step 1 said ngl 41 and step 2's best row says ngl 47. */
+let REC = null, REC_FOR = null;
+
+const REC_KIND = {
+  objective: "objective",
+  budget:    "budget",
+  axis:      "knobs",
+  stale:     "conditions",
+  untrusted: "no usable rows"
+};
+
+/** Config in one line, in the vocabulary the launcher and the row tables use. */
+function cfgLine(c){
+  if(!c) return "—";
+  const bits = [];
+  if(c.ngl != null) bits.push("ngl " + c.ngl);
+  if(c.ncmoe) bits.push("ncmoe " + c.ncmoe);
+  if(c.ub) bits.push("ub " + c.ub);
+  if(c.spec && c.spec !== "none")
+    bits.push(c.spec + (c.spec_n_max ? "/" + c.spec_n_max : ""));
+  if(c.mmproj_offload === false) bits.push("projector in RAM");
+  return bits.join(" · ") || "—";
+}
+
+/** Fetch the reconciliation for this plan.
+ *
+ *  Guarded on the plan object itself, because render() runs on every tab switch
+ *  and the answer cannot change between two clicks of the same plan. Without it
+ *  each switch cost a round trip and blanked the card while it flew. */
+async function loadRecommendation(r){
+  if(!r || !r.plan) return;
+  if(REC_FOR === r) return;
+  REC_FOR = r;
+  REC = null;
+  drawRecommendation();
+  try{
+    REC = await (await fetch("/api/recommend", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ plan: r, model: (currentPath().split(/[\\/]/).pop() || "") })
+    })).json();
+  }catch(e){ REC = { ok: false, error: String(e) }; }
+  drawRecommendation();
+}
+
+function drawRecommendation(){
+  const el = $("rec");
+  if(el) el.innerHTML = renderRecommendation();
+}
+
+function renderRecommendation(){
+  if(!LAST) return "";
+  const v = (LAST.plan && LAST.plan.verdict) || {};
+  if(!REC) return h`<section class="card rec"><p class="muted small">reconciling against
+    recorded measurements&hellip;</p></section>`;
+  if(REC.ok === false) return "";
+
+  const measured = REC.source === "measured";
+  const cfg = REC.config || {};
+  const badge = measured
+    ? '<span class="pill ok">● measured</span>'
+    : '<span class="pill">estimated</span>';
+
+  // The headline number differs by source on purpose: a measured row has a real
+  // tok/s and a real process VRAM reading, and an estimate has neither - showing
+  // the planner's arithmetic in the same slot would dress one up as the other.
+  const figures = measured
+    ? h`<span class="rec-big">${(REC.tok_s || 0).toFixed(2)}</span><span class="rec-unit">tok/s</span>
+        <span class="rec-sep"></span>
+        <span class="rec-num">${fmt(REC.vram_mib)}</span><span class="rec-unit">VRAM, measured</span>`
+    : h`<span class="rec-big ${v.state === "fits" ? "" : "warn"}">${v.word || "—"}</span>
+        <span class="rec-sep"></span>
+        <span class="rec-num">${fmt(v.vram_mib)}</span><span class="rec-unit">of ${
+          fmt(v.vram_budget_mib)} VRAM, estimated</span>`;
+
+  const deltas = (REC.deltas || []).map(d =>
+    h`<div class="delta"><span class="dk">${REC_KIND[d.kind] || d.kind}</span><span>${d.text}</span></div>`
+  ).join("");
+
+  const other = measured && REC.predicted
+    ? h`<p class="note rec-alt">The estimate on its own says <b class="mono">${
+        cfgLine(REC.predicted)}</b>.</p>`
+    : "";
+
+  const foot = measured
+    ? h`<p class="note">From the fastest recorded row this campaign can stand behind — rows that
+        spilled, looped or copied the prompt back are never eligible, however fast they read.
+        ${REC.n_trusted} of ${REC.n_rows} recorded row${REC.n_rows === 1 ? "" : "s"} qualified.</p>`
+    : h`<p class="note">Nothing measured for this model yet, so this is the planner's arithmetic:
+        the <b>largest split that fits</b>, which is not the same question as the fastest.
+        Step 2 measures the difference.</p>`;
+
+  return h`<section class="card rec ${measured ? "is-measured" : ""}">
+    <div class="rec-head"><h2>Run this</h2>${raw(badge)}</div>
+    <p class="rec-cfg mono">${cfgLine(cfg)}</p>
+    <p class="rec-figs">${raw(figures)}</p>
+    <p class="rec-cond mono">${num(LAST.inputs.context)} ctx · ${LAST.inputs.kv_type}${
+      LAST.inputs.n_seq > 1 ? " · " + LAST.inputs.n_seq + " seqs" : ""}</p>
+    ${raw(deltas ? h`<div class="deltas"><p class="sublabel">WHY THE TWO ANSWERS DIFFER</p>${
+      raw(deltas)}</div>` : "")}
+    ${raw(other)}
+    ${raw(foot)}
+    <div class="actions">
+      <button class="ghost" type="button" data-action="rec-script">Build a launch script &rarr;</button>
+      <button class="ghost" type="button" data-action="set-step" data-step="measure">${
+        measured ? "See the measurements" : "Measure it for real"}</button>
+    </div>
+  </section>`;
+}
+
+/** Take the recommendation to step 3 with its own row selected.
+ *  Goes through the existing pick path rather than adding a second way to set
+ *  the same state - two paths to one selection is how the page once managed to
+ *  show one row checked and build the script from another. */
+function recToScript(){
+  if(REC && REC.row){
+    const key = rowKey(REC.row);
+    PICKABLE[key] = REC.row;
+    SWEEP.pickKey = key;
+    SWEEP.script = null;
+  }
+  setStep("script");
+}
+
 /* ------------------------------------------------------------ result cards */
 function renderVerdict(r){
   const c = r.config, p = r.plan, s = r.sizes_mib, inp = r.inputs;
-  let vcls = "warn";
-  if(p.fits_fully) vcls = "ok";
-  else if(p.attention_overflow || p.kv_overflow || p.ram_ok === false || p.vram_ok === false) vcls = "bad";
+  // The state comes from the server now. The browser used to re-derive its own
+  // reading of the same fields, and the step tab's copy of that logic read two
+  // keys this API has never returned - so it announced "fits" for every plan,
+  // including the ones that did not.
+  const vd = p.verdict || {};
+  const vcls = { fits: "ok", tight: "warn", spills: "bad", no_fit: "bad" }[vd.state] || "warn";
 
   const vramSegs = [
     { cls:"s-wt",  color:"var(--wt)",   label:"weights (GPU)",     mib:p.gpu_weights_mib || 0 },
@@ -689,7 +825,12 @@ function render(r){
   }else{
     panel = renderScriptStep();
   }
-  $("out").innerHTML = renderStepper(r) + panel;
+  $("out").innerHTML = h`<div id="rec"></div>` + renderStepper(r) +
+                       renderGlossary() + panel;
+  drawRecommendation();
+  // Needs the recorded rows and a round trip, and the plan is what the button
+  // was pressed for - so it fills in after the page rather than holding it up.
+  loadRecommendation(r);
   if(r.speed && !r.speed.error) loadSpeedHistory(r);
   // Filled in asynchronously: it needs a live GPU reading and the recorded rows,
   // and neither should hold up the plan the user actually pressed the button for.
@@ -981,6 +1122,35 @@ function renderHistory(){
 
 function tier(label, note){
   return h`<div class="tier"><span>${label}</span><i>${note}</i></div>`;
+}
+
+/* --------------------------------------------------------------- glossary
+ *
+ * Six abbreviations head every row table on this page and none of them was
+ * defined anywhere. They are llama.cpp's own spellings, which is the right
+ * choice - they are what you type at the command line - but a column header is
+ * not a place to learn a vocabulary from. Defined once here and reused as the
+ * `title` on each <th>, so the two cannot drift. */
+const TERMS = [
+  ["ngl", "GPU layers", "How many transformer blocks live in VRAM. llama.cpp offloads the LAST n, so this is a count and not a list."],
+  ["ncmoe", "CPU expert layers", "On an MoE only: the routed experts of the first n blocks are pushed to system RAM, leaving their attention and KV in VRAM. A different knob from ngl, and usually the one that matters — experts are most of the file and only a few of them fire per token."],
+  ["ub", "ubatch", "Physical batch size: how many tokens are pushed through the graph at once during prompt processing. Sizes the compute buffer."],
+  ["fill", "context filled", "How many tokens of context were actually present when the row was measured. Decode re-reads the KV cache every token, so a number taken at 2k says little about 40k."],
+  ["spec", "speculation", "Speculative decoding: a cheap draft proposes tokens and the real model checks them. draft-mtp uses the model's own multi-token-prediction blocks; the ngram variants need nothing extra."],
+  ["proj", "projector", "Where the vision projector's weights sit — VRAM or system RAM. Text decode is unaffected by moving it, so those megabytes come back as GPU layers."],
+  ["accepted", "acceptance rate", "The share of drafted tokens the target model kept, and how many were drafted at all. Read them together: 100% of 15 drafted out of 128 generated is a 7% gain."]
+];
+
+function termTitle(k){
+  const t = TERMS.find(x => x[0] === k);
+  return t ? t[1] + " — " + t[2] : "";
+}
+
+function renderGlossary(){
+  return h`<details class="card glossary"><summary>What the column names mean</summary>
+    <dl>${raw(TERMS.map(([k, name, desc]) =>
+      h`<dt class="mono">${k}</dt><dd><b>${name}.</b> ${desc}</dd>`).join(""))}</dl>
+  </details>`;
 }
 
 /* ---------------------------------------------------------------- the steps
@@ -1520,6 +1690,11 @@ async function pollSweep(){
       // once, not per poll.
       loadHistory();
       loadSweepRows().then(() => drawSweep({ history: true }));
+      // New rows can change which config is recommended - that is the whole
+      // point of having run the campaign - so the reconciliation is refetched
+      // rather than left showing what was true two hours ago.
+      REC_FOR = null;
+      if(LAST) loadRecommendation(LAST);
     }
   }
   // Grid and results only. See drawSweep(): the script pane holds live inputs.
@@ -1625,8 +1800,11 @@ function rowFlags(r){
   return f;
 }
 
-const ROW_HEAD = h`<thead><tr><th></th><th>tok/s</th><th>prefill</th><th>ngl</th><th>ncmoe</th>
-  <th>ub</th><th>fill</th><th>spec</th><th>proj</th><th>accepted</th><th>VRAM</th><th></th>
+const ROW_HEAD = h`<thead><tr><th></th><th>tok/s</th><th>prefill</th>
+  <th title="${termTitle("ngl")}">ngl</th><th title="${termTitle("ncmoe")}">ncmoe</th>
+  <th title="${termTitle("ub")}">ub</th><th title="${termTitle("fill")}">fill</th>
+  <th title="${termTitle("spec")}">spec</th><th title="${termTitle("proj")}">proj</th>
+  <th title="${termTitle("accepted")}">accepted</th><th>VRAM</th><th></th>
   </tr></thead>`;
 
 /** Identity of a measured row, for "which one did you pick".

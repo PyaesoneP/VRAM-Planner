@@ -249,6 +249,84 @@ details.adv[open] > summary::before{transform:rotate(90deg)}
 .verdict.bad .vword{color:var(--bad)}
 .verdict .h{font-size:var(--t-body);color:var(--ink);margin:0}
 
+/* ---------- the recommendation ----------
+   The one thing the page is for. It sits above the steps because it is the
+   answer all three of them work towards, and because its two possible sources -
+   the planner's arithmetic and the fastest measured row - used to be three
+   clicks apart with nothing anywhere admitting they disagreed. */
+/* The slot is filled asynchronously and can legitimately stay empty; without
+   this it still spends a flex gap looking like a missing card. */
+#rec:empty{display:none}
+.card.rec{border-color:var(--line2);border-top:2px solid var(--line2)}
+.card.rec.is-measured{border-top-color:var(--ok)}
+.rec-head{display:flex;align-items:center;justify-content:space-between;gap:var(--s3)}
+.rec-head > h2{border:0;margin:0;padding:0}
+.pill{
+  font-family:var(--mono);font-size:var(--t-micro);letter-spacing:.08em;
+  padding:3px 10px;border-radius:999px;border:1px solid var(--line2);color:var(--muted);
+}
+.pill.ok{border-color:var(--ok);color:var(--ok)}
+.rec-cfg{
+  font-size:var(--t-hero);font-weight:600;color:var(--ink);
+  margin:var(--s3) 0 var(--s2);line-height:1.2;overflow-wrap:anywhere;
+}
+.rec-figs{display:flex;align-items:baseline;flex-wrap:wrap;gap:var(--s2);margin:0}
+.rec-big{font-family:var(--mono);font-size:var(--t-mega);font-weight:600;color:var(--ok);line-height:1}
+.rec-big.warn{color:var(--warn)}
+.rec-num{font-family:var(--mono);font-size:var(--t-head);color:var(--ink)}
+.rec-unit{font-size:var(--t-small);color:var(--muted)}
+.rec-sep{width:1px;align-self:stretch;background:var(--line);margin:0 var(--s3)}
+.rec-cond{font-size:var(--t-small);color:var(--muted);margin:var(--s2) 0 0}
+.rec-alt{border-top:1px dashed var(--line);padding-top:var(--s3)}
+
+.deltas{
+  margin-top:var(--s4);padding:var(--s3) var(--s4);
+  background:var(--panel2);border:1px solid var(--line);border-radius:var(--radius-sm);
+}
+.deltas > .sublabel{margin-bottom:var(--s3)}
+.delta{
+  display:grid;grid-template-columns:8.5em minmax(0,1fr);gap:var(--s3);
+  padding:6px 0;font-size:var(--t-small);color:var(--muted);line-height:1.55;
+}
+.delta + .delta{border-top:1px dashed var(--line)}
+.delta .dk{
+  font-family:var(--mono);font-size:var(--t-micro);letter-spacing:.06em;
+  color:var(--warn);text-transform:uppercase;padding-top:2px;
+}
+@media(max-width:600px){.delta{grid-template-columns:1fr;gap:2px}}
+
+/* ---------- glossary ----------
+   Six abbreviations head every row table here and none of them was defined
+   anywhere on the page. */
+.glossary{padding:var(--s3) var(--s4)}
+.glossary > summary{
+  cursor:pointer;list-style:none;font-size:var(--t-small);color:var(--muted);
+}
+.glossary > summary::-webkit-details-marker{display:none}
+.glossary > summary::before{content:"\25B8 ";display:inline-block;transition:transform .15s}
+.glossary[open] > summary::before{transform:rotate(90deg)}
+.glossary dl{
+  display:grid;grid-template-columns:6em minmax(0,1fr);gap:var(--s2) var(--s4);
+  margin:var(--s4) 0 var(--s2);font-size:var(--t-small);
+}
+.glossary dt{color:var(--kv)}
+.glossary dd{margin:0;color:var(--muted);line-height:1.55}
+.glossary dd b{color:var(--ink);font-weight:600}
+@media(max-width:600px){.glossary dl{grid-template-columns:1fr;gap:2px var(--s2)}
+  .glossary dd{margin-bottom:var(--s2)}}
+
+.badge{
+  display:inline-block;font-family:var(--mono);font-size:var(--t-micro);
+  letter-spacing:.06em;padding:2px 8px;border-radius:5px;border:1px solid var(--line);
+}
+.badge.moe{color:var(--cmp);border-color:var(--cmp)}
+.badge.dense{color:var(--wt);border-color:var(--wt)}
+
+.summary-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(140px,1fr));gap:10px var(--s4)}
+.kvi{font-family:var(--mono)}
+.kvi .k{color:var(--muted);font-size:var(--t-micro);letter-spacing:.04em}
+.kvi .v{color:var(--ink);font-size:var(--t-lead);margin-top:2px}
+
 /* ---------- memory bar ---------- */
 .barwrap{margin-top:var(--s4)}
 .bar-top{

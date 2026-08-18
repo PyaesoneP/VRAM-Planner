@@ -143,6 +143,11 @@ class Handler(BaseHTTPRequestHandler):
             # be collapsed with False the way `or None` would.
             "mmproj_offload": (None if data.get("mmproj_offload") is None
                                else bool(data.get("mmproj_offload"))),
+            # "none" means no drafter at all (own-MTP and n-gram rows only);
+            # "auto" is the server's discovery of a dflash-*.gguf next to the
+            # model, the long-standing default; a path names a specific file -
+            # an MTP GGUF, which no discovery can find on its own.
+            "drafter": (data.get("drafter") or "auto"),
             # Same two fields the launch-script card already carries, so a
             # campaign can be MEASURED under the template it will be RUN under.
             # Absent means the GGUF's own metadata template, which is what every
@@ -173,6 +178,15 @@ class Handler(BaseHTTPRequestHandler):
         kw = self._speed_args(data)
         if not kw["models"]:
             return {"ok": False, "error": "No such model file: %s" % (data.get("path") or "")}
+        # A named drafter is validated before the job starts, not inside it: a
+        # bad file is a one-line error, while a campaign that dies on config
+        # one costs the hours it took to get there.
+        if kw["drafter"] not in ("auto", "none"):
+            try:
+                from .sweep import classify_drafter
+                classify_drafter(kw["drafter"])
+            except ValueError as e:
+                return {"ok": False, "error": str(e)}
 
         def add_row(row):
             # Keep only what the table renders. A full row carries every measured
@@ -485,6 +499,37 @@ class Handler(BaseHTTPRequestHandler):
             res = insights(rows)
             res["ok"] = True
             return self._send(200, res)
+        if u.path == "/api/drafters":
+            # The drafter picker: every .gguf next to the model except the model
+            # itself, classified the way the plan will price it. The plan is the
+            # authority - a file's label here only shapes the dropdown, and a
+            # mislabel is refused there, not silently repriced here.
+            from .gguf import parse_meta_only
+            from .model import _as_int
+            q = parse_qs(u.query)
+            path = (q.get("path") or [""])[0]
+            d = os.path.dirname(os.path.abspath(path)) if path else ""
+            found = []
+            if d and os.path.isdir(d):
+                base = os.path.basename(path).lower()
+                for fn in sorted(os.listdir(d)):
+                    if not fn.lower().endswith(".gguf") or fn.lower() == base:
+                        continue
+                    p = os.path.join(d, fn)
+                    try:
+                        meta = parse_meta_only(p)
+                    except (OSError, ValueError):
+                        continue
+                    arch = (meta.get("general.architecture") or "").lower()
+                    if arch == "dflash":
+                        kind = "dflash"
+                    elif any(str(k).endswith(".nextn_predict_layers")
+                             and _as_int(v) > 0 for k, v in meta.items()):
+                        kind = "mtp"
+                    else:
+                        kind = "other"
+                    found.append({"path": p, "name": fn, "kind": kind})
+            return self._send(200, {"ok": True, "dir": d, "drafters": found})
         if u.path == "/api/templates":
             # A browser <input type=file> cannot hand back a real path, so the
             # field is a text box - and typing an absolute Windows path by hand is
@@ -606,6 +651,7 @@ class Handler(BaseHTTPRequestHandler):
                 # the request to price it, and its absence leaves the plan on the
                 # model alone (the same default as the MTP checkbox).
                 dflash=(data.get("spec") == "draft-dflash" or bool(data.get("dflash"))),
+                drafter=(data.get("drafter") or None),
                 flash_attn=bool(data.get("flash_attn", False)),
                 vram_budget_mib=float(data.get("vram_budget_mib", 0)),
                 ram_budget_mib=float(data.get("ram_budget_mib", 0)),

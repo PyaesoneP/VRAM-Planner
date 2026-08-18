@@ -297,6 +297,47 @@ function onPick(){
   if(!m) return;
   $("path").value = "";
   if(m.n_ctx_train) setCtxMax(m.n_ctx_train);
+  // Speculation is per-model: the previous model's drafter choice must not ride
+  // along to one with no drafter next to it - a stale pick is a plan that fails
+  // for no reason. The picker is repopulated from the new model's directory and
+  // reset to "none", and the field is re-shown only by a plan that actually
+  // priced a drafter.
+  $("draftpick").value = "__none__";
+  $("draftpath").value = "";
+  $("dflashfield").hidden = true;
+  loadDrafters();
+}
+
+/** The drafter picker's options: every .gguf next to the model, classified by
+ *  what the plan would do with it. The server does the reading; the dropdown
+ *  only shapes the choice, and the plan refuses a file it cannot draft with. */
+async function loadDrafters(){
+  const path = currentPath();
+  if(!path) return;
+  const sel = $("draftpick");
+  const keep = sel.value;
+  while(sel.options.length > 2) sel.remove(2);
+  let cand = [];
+  try{
+    const d = await (await fetch("/api/drafters?path=" + encodeURIComponent(path))).json();
+    cand = (d && d.drafters) || [];
+  }catch(e){}
+  for(const c of cand){
+    const tag = c.kind === "dflash" ? "DFlash drafter"
+             : c.kind === "mtp" ? "MTP draft model" : "model file";
+    const opt = document.createElement("option");
+    opt.value = c.path;
+    opt.textContent = c.name + " — " + tag;
+    sel.appendChild(opt);
+  }
+  sel.value = cand.some(c => c.path === keep) ? keep : "__none__";
+  $("dflashhint").textContent = cand.length
+    ? cand.length + " candidate drafter file(s) next to the model"
+    : "no drafter candidates next to this model — DFlash auto-discovery will find none either";
+  // The field is reachable whenever a model is on the table: the manual path
+  // input lives INSIDE it, so a field that hides on "no candidates" or after a
+  // plan without a drafter is one the user can never open again.
+  $("dflashfield").hidden = !currentPath();
 }
 
 /* -------------------------------------------------------------- analysis */
@@ -318,7 +359,16 @@ async function run(){
     n_seq: parseInt($("nseq").value) || 1,
     include_mmproj: $("mmproj").checked,
     mtp_spec: $("mtpspec").checked,
-    dflash: $("dflash").checked,
+    // The drafter picker: "auto" (empty value) asks the server for the DFlash
+    // drafter next to the model, "__none__" or a hidden field sends nothing,
+    // and a chosen file or typed path goes through verbatim.
+    dflash: !$("dflashfield").hidden
+      && ($("draftpick").value === "") && !$("draftpath").value.trim(),
+    drafter: (!$("dflashfield").hidden && $("draftpick").value
+              && $("draftpick").value !== "__none__")
+      ? $("draftpick").value
+      : (!$("dflashfield").hidden && $("draftpath").value.trim()
+         ? $("draftpath").value.trim() : ""),
     n_cpu_moe_override: $("ncpumoe").value === "" ? null : parseInt($("ncpumoe").value),
     bw_vram_gbs: parseFloat($("bwv").value) || 0,
     bw_ram_gbs: parseFloat($("bwr").value) || 0,
@@ -559,7 +609,9 @@ function renderVerdict(r){
     { cls:"s-kv",  color:"var(--kv)",   label:"KV cache (GPU)",    mib:p.gpu_kv_mib || 0 },
     { cls:"s-rec", color:"var(--rec)",  label:"recurrent state",   mib:p.gpu_recurrent_mib || 0 },
     { cls:"s-prj", color:"var(--proj)", label:"vision projector",  mib:p.mmproj_mib || 0 },
-    { cls:"s-spc", color:"var(--spec)", label: inp.dflash ? "DFlash drafter" : "MTP draft cache", mib:p.spec_mib || 0 },
+    { cls:"s-spc", color:"var(--spec)", label: r.drafter
+    ? (r.drafter.kind === "mtp" ? "MTP draft model" : "DFlash drafter")
+    : "MTP draft cache", mib:p.spec_mib || 0 },
     { cls:"s-cmp", color:"var(--cmp)",  label:"compute buffer",    mib:p.compute_mib || 0 },
     { cls:"s-rsv", color:"",            label:"driver reserve",    mib:inp.gpu_reserve_mib || 0 }
   ];
@@ -704,10 +756,13 @@ function renderSummary(r){
       ${raw(c.n_mtp_layers
         ? kvItem("multi-token pred.", c.n_mtp_layers + " block" + (c.n_mtp_layers == 1 ? "" : "s") +
             ' <span class="muted">(' + (inp.mtp_spec ? "drafting: KV counted" : "idle: weights only") + ')</span>') : "")}
-      ${raw(r.dflash
-        ? kvItem("dflash drafter", esc(r.dflash.name) +
-            ' <span class="muted">' + fmt(r.dflash.mib) + " &middot; derived &middot; block " +
-            r.dflash.block_size + "</span>") : "")}
+      ${raw(r.drafter
+        ? kvItem(r.drafter.kind === "mtp" ? "MTP draft model" : "dflash drafter",
+            esc(r.drafter.name) +
+            ' <span class="muted">' + fmt(r.drafter.mib) + " &middot; derived &middot; " +
+            (r.drafter.kind === "mtp"
+              ? r.drafter.depth + " MTP block" + (r.drafter.depth === 1 ? "" : "s")
+              : "block " + r.drafter.depth) + "</span>") : "")}
       ${raw(kvItem("head dim", (c.head_dim_k || "-") +
         ((r.swa && r.swa.enabled && r.swa.head_dim !== r.swa.head_dim_global)
           ? '  <span class="muted">/ ' + esc(r.swa.head_dim) + ' swa</span>' : "")))}
@@ -809,15 +864,29 @@ function render(r){
   $("mmprojfield").hidden = !r.mmproj;
   $("ncpumoefield").hidden = !r.is_moe;
   $("mtprow").hidden = !c.n_mtp_layers;
-  $("dflashfield").hidden = !r.dflash;
-  if(r.dflash){
-    // The drafter's cost is derived (weights exact; KV and graph from geometry
-    // and the calibration), and the plan says so rather than passing it off as
-    // measured - the speed sweep's stage D exists to replace it with a number.
-    $("dflashhint").innerHTML = h`${esc(r.dflash.name)} drafts blocks for this model &mdash;
-      ${fmt(r.dflash.mib)} of VRAM (weights ${fmt(r.dflash.weights_mib)} + KV ${fmt(
-        r.dflash.kv_mib)} + graph ${fmt(r.dflash.graph_mib)}), block ${r.dflash.block_size
-      }. <b>Derived, not measured</b>: the speed sweep&rsquo;s stage D measures the real cost.`;
+  // Never hide the drafter field on a plan without one - the picker is how the
+  // user asks for one, and its manual path input cannot be reached while hidden.
+  $("dflashfield").hidden = !currentPath();
+  if(r.drafter){
+    // The drafter's cost is derived (weights exact; cache and graph from
+    // geometry and the calibration), and the plan says so rather than passing
+    // it off as measured - the speed sweep's stage D exists to replace it with
+    // a number. The picker lands on the file the plan used, so a re-run prices
+    // the same pair; anything else the dropdown holds stays as it was.
+    if(r.drafter.kind === "mtp"){
+      $("dflashhint").innerHTML = h`${esc(r.drafter.name)} drafts this model with its MTP
+        blocks &mdash; ${fmt(r.drafter.mib)} of VRAM (weights ${fmt(r.drafter.weights_mib)}
+        + MTP draft cache ${fmt(r.drafter.cache_mib)}), ${r.drafter.depth} MTP block${
+        r.drafter.depth === 1 ? "" : "s"}. <b>Derived, not measured</b>.`;
+    }else{
+      $("dflashhint").innerHTML = h`${esc(r.drafter.name)} drafts blocks for this model &mdash;
+        ${fmt(r.drafter.mib)} of VRAM (weights ${fmt(r.drafter.weights_mib)} + KV ${fmt(
+        r.drafter.cache_mib)}), block ${r.drafter.depth
+        }. <b>Derived, not measured</b>: the speed sweep&rsquo;s stage D measures the real cost.`;
+    }
+    const sel = $("draftpick");
+    if(sel && r.drafter.path && Array.from(sel.options).some(o => o.value === r.drafter.path))
+      sel.value = r.drafter.path;
   }
   if(r.mmproj){
     $("mmprojhint").innerHTML = h`${r.mmproj.name} &middot; ${fmt(r.mmproj.mib)
@@ -1106,6 +1175,10 @@ function sweepDefaults(){
            shell: (SYS && SYS.shell) || "bash", busy: "",
            campaigns: null, insights: null, openCampaign: null,
            templates: [], speeddir: "",
+           // The drafter the plan just priced, so the sweep form can ride along
+           // on the same scheme instead of silently re-discovering a different
+           // one. Set by initSweep from the analyze result; null = plan had none.
+           drafterPick: null,
            // Which campaign is being asked about, which is mid-delete, and what
            // the last delete did. Deleting takes two clicks and the second one
            // reports what it removed and where it put it.
@@ -1281,6 +1354,7 @@ async function initSweep(r){
   // matches nothing.
   SWEEP.model = SWEEP.path.split(/[\\/]/).pop();
   SWEEP.mmproj = !!(r && r.mmproj);
+  SWEEP.drafterPick = (r && r.drafter && r.drafter.path) || null;
   // The planner's own answer is the fallback config: a script is useful before
   // anyone has spent two hours measuring, it just has to say that it is a guess.
   if(r && r.plan) SWEEP.predicted = {
@@ -1342,6 +1416,42 @@ async function loadTemplates(){
   }catch(e){ SWEEP.templates = []; }
 }
 
+/** The sweep form's drafter options: every .gguf next to the model, classified
+ *  by what stage D would do with it. Runs when the form renders (it does not
+ *  exist on the page before that), and the plan's own drafter choice rides
+ *  along: a candidate file lands in the select, a file from another folder
+ *  lands in the path box. */
+async function loadSweepDrafters(){
+  const sel = $("swdrafter");
+  if(!sel || !SWEEP.path) return;
+  const keep = sel.value;
+  while(sel.options.length > 2) sel.remove(2);
+  let cand = [];
+  try{
+    const d = await (await fetch("/api/drafters?path=" +
+                                encodeURIComponent(SWEEP.path))).json();
+    cand = (d && d.drafters) || [];
+  }catch(e){}
+  for(const c of cand){
+    const tag = c.kind === "dflash" ? "DFlash drafter"
+             : c.kind === "mtp" ? "MTP draft model" : "model file";
+    const opt = document.createElement("option");
+    opt.value = c.path;
+    opt.textContent = c.name + " — " + tag;
+    sel.appendChild(opt);
+  }
+  if(SWEEP.drafterPick){
+    if(cand.some(c => c.path === SWEEP.drafterPick)){
+      sel.value = SWEEP.drafterPick;
+    }else{
+      const pathBox = $("swdraftpath");
+      if(pathBox && !pathBox.value.trim()) pathBox.value = SWEEP.drafterPick;
+    }
+  }else if(keep && keep !== "__none__" && !cand.some(c => c.path === keep)){
+    sel.value = "";
+  }
+}
+
 async function loadSweepRows(){
   try{
     const d = await (await fetch("/api/speed/rows?model=" +
@@ -1370,6 +1480,8 @@ function drawSweep(what){
       ? sweepRunning(st)
       : sweepIdle() + (st && st.status === "failed"
           ? h`<p class="note" style="color:var(--warn)">Sweep failed: ${st.error}</p>` : "");
+    // The form was just built; its drafter options are not part of the HTML.
+    loadSweepDrafters();
   }
   if(what.results !== false){
     const rr = $("sweepresults");
@@ -1460,6 +1572,19 @@ function sweepForm(pf){
           model, which bought back whole expert layers. Sweeping it is stage B. Before this
           control the only way to pin it was to write
           <span class="mono">mmproj_offload=false</span> into the axes box.</details></p>
+    </div>
+    <div class="field" style="max-width:24em">
+      <label for="swdrafter">Draft model</label>
+      <select id="swdrafter">
+        <option value="">auto &mdash; the DFlash drafter (dflash-*.gguf) next to the model</option>
+        <option value="__none__">none &mdash; the model&rsquo;s own MTP blocks, or n-gram</option>
+      </select>
+      <p class="hint">Stage D measures the draft scheme you plan to run. A
+        <span class="mono">dflash-*.gguf</span> drafts as DFlash; a model file with MTP
+        blocks (a <span class="mono">*-MTP-*.gguf</span>) drafts as draft-mtp with its own
+        blocks; anything else is refused rather than measured.
+        <input type="text" id="swdraftpath" placeholder="or type a path to a drafter .gguf"
+               style="margin-top:6px"></p>
     </div>
     <p class="hint">Measure where you actually work: decode slows as the context fills, so a
       number taken at 2k is not the speed you feel at 40k. A deeper fill costs real time
@@ -1605,6 +1730,8 @@ function sweepBody(){
   const v = id => { const el = $(id); return el && el.value !== "" ? parseInt(el.value) : null; };
   const chain = $("swchain") ? $("swchain").checked : true;
   const verify = $("swverify") ? $("swverify").checked : false;
+  const swd = $("swdrafter") ? $("swdrafter").value : "auto";
+  const swdp = $("swdraftpath") ? $("swdraftpath").value.trim() : "";
   return { path: SWEEP.path, stages: sweepStages(), context: parseInt($("ctx").value),
            kv_type: $("kv").value,
            fill: $("swfills") && $("swfills").value.trim()
@@ -1621,6 +1748,10 @@ function sweepBody(){
            // which is a different thing from absent and has to survive as one.
            mmproj_offload: (($("swmmproj") && $("swmmproj").value) || "") === ""
              ? null : $("swmmproj").value === "ram" ? false : true,
+           // A typed path wins; otherwise the select, where "" is auto (the
+           // server's discovery, the long-standing default) and __none__ is no
+           // drafter at all.
+           drafter: swdp ? swdp : (swd === "__none__" ? "none" : (swd || "auto")),
            ...sweepAskBody() };
 }
 
@@ -2460,16 +2591,32 @@ $("ctx").addEventListener("input", markCtx);
 $("visionplan").addEventListener("change", () => {
   $("visioninputs").hidden = !$("visionplan").checked;
 });
-// A server runs ONE speculative scheme, so DFlash and MTP are exclusive:
-// ticking one switches the other off rather than asking the planner to price
-// both (it would price only the first and warn about the second).
-$("dflash").addEventListener("change", () => {
-  if($("dflash").checked) $("mtpspec").checked = false;
+// A server runs ONE speculative scheme, so a chosen drafter and MTP are
+// exclusive: picking a drafter switches the model's own MTP off, and ticking
+// MTP clears the drafter pick. "auto" counts as a pick - it resolves to a
+// DFlash drafter, which would then argue with the MTP check.
+$("draftpick").addEventListener("change", () => {
+  if($("draftpick").value && $("draftpick").value !== "__none__")
+    $("mtpspec").checked = false;
 });
 $("mtpspec").addEventListener("change", () => {
-  if($("mtpspec").checked) $("dflash").checked = false;
+  if($("mtpspec").checked && $("draftpick").value
+     && $("draftpick").value !== "__none__")
+    $("draftpick").value = "__none__";
 });
 $("model").addEventListener("change", onPick);
+// Typing a path is the same event as picking a model: the picker repopulates
+// from the typed file's folder. Debounced - the input fires per keystroke and
+// each repopulation reads the folder.
+let _draftTimer = 0;
+$("path").addEventListener("input", () => {
+  clearTimeout(_draftTimer);
+  _draftTimer = setTimeout(() => {
+    $("draftpick").value = "__none__";
+    $("draftpath").value = "";
+    loadDrafters();
+  }, 250);
+});
 // Switching the basis with a stale number in the budget box is exactly the
 // divergence the control exists to remove, so it rewrites the field.
 $("vrambasis").addEventListener("change", setBasis);

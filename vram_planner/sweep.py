@@ -329,6 +329,12 @@ def build_argv(exe, model_path, c, port, probe=True, host="127.0.0.1"):
             if c.get("spec_n_min"):
                 av += ["--spec-draft-n-min", str(c["spec_n_min"])]
         else:
+            if spec == "draft-mtp" and c.get("md"):
+                # An external MTP draft model: the MTP blocks live in the
+                # drafter, so it must ride the command the way DFlash's does.
+                # Without an md, draft-mtp uses the model's own blocks and no
+                # extra file is passed - the distinction is the md's presence.
+                av += ["-md", c["md"]]
             if c.get("spec_n_max"):
                 av += ["--spec-draft-n-max", str(c["spec_n_max"])]
             if c.get("spec_n_min"):
@@ -634,7 +640,39 @@ def _drafter_block_size(drafter_path):
     return int(v) if isinstance(v, int) and v > 0 else 0
 
 
-def build_grid(facts, base=None, max_ctx=None):
+def classify_drafter(path):
+    """An explicitly named drafter file, classified for the sweep grids.
+
+    The same reading the plan makes: a `dflash-*.gguf` (dflash architecture)
+    drafts as DFlash, its trained block size setting the depth ladder; a full
+    model with MTP blocks (nextn_predict_layers > 0) drafts as MTP, its own
+    block count capping the depths. Anything else is refused rather than
+    measured as something it is not. Cheap like find_drafter_for(): only the
+    GGUF header is read."""
+    p = os.path.abspath(path)
+    if not os.path.isfile(p):
+        raise ValueError("drafter file not found: %s" % path)
+    meta = parse_meta_only(p)
+    if (meta.get("general.architecture") or "").lower() == "dflash":
+        bs = meta.get("dflash.block_size")
+        return {"path": p, "name": os.path.basename(p), "kind": "dflash",
+                "block_size": int(bs) if isinstance(bs, int) and bs > 0 else 16}
+    n = 0
+    for k, v in meta.items():
+        if str(k).endswith(".nextn_predict_layers"):
+            try:
+                n = max(n, int(v) or 0)
+            except (TypeError, ValueError):
+                pass
+    if n > 0:
+        return {"path": p, "name": os.path.basename(p), "kind": "mtp",
+                "depth": n}
+    raise ValueError("%s is neither a DFlash drafter (architecture 'dflash') "
+                     "nor a model with MTP blocks, so it cannot draft this "
+                     "model" % os.path.basename(p))
+
+
+def build_grid(facts, base=None, max_ctx=None, drafter=None):
     """Configs for one model: a baseline, each axis swept, then a few corners."""
     b = dict(base or BASE)
     nl = facts["n_layers"] or 32
@@ -690,6 +728,15 @@ def build_grid(facts, base=None, max_ctx=None):
               {"ctx": min(65536, ctx_cap), "kv": "q8_0", "seq": 4},
               {"ctx": min(32768, ctx_cap), "ngl": 0, "ub": 2048}):
         add(**c)
+    # Speculation, when a drafter was named: the draft cache is real VRAM the
+    # plan only derives, so the fit sweep measures it. Depth 1 and the
+    # recommended depth (the drafter's own blocks) are the rows that matter -
+    # the speed sweep walks the full ladder; this grid stays coarse on purpose.
+    if drafter:
+        cap = int(drafter.get("depth") or drafter.get("block_size") or 0) or 1
+        for nmax in (1, cap):
+            add(spec="draft-dflash" if drafter.get("kind") == "dflash"
+                   else "draft-mtp", spec_n_max=nmax, md=drafter["path"])
     return cfgs
 
 
@@ -851,7 +898,7 @@ def probe(model, axes, backend=None, timeout=420.0, port=8231, log=print):
 
 
 def sweep(models=None, backend=None, dry_run=False, out_path=None, timeout=420.0,
-          port=8231, limit=None, log=print):
+          port=8231, limit=None, log=print, drafter=None):
     """Run the grid for every model and append rows to the sweep file.
 
     Resumable by construction: the file is JSONL, appended one row at a time and
@@ -877,13 +924,14 @@ def sweep(models=None, backend=None, dry_run=False, out_path=None, timeout=420.0
         return None
 
     plan, skipped = [], 0
+    drf = classify_drafter(drafter) if drafter else None
     for mp in paths:
         try:
             facts = model_facts(mp)
         except Exception as e:
             log("  skip %s (%s)" % (os.path.basename(mp), e))
             continue
-        for c in build_grid(facts):
+        for c in build_grid(facts, drafter=drf):
             if _key(os.path.basename(mp), c) in done:
                 skipped += 1
                 continue

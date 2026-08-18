@@ -26,8 +26,9 @@ import datetime, hashlib, json, os, re, socket, statistics, time, urllib.error, 
 from .gpu import get_gpu_processes, gpu_list, gpu_shared_mib
 from .lmstudio import default_models_dir
 from .paths import _data_dir
-from .sweep import (build_argv, discover_models, find_drafter_for, finish_row,
-                    model_facts, pick_backend, backends_dir, serve, sweep_path,
+from .sweep import (build_argv, classify_drafter, discover_models,
+                    find_drafter_for, finish_row, model_facts, pick_backend,
+                    backends_dir, serve, sweep_path,
                     _drafter_block_size, _key, load_rows)
 
 
@@ -957,13 +958,32 @@ def stage_configs(letter, b, nl, is_moe, rungs, mmproj=None, facts=None,
         for v in STAGE_C_UB:
             add(ub=v, stage="C", wall=[("ub", "up")])
     elif letter == "d":
-        # draft-mtp needs nextn blocks in the file. Without them llama.cpp has
-        # nothing to draft from, so those rows are four wasted loads that all fail
-        # the same way - and the n-gram variants, which need nothing, are the only
-        # speculation such a model can use.
+        # draft-mtp needs nextn blocks somewhere: in the target file itself, or
+        # in an external drafter the user named (a separate MTP GGUF - e.g. a
+        # Qwen with a standalone *-MTP file). Without either, llama.cpp has
+        # nothing to draft from, so those rows are wasted loads that all fail
+        # the same way - and the n-gram variants, which need nothing, are the
+        # only speculation such a model can use.
         has_mtp = bool(facts.get("n_mtp_layers"))
+        # A drafter without a `kind` is the DFlash drafter by construction - the
+        # pre-picker shape only ever carried {path, block_size}.
+        mtp_drafter = bool(drafter and drafter.get("kind") == "mtp")
+        dmax = int((drafter or {}).get("depth") or 0) or 0
         for sp, nmax in STAGE_D_SPEC:
-            if sp == "draft-mtp" and not has_mtp:
+            if sp == "draft-mtp":
+                if mtp_drafter:
+                    # An external MTP drafter: depths past its trained blocks
+                    # are not configs (llama.cpp clamps them), and the drafter
+                    # rides every row the way DFlash's does.
+                    if dmax and nmax > dmax:
+                        continue
+                    add(spec=sp, spec_n_max=nmax, stage="D",
+                        md=drafter["path"], wall=[("spec_n_max", "up")])
+                elif not has_mtp:
+                    continue
+                else:
+                    add(spec=sp, spec_n_max=nmax, stage="D",
+                        wall=[("spec_n_max", "up")])
                 continue
             add(spec=sp, spec_n_max=nmax, stage="D",
                 wall=[("spec_n_max", "up")])
@@ -974,7 +994,7 @@ def stage_configs(letter, b, nl, is_moe, rungs, mmproj=None, facts=None,
         # the whole of it: the draft cache grows with depth, so the first depth
         # that OOMs prunes every deeper one at the same split - the pruned ones
         # are exactly the rows a hand-run --speed-axes ladder used to measure.
-        if drafter:
+        if drafter and drafter.get("kind") != "mtp":
             bs = int(drafter.get("block_size") or 0) or 16
             for nmax in range(1, bs + 1):
                 add(spec="draft-dflash", spec_n_max=nmax, stage="D",
@@ -1332,7 +1352,7 @@ def speed_sweep(models=None, backend=None, dry_run=False, timeout=420.0,
                 chain=False, rounds=1, verify=False, verify_overrides=None,
                 chat_template_file=None, chat_template_kwargs=None,
                 reasoning=None, reasoning_preserve=None, sampling=None,
-                mmproj_offload=None):
+                mmproj_offload=None, drafter=None):
     """Run the speed grid and append one row per config. Resumable like --sweep.
 
     `on_row` is called with each finished row, `on_total` when the number of
@@ -1372,9 +1392,19 @@ def speed_sweep(models=None, backend=None, dry_run=False, timeout=420.0,
     # The DFlash drafter, if the model has one next to it. Stage D then measures
     # the scheme whose cost the planner could only derive, which is the whole
     # point of the stage - and the drafter's block size sets the depth ladder.
+    # `drafter` is the campaign's own: None or "auto" discovers as before,
+    # "none" means no drafter at all (own-MTP and n-gram rows only), and a path
+    # names a specific file - an MTP GGUF, which is the scheme a plan can now
+    # price but no discovery can find on its own.
     dp = find_drafter_for(mp)
-    drafter = ({"path": dp, "block_size": _drafter_block_size(dp) or 16}
-               if dp else None)
+    if drafter in (None, "auto"):
+        drafter = ({"path": dp, "block_size": _drafter_block_size(dp) or 16,
+                    "kind": "dflash"}
+                   if dp else None)
+    elif drafter == "none":
+        drafter = None
+    else:
+        drafter = classify_drafter(drafter)
 
     # Validated before a single server is launched. A bad kwargs string is a
     # four-hour campaign that dies on config one, or worse - a template path with
@@ -1890,13 +1920,19 @@ def _draft_depths(spec, drafter=None):
     """The depth ladder one draft family walks, ascending.
 
     dflash depths come from the drafter's trained block size, the same ladder
-    stage D plans; draft-mtp from the same list STAGE_D_SPEC uses. Both are
-    what llama.cpp accepts - anything deeper is clamped, so a depth beyond the
-    list is not a config, it is the same row twice."""
+    stage D plans; draft-mtp from the same list STAGE_D_SPEC uses, capped at an
+    external drafter's own block count when one was named. Both are what
+    llama.cpp accepts - anything deeper is clamped, so a depth beyond the list
+    is not a config, it is the same row twice."""
     if spec == "draft-dflash":
         bs = int((drafter or {}).get("block_size") or 0) or 16
         return list(range(1, bs + 1))
-    return [n for s, n in STAGE_D_SPEC if s == "draft-mtp"]
+    depths = [n for s, n in STAGE_D_SPEC if s == "draft-mtp"]
+    if drafter and drafter.get("kind") == "mtp":
+        dmax = int(drafter.get("depth") or 0) or 0
+        if dmax:
+            depths = [n for n in depths if n <= dmax]
+    return depths
 
 
 def _draft_probe(c, is_moe, rung, depth):

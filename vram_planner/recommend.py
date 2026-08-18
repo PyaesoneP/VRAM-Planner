@@ -58,6 +58,18 @@ def plan_config(plan_result):
         c["seq"] = inp["n_seq"]
     if inp.get("flash_attn") is not None:
         c["fa"] = bool(inp["flash_attn"])
+    # Speculation the plan actually priced must survive into the launch script.
+    # An external drafter names the file (md) and the scheme follows its kind;
+    # the model's own MTP blocks are a scheme without a file. Absent either,
+    # spec stays absent - a plan without speculation must not invent one.
+    if inp.get("drafter"):
+        c["spec"] = "draft-mtp" if inp.get("drafter_kind") == "mtp" else "draft-dflash"
+        if inp.get("drafter_depth"):
+            c["spec_n_max"] = inp["drafter_depth"]
+        c["md"] = inp["drafter"]
+    elif inp.get("mtp_depth"):
+        c["spec"] = "draft-mtp"
+        c["spec_n_max"] = inp["mtp_depth"]
     return c
 
 

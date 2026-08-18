@@ -265,6 +265,10 @@ def _run_suite(require_refs, tmp, skipped_real):
     print("  DFLASH analyze without a drafter falls back to MTP, warning said  %s"
           % ("OK" if fb_ok else "FAIL"))
     ok = ok and fb_ok
+    # The same synthetic MTP model prices the draft-cache quant test in section
+    # 15 - aliased here because the reference-model section reuses the `mtpp`
+    # name for the real Qwen3.5-9B-MTP file, and section 15 runs after it.
+    mtps = mtpp
     # 3c) EXPLICIT drafter pick: the user names the file, so discovery plays no
     #     part - the plan prices exactly that file. A dflash-*.gguf drafts as
     #     DFlash; a model with MTP blocks drafts as an MTP draft model (-md +
@@ -2187,6 +2191,607 @@ def _run_suite(require_refs, tmp, skipped_real):
         find_ok = False
         print("  CHAIN/FIND raised %s: %s  FAIL" % (type(e).__name__, e))
     ok = ok and find_ok
+
+    # 14) the -ot dense-FFN tensor knob: n_cpu_ffn, end to end - the regex,
+    # the argv, the resume key, the fit gate, stage E's ladder and walls, and
+    # the launch scripts it lands in.
+    print("\n  -ot dense-FFN tensor offload (n_cpu_ffn)")
+    try:
+        import re as _re
+        from vram_planner.sweep import (ot_regex, _key, build_argv,
+                                        parse_overrides, suspect_reason)
+        from vram_planner.bench import (stage_configs, build_speed_grid,
+                                        _tag_axes, _prune_queue,
+                                        _carry_summary, SPEED_BASE,
+                                        CARRY_KEYS, _CONFIG_KEYS, _MONOTONE_FFN)
+
+        # 14a) the regex: every block number spelled out, so the `0` in blk.0
+        # can never match the `0` inside blk.10 - the `\.` after the number
+        # anchors it either way, but spelling the alternation makes the intent
+        # literal. Zero pins nothing, and no flag means no regex.
+        ot_ok = (ot_regex(3) == r"blk\.(0|1|2)\.ffn_(gate|up|down)\.weight=CPU"
+                 and ot_regex(0) == ""
+                 and _re.search(r"blk\.0\.", "blk.10.ffn_up.weight") is None
+                 and _re.search(r"blk\.(0|1|2)\.", "blk.2.ffn_up.weight") is not None
+                 and "10" in ot_regex(11))
+        print("  OT    regex is per-block and anchored  %s"
+              % ("OK" if ot_ok else "FAIL"))
+
+        # 14b) build_argv emits the flag exactly when the pin is set - probe
+        # and launch alike - and before --n-cpu-moe, because llama.cpp resolves
+        # the user's own --override-tensor entries before the ones --n-cpu-moe
+        # generates, so an explicit pin must be allowed to win.
+        b0 = {"ctx": 8192, "kv": "q8_0", "fa": True, "seq": 1, "ub": 512, "ngl": 20}
+        av0 = build_argv("EXE", "M.gguf", dict(b0), 8231)
+        av4 = build_argv("EXE", "M.gguf", dict(b0, n_cpu_ffn=4), 8231)
+        av8 = build_argv("EXE", "M.gguf", dict(b0, n_cpu_ffn=8), 8231, probe=False)
+        avx = build_argv("EXE", "M.gguf", dict(b0, n_cpu_ffn=4, ncmoe=4), 8231,
+                         probe=False)
+        ot_ok = ot_ok and (
+            "--override-tensor" not in av0
+            and av4[av4.index("--override-tensor"):
+                    av4.index("--override-tensor") + 2] ==
+                ["--override-tensor", ot_regex(4)]
+            and "--override-tensor" in av8
+            and avx.index("--override-tensor") < avx.index("--n-cpu-moe"))
+        print("  OT    build_argv emits -ot exactly when pinned  %s"
+              % ("OK" if ot_ok else "FAIL"))
+
+        # 14c) the resume key: a different pin is a different measurement, and
+        # absent means 0 - rows recorded before the key existed keep keying
+        # the same way, so a resumed campaign does not re-run its history.
+        ot_ok = ot_ok and (_key("m.gguf", dict(b0)) == _key("m.gguf",
+                                                            dict(b0, n_cpu_ffn=0))
+                           and _key("m.gguf", dict(b0)) != _key("m.gguf",
+                                                                dict(b0, n_cpu_ffn=8)))
+        # ...and it is both carried by chaining (a later stage must rebuild at
+        # the pin that won) and part of an experiment's identity (two rows at
+        # different pins never meet in an effect size).
+        ot_ok = ot_ok and ("n_cpu_ffn" in CARRY_KEYS and "n_cpu_ffn" in _CONFIG_KEYS)
+
+        # 14d) the axes grammar reads it like any other int, so --speed-axes
+        # and --speed-verify-overrides reach it without a special case.
+        ot_ok = ot_ok and parse_overrides(["n_cpu_ffn=0,4,8"]) == \
+            {"n_cpu_ffn": [0, 4, 8]}
+
+        # 14e) the fit gate: an ALLOCATION row carrying the pin cannot be
+        # fitted - the allocation equation prices whole blocks and has no term
+        # for a tensor split - so it stays a visible probe and never corrupts
+        # a coefficient. The speed row is a different store and no gate exists
+        # there, which is the point.
+        good = {"status": "ok", "floor_mib": 200.0, "gpu_free_after_mib": 1000.0,
+                "config": dict(b0)}
+        pinned = dict(good, config=dict(b0, n_cpu_ffn=4))
+        ot_ok = ot_ok and suspect_reason(pinned) and not suspect_reason(good)
+        print("  OT    key / argv / fit gate  %s" % ("OK" if ot_ok else "FAIL"))
+
+        # 14f) stage E: a DENSE model ladders n_cpu_ffn downward from 0 to ALL
+        # blocks at ngl = all blocks - the point of the knob is that the layers
+        # stay put and only tensors move - and every rung carries the monotone
+        # wall, so the first OOM prunes the deeper half. An MoE has no dense
+        # FFN to pin, so stage E produces nothing for it.
+        bE = dict(SPEED_BASE, ctx=8192, ngl=20)
+        se = stage_configs("e", bE, 32, False, [1])
+        sm = stage_configs("e", bE, 32, True, [1])
+        ot_ok = ot_ok and (
+            len(se) == 9
+            and [c["n_cpu_ffn"] for c in se] ==
+                [0, 4, 8, 12, 16, 20, 24, 28, 32]
+            and all(c["ngl"] == 32 and c["stage"] == "E"
+                    and c["_wall"] == [("n_cpu_ffn", "down")] for c in se)
+            and sm == [])
+        # ...and the default campaign carries it on a dense model, never on an
+        # MoE - grid_context is happy without a real file when no ladder seed
+        # is asked for (model_path=None), which is what this exercises.
+        fd = {"arch": "test", "n_layers": 32, "n_ctx_train": 0, "is_moe": False}
+        fm = {"arch": "test", "n_layers": 32, "n_ctx_train": 0, "is_moe": True}
+        gd = build_speed_grid(fd, base=dict(SPEED_BASE, ctx=8192), stages="abcde")
+        gm = build_speed_grid(fm, base=dict(SPEED_BASE, ctx=8192), stages="abcde")
+        ot_ok = ot_ok and (any(c.get("stage") == "E" for c in gd)
+                           and not any(c.get("stage") == "E" for c in gm))
+        print("  OT    stage E ladder (dense only, all blocks on GPU)  %s"
+              % ("OK" if ot_ok else "FAIL"))
+
+        # 14g) the monotone wall: n_cpu_ffn is dense-only and runs DOWNWARD -
+        # more blocks on the CPU means less VRAM, so an OOM at 16 proves 8
+        # fails too. An explicit --speed-axes ladder over it is tagged the same
+        # way, and untagged on an MoE where the axis means nothing.
+        ot_ok = ot_ok and _MONOTONE_FFN == {"n_cpu_ffn": "down"}
+        t1 = [dict(b0, n_cpu_ffn=8), dict(b0, n_cpu_ffn=16)]
+        _tag_axes(t1, {"n_cpu_ffn"}, is_moe=False)
+        t2 = [dict(b0, n_cpu_ffn=8)]
+        _tag_axes(t2, {"n_cpu_ffn"}, is_moe=True)
+        ot_ok = ot_ok and (t1[0].get("_wall") == [("n_cpu_ffn", "down")]
+                           and "_wall" not in t2[0])
+        # ...and the wall pruning: on a DOWNWARD axis, worse means FEWER blocks
+        # pinned, so an OOM at 8 in a descending ladder proves the pending 4
+        # and 0 fail too and they are dropped - while a sibling at another
+        # ubatch is a different family and survives. An ascending ladder
+        # OOMing on its LAST rung has nothing pending: the rungs below it
+        # already ran, and a run row is a measurement, never pruned.
+        eq = [dict(b0, n_cpu_ffn=16, _wall=[("n_cpu_ffn", "down")]),
+              dict(b0, n_cpu_ffn=8, _wall=[("n_cpu_ffn", "down")]),
+              dict(b0, n_cpu_ffn=4, _wall=[("n_cpu_ffn", "down")]),
+              dict(b0, n_cpu_ffn=0, _wall=[("n_cpu_ffn", "down")]),
+              dict(b0, n_cpu_ffn=4, ub=1024, _wall=[("n_cpu_ffn", "down")])]
+        eqw = {_key("m", c): c.get("_wall") for c in eq}
+        kp, dp = _prune_queue([dict(c) for c in eq], eqw, 1, "m",
+                              dict(b0, n_cpu_ffn=8))
+        ot_ok = ot_ok and ([c["n_cpu_ffn"] for c in kp] == [16, 8, 4]
+                           and kp[-1]["ub"] == 1024
+                           and sorted(c["n_cpu_ffn"] for c in dp) == [0, 4]
+                           and all(c["ub"] == 512 for c in dp))
+        print("  OT    monotone wall is dense-only and downward  %s"
+              % ("OK" if ot_ok else "FAIL"))
+
+        # 14h) the launch scripts: a config with the pin declares the regex as
+        # a per-launch parameter (which tensors move is a legitimate edit), a
+        # config without it never mentions the flag, and the carried-baseline
+        # summary names the pin so a chained campaign at ffn-cpu 8 does not
+        # read as the plain split.
+        from vram_planner.launch import launch_script
+        lop = launch_script("m.gguf", dict(b0, n_cpu_ffn=4), shell="powershell")
+        lob = launch_script("m.gguf", dict(b0, n_cpu_ffn=4), shell="bash")
+        lno = launch_script("m.gguf", dict(b0), shell="powershell")
+        ot_ok = ot_ok and (
+            "--override-tensor" in lop and "$OverrideTensor" in lop
+            and r"blk\.(0|1|2|3)\.ffn_(gate|up|down)\.weight=CPU" in lop
+            and "--override-tensor" in lob and '"$OVERRIDETENSOR"' in lob
+            and "--override-tensor" not in lno
+            and "ffn-cpu 8" in _carry_summary(dict(b0, n_cpu_ffn=8))
+            and "ffn-cpu" not in _carry_summary(dict(b0)))
+        print("  OT    scripts declare the pin, summary names it  %s"
+              % ("OK" if ot_ok else "FAIL"))
+    except Exception as e:
+        ot_ok = False
+        print("  OT raised %s: %s  FAIL" % (type(e).__name__, e))
+    ok = ok and ot_ok
+
+    # 15) the DRAFT cache's OWN quant (spec_kv): llama.cpp keeps the draft
+    #     model's KV cache at f16 whatever -ctk/-ctv say - -ctkd/-ctvd are the
+    #     flags that move it, and the sweep's knob is frozen like kv's. The
+    #     planner prices the draft cache at the same quant, the launch scripts
+    #     carry it, and rows measured under different draft quants never meet.
+    print("\n  Draft KV cache quant (spec_kv)")
+    try:
+        from vram_planner.bench import (SPEED_BASE, _CONFIG_KEYS, EFFECT_AXES,
+                                        CARRY_KEYS, _carry_summary, comparable,
+                                        _CONFIG_DEFAULTS)
+        from vram_planner.launch import launch_script, _config_divergence
+        from vram_planner.sweep import _key, build_argv
+        from vram_planner.plan import load_drafter
+        from vram_planner.kv import kv_bytes_per_token
+        from vram_planner.compute import MTP_SPEC_CONST_MIB, MTP_SPEC_PER_SEQ_MIB
+
+        b0 = dict(SPEED_BASE, ctx=8192, ngl=20)
+        d0 = dict(b0, spec="draft-mtp", spec_n_max=2)
+
+        # 15a) argv: the flags ride the draft schemes - both K and V, the same
+        #     way the target's two are moved - and only there: a config without
+        #     a draft scheme has no draft cache to quantise. The campaign's own
+        #     default names f16 explicitly rather than leaving llama.cpp to
+        #     guess; only a config that predates the knob is silent, because
+        #     silence IS llama.cpp's f16.
+        dA = dict(d0)
+        dA.pop("spec_kv", None)
+        av0 = build_argv("EXE", "M.gguf", d0, 8231)
+        avq = build_argv("EXE", "M.gguf", dict(d0, spec_kv="q8_0"), 8231)
+        avn = build_argv("EXE", "M.gguf", dict(b0, spec_kv="q8_0"), 8231)
+        avA = build_argv("EXE", "M.gguf", dA, 8231)
+        sk_ok = (av0[av0.index("-ctkd"):av0.index("-ctkd") + 4] ==
+                     ["-ctkd", "f16", "-ctvd", "f16"]
+                 and avq[avq.index("-ctkd"):avq.index("-ctkd") + 4] ==
+                     ["-ctkd", "q8_0", "-ctvd", "q8_0"]
+                 and "-ctkd" not in avn and "-ctkd" not in avA)
+
+        # 15b) identity: the draft quant is part of what a speculative row IS.
+        #     Absent normalises to llama.cpp's f16 default, so rows recorded
+        #     before the knob existed keep keying the same way, and a q8_0 row
+        #     is a different measurement that must never merge with an f16 one.
+        sk_ok = sk_ok and (_key("m", d0) == _key("m", dict(d0, spec_kv="f16"))
+                           and _key("m", d0) != _key("m", dict(d0, spec_kv="q8_0"))
+                           and "spec_kv" in _CONFIG_KEYS
+                           and "spec_kv" not in CARRY_KEYS
+                           and _CONFIG_DEFAULTS["spec_kv"] == "f16"
+                           and ("spec_kv", "draft KV quant", ("spec_kv",), "f16")
+                               in EFFECT_AXES)
+        print("  SPECKV argv / key / identity  %s" % ("OK" if sk_ok else "FAIL"))
+
+        # 15c) the planner prices the draft cache at the quant, not at f16:
+        #     the MTP cache term visibly shrinks from f16 to q8_0 (the pool and
+        #     per-sequence slot are graph buffers and do not move), and the
+        #     DFlash drafter's KV cache scales by the same bytes-per-element
+        #     ratio - checked through the exact pricing path it is handed to.
+        a16 = analyze(mtps, 4096, "f16", 512, True, vram_budget_mib=2000,
+                      ram_budget_mib=8000, gpu_reserve_mib=0,
+                      compute_override_mib=0, safety_pct=0, mtp_spec=True,
+                      spec_kv="f16")
+        aq = analyze(mtps, 4096, "f16", 512, True, vram_budget_mib=2000,
+                     ram_budget_mib=8000, gpu_reserve_mib=0,
+                     compute_override_mib=0, safety_pct=0, mtp_spec=True,
+                     spec_kv="q8_0")
+        pool = MTP_SPEC_CONST_MIB + MTP_SPEC_PER_SEQ_MIB * 1
+        kv16, kvq = a16["plan"]["spec_mib"] - pool, aq["plan"]["spec_mib"] - pool
+        dc = load_drafter(pd)["cfg"]
+        sk_ok = sk_ok and (a16["inputs"]["spec_kv"] == "f16"
+                           and aq["inputs"]["spec_kv"] == "q8_0"
+                           and 0.4 < kv16 - kvq < 1.4
+                           and abs(kvq / kv16 - 34.0 / 64.0) < 0.08
+                           and abs(kv_bytes_per_token(dc, "q8_0")
+                                   / kv_bytes_per_token(dc, "f16")
+                                   - 34.0 / 64.0) < 0.001)
+        print("  SPECKV planner prices the draft cache at the quant  %s"
+              % ("OK" if sk_ok else "FAIL"))
+
+        # 15d) comparability: a q8_0-draft row is a different experiment from
+        #     an f16 one - a baseline and an effect size may only be built
+        #     inside one quant - and absent compares as f16 on both sides.
+        rw = {"config": dict(d0), "tok_s": 1.0, "status": "ok",
+              "model": "m.gguf"}
+        rq = {"config": dict(d0, spec_kv="q8_0"), "tok_s": 1.0, "status": "ok",
+              "model": "m.gguf"}
+        sk_ok = sk_ok and (comparable(rw, "m.gguf", d0)
+                           and comparable(rw, "m.gguf", dict(d0, spec_kv="f16"))
+                           and not comparable(rw, "m.gguf",
+                                              dict(d0, spec_kv="q8_0"))
+                           and not comparable(rq, "m.gguf", d0))
+        print("  SPECKV rows at different draft quants never meet  %s"
+              % ("OK" if sk_ok else "FAIL"))
+
+        # 15e) the launch scripts carry the flags with the quant, a script
+        #     launched from an f16-measured row at q8_0 says so in the header,
+        #     and a carried baseline names the quant instead of reading as the
+        #     plain f16 speculation.
+        lq = launch_script("m.gguf", dict(d0, spec_kv="q8_0"), shell="powershell")
+        lb = launch_script("m.gguf", dict(d0, spec_kv="q8_0"), shell="bash")
+        ln = launch_script("m.gguf", d0, shell="powershell")
+        div = _config_divergence(dict(d0, spec_kv="q8_0"),
+                                 {"config": dict(d0)}, sampling=None)
+        sk_ok = sk_ok and ("-ctkd q8_0 -ctvd q8_0" in lq
+                           and "-ctkd" in lb
+                           and "-ctkd f16 -ctvd f16" in ln
+                           and "spec_kv" in div
+                           and "spec-kv q8_0" in
+                               _carry_summary(dict(d0, spec_kv="q8_0"))
+                           and "spec-kv" not in _carry_summary(d0))
+        print("  SPECKV scripts, divergence, carried baseline  %s"
+              % ("OK" if sk_ok else "FAIL"))
+    except Exception as e:
+        sk_ok = False
+        print("  SPECKV raised %s: %s  FAIL" % (type(e).__name__, e))
+    ok = ok and sk_ok
+
+    # 16) SKIP: abandoning ONE config mid-campaign without ending it. The
+    #     controlling layer (terminal S key, web Skip button) kills the server,
+    #     so the run fails promptly instead of sitting out its generation
+    #     timeout, and the row is stamped `skipped` - recorded and keyed so a
+    #     resumed campaign never re-measures it, but never a measurement: no
+    #     wall, no baseline, no tok/s.
+    print("\n  Skip a run")
+    try:
+        import time as _t
+        from .bench import _skip_stamp, trustworthy, _fmt_row
+        from .job import Job
+        from .launch import launch_script
+
+        b0 = dict(SPEED_BASE, ctx=8192, ngl=20)
+
+        # 16a) the stamping decision, exactly as bench_one sees it. The counter
+        #     only grows, so a press binds to the run it was made during, and a
+        #     press between runs is consumed by the comparison: the next run's
+        #     base already includes it, so nothing later is ever misstamped.
+        n = [0]
+        sk = lambda: n[0]
+        skip_ok = (not _skip_stamp({"status": "genfail"}, sk, 0)
+                   and not _skip_stamp({"status": "ok"}, None, 0))
+        n[0] = 1
+        skip_ok = (skip_ok
+                   and _skip_stamp({"status": "genfail"}, sk, 0)
+                   and _skip_stamp({"status": "exit"}, sk, 0)
+                   # complete measurements stay what they are: an OOM row is
+                   # the wall the ladder is read from, and overwriting it with
+                   # a skip would throw away the one result the run produced
+                   and not _skip_stamp({"status": "ok"}, sk, 0)
+                   and not _skip_stamp({"status": "oom"}, sk, 0)
+                   and not _skip_stamp({"status": "genfail"}, sk, 1))
+        print("  SKIP  the press binds to the run it was made during  %s"
+              % ("OK" if skip_ok else "FAIL"))
+
+        # 16b) a skipped row is evidence of the judgement, never a measurement.
+        r = {"status": "skipped", "gen_error": "skipped by user",
+             "tok_s": 12.5, "config": dict(b0)}
+        line = _fmt_row(dict(b0), r)
+        skip_ok = skip_ok and (not trustworthy(r)
+                               and "SKIPPED" in line
+                               and "skipped by user" in line)
+        print("  SKIP  recorded but never a measurement  %s"
+              % ("OK" if skip_ok else "FAIL"))
+
+        # 16c) the web button's backend: idle refuses, a live server is killed,
+        #     the counter bumps once per press and leaves stop/abort alone.
+        class _P(object):
+            def __init__(self): self.killed = False
+            def poll(self): return None
+            def kill(self): self.killed = True
+        jb = Job()
+        js_ok = jb.skip() == (False, "nothing running")   # idle refuses
+        jb.status, jb.started = "running", _t.time()
+        proc = _P()
+        jb.set_live_proc(proc)
+        ok3, m3 = jb.skip()
+        js_ok = (js_ok and ok3 and m3 == "skipping" and proc.killed
+                 and jb.skipped() == 1 and jb.status == "running"
+                 and not jb.cancelled() and not jb.aborting()
+                 # a press between configs (nothing live) is not an error...
+                 and jb.skip()[0]
+                 # ...and it is consumed: the count is what stamps, not the
+                 # event, so it never bleeds into the next config
+                 and jb.skipped() == 2)
+        print("  SKIP  web button kills the server, counts the press  %s"
+              % ("OK" if js_ok else "FAIL"))
+        skip_ok = skip_ok and js_ok
+
+        # 16d) a launcher built over a skipped row says NOT MEASURED - the row
+        #     exists so the campaign does not re-run the config, not as
+        #     evidence, and a script that claimed "MEASURED" over it would be
+        #     the lie the header exists to prevent. The header is comment lines,
+        #     so the raw text is checked, not command_lines().
+        s = launch_script("m.gguf", dict(b0), shell="bash",
+                          measured={"status": "skipped", "config": dict(b0)})
+        skip_ok = skip_ok and ("NOT MEASURED" in s and "SKIPPED" in s
+                               and "PREDICTED" not in s
+                               and "tok/s" not in s)
+        print("  SKIP  launcher over a skipped row says so  %s"
+              % ("OK" if skip_ok else "FAIL"))
+    except Exception as e:
+        skip_ok = False
+        print("  SKIP raised %s: %s  FAIL" % (type(e).__name__, e))
+    ok = ok and skip_ok
+
+    # 17) E FRONTIER: stage E's two ladders. The first pins FFN tensors at the
+    #     split the campaign actually won (the carried ngl, not ngl=nl - the
+    #     rows must start where the baseline fits, or they re-prove a wall the
+    #     chain already measured); the second spends the freed VRAM on LAYERS:
+    #     ngl walked back up with the pin held, one corner of the (ngl, ffn)
+    #     frontier per row. And the draft walk must not fire on E rows - it
+    #     would read a layer/FFN wall as a draft-cache wall and walk a diagonal
+    #     no family ever ran.
+    print("\n  Stage E frontier")
+    try:
+        from .bench import _e_frontier, _e_walk_pin, _spec_retry, \
+            _prune_queue, stage_configs
+        from .sweep import _key
+
+        b17 = dict(b0, spec="draft-mtp", spec_n_max=3, ub=256,
+                   mmproj_offload=False, n_cpu_ffn=0)
+
+        # 17a) the probes: one corner per layer above the base, the pin held,
+        #     the row's family inherited - and tagged ngl-up, so the first OOM
+        #     prunes the rest. A stale _wall from the row that proved the pin
+        #     must not leak into the probes.
+        fr = _e_frontier(dict(b17, ngl=27, _wall=[("n_cpu_ffn", "down")]),
+                         27, 8, 30)
+        e_ok = (len(fr) == 3
+                and [c["ngl"] for c in fr] == [28, 29, 30]
+                and all(c["n_cpu_ffn"] == 8 for c in fr)
+                and all(c["_wall"] == [("ngl", "up")] for c in fr)
+                and all(c["spec"] == "draft-mtp" and c["spec_n_max"] == 3
+                        and c["ub"] == 256 for c in fr)
+                # no layers above nl: nothing to walk
+                and _e_frontier(dict(b17, ngl=30), 30, 8, 30) == [])
+        print("  EFRON probes: one ngl-up corner per layer, pin held  %s"
+              % ("OK" if e_ok else "FAIL"))
+
+        # 17b) the OOM interplay: a probe that OOMs prunes every higher probe
+        #     (same family, worse ngl) - the walk IS the queue, not a loop.
+        wq = [dict(c) for c in fr]
+        wwalls = {_key("m", c): c.get("_wall") for c in wq}
+        keep, drop = _prune_queue(wq, wwalls, 1, "m",
+                                  dict(b17, ngl=29, n_cpu_ffn=8))
+        e_ok = (e_ok and [c["ngl"] for c in keep] == [28, 29]
+                and [c["ngl"] for c in drop] == [30])
+        print("  EFRON one OOM ends the walk - later rungs pruned  %s"
+              % ("OK" if e_ok else "FAIL"))
+
+        # 17c) the pin: the SMALLEST ffn>0 already proven to fit at the base
+        #     ngl in the same family. ffn 0 is not a pin (it is the plain split
+        #     the baseline already is); other ngls, families or statuses are
+        #     not evidence; a spilled row loaded on the edge.
+        rec = {"k1": {"status": "ok", "config": dict(b17, ngl=27, n_cpu_ffn=16)},
+               "k2": {"status": "ok", "config": dict(b17, ngl=27, n_cpu_ffn=8)},
+               "k3": {"status": "ok", "config": dict(b17, ngl=27, n_cpu_ffn=0)},
+               "k4": {"status": "ok", "config": dict(b17, ngl=26, n_cpu_ffn=4)},
+               "k5": {"status": "oom", "config": dict(b17, ngl=27, n_cpu_ffn=4)},
+               "k6": {"status": "ok", "config": dict(b17, ngl=27, n_cpu_ffn=4,
+                                                      ub=512)},
+               "k7": {"status": "spilled", "config": dict(b17, ngl=27,
+                                                          n_cpu_ffn=2)}}
+        e_ok = (e_ok
+                and _e_walk_pin(rec, 27, b17) == 8
+                and _e_walk_pin({}, 27, b17) is None
+                and _e_walk_pin(rec, 28, b17) is None)
+        print("  EFRON the walk pins the least ffn proven to fit  %s"
+              % ("OK" if e_ok else "FAIL"))
+
+        # 17d) the draft walk is deaf to stage E: an E row's OOM is a layer or
+        #     FFN wall, not a draft cache that cannot fit - and the walk state
+        #     must stay untouched so stage D's own walk is not derailed.
+        tr17 = {}
+        d17 = _spec_retry(dict(b17, ngl=65, n_cpu_ffn=0, stage="E"),
+                          {"status": "oom"},
+                          {"is_moe": False, "n_layers": 65}, tr17)
+        e_ok = (e_ok and d17 is None and "draft-mtp" not in tr17)
+        print("  EFRON draft walk deaf to stage E rows  %s"
+              % ("OK" if e_ok else "FAIL"))
+
+        # 17e) stage E ladders from the split it is handed (e_ngl - the carried
+        #     winner's under a chain), not from ngl=nl; the unchained default
+        #     stays the mode's own layout.
+        se = stage_configs("e", dict(b0, ngl=20), 32, False, [1], e_ngl=27)
+        se0 = stage_configs("e", dict(b0, ngl=20), 32, False, [1])
+        e_ok = (e_ok
+                and len(se) == 9 and all(c["ngl"] == 27 for c in se)
+                and [c["n_cpu_ffn"] for c in se] ==
+                    [0, 4, 8, 12, 16, 20, 24, 28, 32]
+                and all(c["_wall"] == [("n_cpu_ffn", "down")] for c in se)
+                and len(se0) == 9 and all(c["ngl"] == 32 for c in se0))
+        print("  EFRON ladder starts at the split it is handed  %s"
+              % ("OK" if e_ok else "FAIL"))
+    except Exception as e:
+        e_ok = False
+        print("  EFRON raised %s: %s  FAIL" % (type(e).__name__, e))
+    ok = ok and e_ok
+
+    # 18) SLOW RUN: a config that does not OOM can still be unusable - WDDM
+    #     spills it into shared memory, or the machine is busy - and then every
+    #     pass crawls and the row, when it finally lands, is a plausible-looking
+    #     number that is not worth the minutes it took. Three sides of the same
+    #     fix: the mid-run abort (a pass at a fraction of what the model
+    #     normally does ends the measurement, status `spilled`), the recorded
+    #     rows verdict (a stored row at a fraction of its campaign's own median
+    #     is flagged the same way a spill is, so it stops being evidence), and
+    #     the resume filter (a judged row - skipped by the user, spilled by the
+    #     machine - is never re-measured).
+    print("\n  Slow-run abort and collapse")
+    try:
+        from .bench import _abort_floor, _resume_recorded, _infer_demotion, \
+            SLOW_FRAC, trustworthy
+        from .sweep import _key
+
+        def hrow(tok, model="M.gguf", ngl=27, **kw):
+            r = {"model": model, "gpu": "G", "_file": "f.jsonl", "status": "ok",
+                 "tok_s": tok, "floor_mib": 1050.0,
+                 "config": {"ctx": 131072, "kv": "q8_0", "ub": 512, "seq": 1,
+                            "fa": True, "ngl": ngl, "fill": 2048}}
+            r.update(kw)
+            return r
+
+        # 18a) the abort floor is 15% of the median of the healthy rows for this
+        #     model; None until there is something to judge against. A spilled,
+        #     looping or copying row is not a healthy row - it must not drag the
+        #     floor down onto the configs that follow it.
+        af = _abort_floor([hrow(5.6), hrow(5.8), hrow(5.58)], dict(ngl=28), "M.gguf")
+        sr_ok = (af is not None and abs(af - 0.15 * 5.6) < 0.001
+                 and _abort_floor([hrow(5.6)], dict(ngl=28), "M.gguf") is None
+                 and _abort_floor([], dict(ngl=28), "M.gguf") is None
+                 and _abort_floor([hrow(5.6)], dict(ngl=28), "Other.gguf") is None
+                 and _abort_floor([hrow(5.6, spilled=True), hrow(5.8)],
+                                  dict(ngl=28), "M.gguf") is None
+                 and _abort_floor([hrow(5.6, distinct_ratio=0.2), hrow(5.8)],
+                                  dict(ngl=28), "M.gguf") is None)
+        print("  SLOWRUN abort floor: 15%% of the healthy median, else None  %s"
+              % ("OK" if sr_ok else "FAIL"))
+
+        # 18b) resume: a judged row is never re-measured. `ok`/`oom` are
+        #     measurements, `skipped`/`spilled` are judgements (by the user and
+        #     by the machine), and everything else failed for a reason that may
+        #     not hold tomorrow. A row measured under other settings is a
+        #     different experiment, not this campaign's work already done.
+        rows18 = [hrow(5.6, ngl=27, n_predict=128, repeat=3, prompt_id="p",
+                       template_id=None),
+                  dict(hrow(5.0, ngl=28, n_predict=128, repeat=3, prompt_id="p",
+                            template_id=None), status="oom"),
+                  dict(hrow(0.5, ngl=29, n_predict=128, repeat=3, prompt_id="p",
+                            template_id=None), status="spilled"),
+                  dict(hrow(0.0, ngl=30, n_predict=128, repeat=3, prompt_id="p",
+                            template_id=None), status="skipped"),
+                  dict(hrow(4.0, ngl=31, n_predict=128, repeat=3, prompt_id="p",
+                            template_id=None), status="genfail"),
+                  hrow(5.0, ngl=27, n_predict=32, repeat=1, prompt_id="p",
+                       template_id=None),
+                  hrow(5.0, ngl=27, n_predict=128, repeat=3, prompt_id="q",
+                       template_id=None),
+                  hrow(5.0, ngl=27, n_predict=128, repeat=3, prompt_id="p",
+                       template_id="t")]
+        rec = _resume_recorded(rows18, 128, 3, "p", None)
+        sr_ok = (sr_ok and len(rec) == 4
+                 and all(rec[k]["status"] in ("ok", "oom", "skipped", "spilled")
+                         for k in rec))
+        print("  SLOWRUN resume keeps judgements, drops the failed  %s"
+              % ("OK" if sr_ok else "FAIL"))
+
+        # 18c) the recorded-rows verdict: a row at a fraction of its campaign's
+        #     own median tok/s is flagged like a spill - excluded from every
+        #     conclusion - with the ratio named. The wall being found moves a
+        #     ladder by tens of percent, never by 6x, so the top rung is safe.
+        def crows(tok, **kw):
+            r = hrow(tok, **kw)
+            r["config"] = dict(r["config"], fill=65536)
+            return r
+        grp = [crows(5.6), crows(5.8), crows(0.576)]
+        _infer_demotion(grp)
+        sr_ok = (sr_ok and grp[-1]["spilled"]
+                 and grp[-1].get("collapse_inferred") is not None
+                 and grp[-1]["collapse_inferred"] < SLOW_FRAC
+                 and not grp[0].get("spilled") and not grp[1].get("spilled")
+                 and trustworthy(grp[0]) and not trustworthy(grp[-1]))
+        wall = [crows(5.9), crows(5.6), crows(4.5)]
+        _infer_demotion(wall)
+        sr_ok = (sr_ok and not any(r.get("spilled") for r in wall)
+                 and all(trustworthy(r) for r in wall))
+        # a lone row has no campaign to be a fraction of - the grouping needs 3
+        lone18 = [crows(0.4)]
+        _infer_demotion(lone18)
+        sr_ok = (sr_ok and not lone18[0].get("spilled"))
+        # a verdict from a memory signal survives: the collapse pass runs after
+        # the counter/floor verdicts, so a demoted row keeps its demotion
+        sus18 = [crows(5.6), crows(5.8), crows(3.9, suspect="floor_mib is negative",
+                                                  shared_mib=700.0)]
+        _infer_demotion(sus18)
+        sr_ok = (sr_ok and sus18[-1]["spilled"])
+        print("  SLOWRUN stored rows at a fraction of the median are flagged  %s"
+              % ("OK" if sr_ok else "FAIL"))
+
+        # 18d) the Skip button's route: the endpoint exists in the handler, so
+        #     the allow-list must carry it too. This is the actual bug this
+        #     section exists for - the button 404'd and the fetch swallowed it.
+        import vram_planner.web as _web
+        sr_ok = (sr_ok and "/api/speed/skip" in _web._POSTS
+                 and "/api/speed/stop" in _web._POSTS)
+        print("  SLOWRUN skip route is on the POST allow-list  %s"
+              % ("OK" if sr_ok else "FAIL"))
+
+        # 18e) a launcher over a spilled row says NOT MEASURED, like a skipped
+        #     one - the row exists so the campaign does not re-measure it, not
+        #     as evidence.
+        s18 = launch_script("m.gguf", dict(b0), shell="bash",
+                            measured={"status": "spilled", "config": dict(b0)})
+        sr_ok = (sr_ok and "NOT MEASURED" in s18 and "SPILLED" in s18
+                 and "PREDICTED" not in s18 and "tok/s" not in s18)
+        print("  SLOWRUN launcher over a spilled row says so  %s"
+              % ("OK" if sr_ok else "FAIL"))
+    except Exception as e:
+        sr_ok = False
+        print("  SLOWRUN raised %s: %s  FAIL" % (type(e).__name__, e))
+    ok = ok and sr_ok
+
+    # 19) WALL SIGNATURE: current llama.cpp Windows builds die at the wall
+    #     with a GGML_ASSERT(buffer) abort - the NULL-buffer check in
+    #     ggml_backend_alloc_ctx_tensors - instead of a clean "failed to
+    #     allocate" line. Before the assert was added to RE_OOM, every such
+    #     row landed as `exit`: it never pruned the queue, never recorded a
+    #     wall, and a resumed sweep re-measured all the rungs it had already
+    #     crashed on. An assert that appears AFTER the server is up is
+    #     something else's problem and stays non-OOM.
+    print("\n  Allocation-wall signature")
+    try:
+        from .sweep import parse_log
+        crash = ("0.08.170.077 I load_hparams: model size:         884.62 MiB\n"
+                 "llm-engine/llama.cpp/ggml/src/ggml-backend.cpp:179: "
+                 "GGML_ASSERT(buffer) failed\n")
+        clean = ("0.07.025.102 E graph_reserve: failed to allocate compute "
+                 "buffers\n")
+        as_ = parse_log(crash)
+        no = parse_log("0.01.000.000 I llama_server: listening on http://...\n"
+                       + crash)
+        cl = parse_log(clean)
+        ok_ = (as_["oom"] and not no["oom"] and cl["oom"])
+        print("  WALLSIG assert-only log is oom, post-ready assert is not  %s"
+              % ("OK" if ok_ else "FAIL"))
+    except Exception as e:
+        ok_ = False
+        print("  WALLSIG raised %s: %s  FAIL" % (type(e).__name__, e))
+    ok = ok and ok_
 
     # ---- the recommendation, and the two divergences it exists to report ----
     #

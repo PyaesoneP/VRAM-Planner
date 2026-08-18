@@ -7,9 +7,10 @@ invisible to it.
 
 - **Speculative decoding.** `speed.py` is a bandwidth roofline with no acceptance-rate
   term, and `per_token_bytes()` skips MTP blocks because they do not run during ordinary
-  decode. The planner can price what speculation *costs* — an f16 draft cache, whatever
-  `--cache-type-k` says — and nothing of what it saves. On one 27B hybrid the roofline
-  predicted MTP would **lose 4%**; measured, it **won by 41%**.
+  decode. The planner can price what speculation *costs* — a draft cache, quant and all
+  (llama.cpp keeps it f16 whatever `--cache-type-k` says; the campaign can pin it lower
+  with `--speed-spec-kv`, §5.1) — and nothing of what it saves. On one 27B hybrid the
+  roofline predicted MTP would **lose 4%**; measured, it **won by 41%**.
 - **Prompt processing**, which is not modelled anywhere in this tool, on purpose.
 
 Everything below is a real command. The same harness also runs from the web UI — see
@@ -69,6 +70,7 @@ only in the driving:
 | preview | `--dry-run` | **Preview grid** |
 | progress | printed rows | live table, ordered as measured |
 | stopping | Ctrl-C | **Stop**, which lands between configs |
+| skipping one run | press **S** | **Skip run** (§3.3) |
 | chaining | `--speed-chain`, off by default | **Chain the stages**, ticked by default |
 | rounds | `--speed-rounds N` | the **Rounds** field |
 | reading back | `--speed-report` | **Measured results**, the ranked table |
@@ -104,6 +106,7 @@ for you (§3.1).
 | **B** | projector in VRAM vs system RAM | Only if the model ships an `mmproj`. Moves the ceiling, so it re-walks stage A's ladder. |
 | **C** | `-ub` (physical batch) | Mostly a *prefill* knob; costs VRAM, so it interacts with the wall. |
 | **D** | `--spec-type` and draft depth | Needs the winner of A–C to be settled first. |
+| **E** | `-ot` dense FFN tensor pin (dense only) | The counterpart of stage A's `--n-cpu-moe`: what the plan's "KV on GPU, FFN in RAM" mode actually costs — and, under `--speed-chain`, what the freed tensors buy back in layers (§5.2). |
 
 Stage A's ladder is **seeded from the planner** — `plan.analyze()` is asked where the
 split falls for this model, this card and this context, and the ladder brackets that.
@@ -145,7 +148,8 @@ wall    : ngl 42 ncmoe 0 ub 512 spec none OOMs; 5 later configs provably worse, 
 - **Only `oom` prunes.** A `genfail`, `exit` or timeout says nothing about the next rung;
   a `spilled` row *loaded* (and ran badly), which is a measurement, not a wall.
 - **Only along monotone axes.** `ngl`, `ub`, `ctx` and draft depth only ever cost more
-  VRAM as they rise; `n_cpu_moe` only ever costs less as it rises (MoE models only). A
+  VRAM as they rise; `n_cpu_moe` (MoE models) and `n_cpu_ffn` (dense models) only ever
+  cost less as they rise. A
   ladder over `spec` or `temp` has no ordering, so those rows are all measured, exactly
   as typed — including in `--speed-axes` ladders.
 - **Pruned rows are never recorded**, so a campaign resumed after a card change
@@ -229,6 +233,40 @@ the same table and the report flags it. If it is untrustworthy — OOM at the wi
 you will actually get when you press the launch button, which is the number that
 matters. Budget ~2 minutes (one load) per campaign.
 
+## 3.3 Skipping one run without stopping the campaign
+
+Most of a config's wall time is one blocking request to the server, so a server that
+wedges sits out the whole generation timeout — up to 30 minutes per config, and the
+only escape used to be stopping the sweep entirely. **Skip** is the escape from ONE
+run: press **S** in the terminal (or the **Skip run** button in the browser), and the
+server is killed, the run fails at once, and the sweep moves on to the next config.
+
+A skipped row is recorded with status `skipped` — that is the point, not the cost:
+
+- **It keys, so it is never re-measured** — by this campaign, or by one resumed
+  tomorrow. The user already judged it once; making it pay for that judgement twice
+  is exactly what the skip exists to prevent.
+- **It is never a measurement.** `skipped` rows carry no tok/s, no wall (only
+  `oom` prunes), no chained baseline, no insight — the report treats them like the
+  failures they replaced.
+- **The press binds to the run it was made during.** A press that lands between
+  configs kills nothing and consumes itself; the next config is untouched.
+- **A completed row is never overwritten.** If the press lands as the run finishes,
+  the row stays what it measured — including an OOM row, which is the wall the
+  ladder is read from.
+
+Skip is judgement, so use it for "this is not going to work". If a config merely
+needs a re-try, stop and resume instead — stopping is the escape from the campaign,
+and nothing is lost either way because every row is already on disk and keyed.
+
+The machine makes the same judgement itself, automatically: a pass that runs at a
+**fraction of what this model normally delivers** is not a slower config, it is a
+card that stopped being usable — WDDM spilled the process into shared memory, or the
+machine is busy with something else. The measurement is then **aborted** instead of
+crawling through its remaining passes, and the row is recorded with status `spilled`
+(§8, Statuses): same keying, same never-a-measurement rule, judged by the machine
+rather than by you.
+
 ---
 
 ## 4. Freezing settings vs chasing speed
@@ -286,6 +324,69 @@ file is present — and it sweeps the drafter's **whole trained block size**, as
 (from depth 1 to the block), because llama.cpp clamps `--spec-draft-n-max` to it and the
 monotone wall (§3.0) prunes the deeper half of the ladder at the first OOM — the draft
 cache grows with depth, so depth 8 failing at a split proves depths 9–16 do too.
+
+### 5.1 The draft cache's own quant (`spec_kv`)
+
+The draft cache is **not** the target's KV cache. llama.cpp keeps it at f16 whatever
+`-ctk/-ctv` say — it is moved by its own pair, `-ctkd/-ctvd` (`--cache-type-k-draft` /
+`--cache-type-v-draft`) — and it is the speculative allocation that grows with draft
+depth, so its size is part of what stage D measures. The sweep's knob is `spec_kv`,
+frozen like `kv` is and defaulting to f16:
+
+```
+python -m vram_planner --speed-sweep --models MODEL --speed-spec-kv q8_0
+```
+
+`q8_0` halves the draft cache (34/32 bytes per element vs 2). The planner prices every
+speculative scheme at the campaign's quant — the MTP cache, a DFlash drafter's cache,
+an external MTP drafter's — and the launch scripts carry `-ctkd/-ctvd` with the value.
+It is an axis like any other (`--speed-axes "spec=draft-mtp spec_kv=f16,q8_0"`), so the
+report can say what the smaller cache *bought* — and the answer is allowed to be "it
+saved VRAM and lost speed", because the acceptance rate is a measurement, not a price.
+
+### 5.2 Dense FFN offload (`-ot`) — the other way to free VRAM
+
+Dense models have two knobs, not one. Stage A's `-ngl` moves **whole blocks** — attention,
+KV and FFN together — which is expensive per token, because every block's KV leaves VRAM
+with it. The alternative the plan's "KV on GPU, FFN in RAM" mode is built on: keep every
+block on the GPU and pin the **dense FFN tensors** (`ffn_gate`, `ffn_up`, `ffn_down`) of
+the first N blocks to the CPU with llama.cpp's `--override-tensor` (`-ot`), e.g.
+
+```
+-ot "blk\.(0|1|2)\.ffn_(gate|up|down)\.weight=CPU"
+```
+
+Stage **E** sweeps exactly that ladder — `n_cpu_ffn` from 0 to all blocks — on dense models
+only. An MoE has no dense FFN to pin (its experts are stage A's `--n-cpu-moe` ladder), so E
+is skipped there with a note. The wall is monotone **downward**, like `n_cpu_moe`: an OOM at
+16 blocks pinned proves 8 fails too.
+
+E's first ladder starts where the split is *believed* to belong: at `-ngl` = all blocks,
+the mode's own layout, in the plain grid — and at the **carried winner's split** under
+`--speed-chain`, because the `-ot` rows must start where the baseline actually fits, or they
+re-prove a wall the chain already measured. Either way the layers stay put and only tensors
+move.
+
+That gives E a **second ladder** — the frontier. Every FFN rung that fits frees VRAM, and
+freed VRAM buys *layers* back: once the smallest pin that fits is known, `-ngl` is walked
+back **up** one layer at a time with the pin held — one corner of the `(ngl, ffn)` frontier
+per row, instead of a cross product of hundreds of loads. The first OOM ends the walk: `ngl`
+is monotone up, so nothing above it can fit either. On a card where all layers fit without
+any pin, the walk has nothing to walk and E is the plain ladder it always was.
+
+This is a **tensor** split, so it is also the one knob no layer count can describe — the
+speed model prices it the same way the plan does (`n_cpu_ffn`), and the launch script
+carries the regex as a parameter (`-OverrideTensor` / `OVERRIDETENSOR`), so which tensors
+move is an edit you can make per launch.
+
+Pin it instead of sweeping it with `--speed-ot N` (which drops stage E, exactly like
+pinning the projector drops stage B) or with any ladder:
+
+```
+python -m vram_planner --speed-sweep --models MODEL --speed-ot 8
+python -m vram_planner --speed-sweep --models MODEL --speed-axes "ngl=32 n_cpu_ffn=0,4,8,16"
+```
+
 Check before you plan a campaign around speculation:
 
 ```
@@ -307,7 +408,7 @@ present), and they are worth far less.
 | `--speed-sweep` | run the staged grid |
 | `--dry-run` | print the configs and estimate, run nothing |
 | `--models NAME` | substring match on the file name |
-| `--speed-stages abcd` | which stages to run |
+| `--speed-stages abcde` | which stages to run |
 | `--speed-ctx N` / `--speed-kv TYPE` | freeze context / KV quant |
 | `--speed-fill N` | prompt length to measure at |
 | `--speed-fills N N …` | first value = campaign fill; the rest re-measure the top stage-A rungs at deeper fills (§3). Refuses to combine with `--speed-fill` |
@@ -318,6 +419,8 @@ present), and they are worth far less.
 | `--sweep-timeout SECONDS` | per-load timeout (raise it for deep fills) |
 | `--speed-chain` | build each stage from the fastest row so far (§3.1) |
 | `--speed-rounds N` | with `--speed-chain`: re-run the stages from the winner |
+| `--speed-ot N` | pin the first N blocks' dense FFN tensors to the CPU (`-ot`) for the campaign; drops stage E (§5.2). Dense models only |
+| `--speed-spec-kv TYPE` | freeze the DRAFT cache's quant (`-ctkd/-ctvd`) for the campaign; f16 by default (§5.1). Halves what speculation costs at `q8_0`, at whatever the acceptance rate turns out to be |
 | `--speed-verify` | re-run the winner plus the production config (§3.2) |
 | `--speed-verify-overrides "k=v,v …"` | extra knobs for the verify row, same grammar as `--speed-axes` |
 | `--refresh-corpus` | regenerate `_corpus.txt` from the current sources (commit it, §7) |
@@ -330,8 +433,9 @@ Values are comma-separated; multiple axes form a cross product, so keep it small
 
 | axis | type | notes |
 |---|---|---|
-| `ctx`, `ngl`, `ub`, `seq`, `ncmoe`, `fill` | int | `seq` is `-np` |
+| `ctx`, `ngl`, `ub`, `seq`, `ncmoe`, `fill`, `n_cpu_ffn` | int | `seq` is `-np`; `n_cpu_ffn` is the `-ot` FFN pin (§5.2) |
 | `kv` | string | `f16`, `q8_0`, … |
+| `spec_kv` | string | the draft cache's own quant, `-ctkd/-ctvd`; absent is llama.cpp's f16 (§5.1). Any draft scheme can ladder it: `spec=draft-mtp spec_kv=f16,q8_0` |
 | `fa`, `mmproj_offload`, `warmup` | bool | `0`/`off`/`false` are false |
 | `spec` | string | `none`, `draft-mtp`, `draft-dflash`, `ngram-mod`, `ngram-cache`, `ngram-simple` |
 | `spec_n_max`, `spec_n_min` | int | draft depth |
@@ -449,12 +553,14 @@ with each other.
 ## 8. Reading the results
 
 ```
-st ngl  ncmoe ub    fill     spec          nmax mmproj |    tok/s   prefill    VRAM accept
-A  28   0     512   2048     draft-mtp     2    ram    |     9.45     296.9   11410    80%
+st ngl  ncmoe ot   ub    fill     spec          nmax mmproj |    tok/s   prefill    VRAM accept
+A  28   0     0    512   2048     draft-mtp     2    ram    |     9.45     296.9   11410    80%
+E  32   0     8    512   2048     none          0    vram   |     8.10     288.4   10120    -
 ```
 
 | column | meaning |
 |---|---|
+| `ot` | blocks whose dense FFN tensors are pinned to the CPU (`-ot`), stage E rows and pinned campaigns only |
 | `tok/s` | **median of `--repeat` cache-warm passes** — pure decode |
 | `prefill` | from one cold pass, `cache_prompt` off |
 | `VRAM` | per-process dedicated VRAM, from the OS counter |
@@ -473,6 +579,8 @@ real context depth. Splitting them is what makes deep fills affordable at all.
 | `oom` | did not allocate — a hard upper bound, recorded rather than dropped |
 | `exit` / `timeout` | died, or never printed a ready line |
 | `genfail` | loaded, then the generation failed — e.g. a draft depth whose context could not allocate |
+| `skipped` | abandoned on request — the user judged it, so it is keyed and never re-measured (§3.3) |
+| `spilled` | aborted mid-measurement: a pass ran at a fraction of what this model normally delivers — WDDM spilled the process into shared memory, or the card was busy. Keyed and never re-measured, like `skipped`, judged by the machine rather than by you |
 
 `spilled` marks a row that loaded and reported `ok` but was over-committed: WDDM does not
 fail an allocation past the dedicated budget — it moves part of the process into system
@@ -487,6 +595,20 @@ differently: only the **measured** reading gates (excluded from conclusions), wh
 inference marks the row as *at the wall* without discarding it — a ladder slowing at its
 top rung is the wall being found, and one real campaign's fastest row carried the exact
 collapse signature.
+
+There is a third signal, and it catches what the two memory signals cannot: a process
+demoted by a **busy machine** shows no excess shared usage and no floor collapse — the
+counters never move, the speed does. A row at a fraction of its campaign's own median
+tok/s is flagged (`collapse_inferred`, the ratio that triggered it) and excluded like any
+other spill — the wall being found moves a ladder by tens of percent, never by 6x.
+
+And since a spilled run is known to be useless before it finishes, it is no longer
+*measured* to the end: the first pass that lands at a fraction of what this model
+normally delivers (15% of the campaign's own median tok/s — `SLOW_FRAC`) **aborts** the
+measurement, and the row is recorded with status `spilled` — the machine's judgement,
+recorded and keyed so the config is never re-measured. No reference rows yet (a
+first-ever config on a fresh model) means no abort: there is nothing to be judged
+against.
 
 ### Depth beats every setting
 

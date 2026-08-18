@@ -43,6 +43,7 @@ class Job(object):
         self._cancel = threading.Event()
         self._abort = threading.Event()   # second Stop: abandon the config in flight
         self.live_proc = None             # the llama-server up right now, if any
+        self._skips = 0                   # Skip presses, for the run's stamping
 
     # -- writing, from the worker thread --------------------------------------
     def _append(self, line):
@@ -194,6 +195,40 @@ class Job(object):
 
     def aborting(self):
         return self._abort.is_set()
+
+    def skipped(self):
+        """How many skips have been requested, for the run's stamping.
+
+        The sweep snapshots this before each config and compares after: a press
+        is bound to the run it was made during, and a press between runs is
+        consumed by the comparison without touching anything - nothing was in
+        flight to skip."""
+        with self._lock:
+            return self._skips
+
+    def skip(self):
+        """Abandon the config in flight and move on, without ending the campaign.
+
+        Stop is the escape from the campaign; Skip is the escape from ONE run -
+        the hung server, the config that is clearly not going to work. The
+        server is killed so the run fails promptly instead of sitting out its
+        generation timeout, and bench_one() then stamps the row `skipped`: it is
+        recorded and keyed, so this campaign - and a resumed one - never
+        re-measures it. The rest of the queue is untouched."""
+        with self._lock:
+            if not self.running:
+                return False, "nothing running"
+            self._skips += 1
+            proc = self.live_proc
+        if proc is not None and proc.poll() is None:
+            try:
+                proc.kill()
+            except Exception as e:
+                self._append("could not kill the server: %s" % e)
+        self._append("skip requested - abandoning the config in flight. Its row is "
+                     "recorded as skipped and will not be re-measured; the campaign "
+                     "continues with the next config.")
+        return True, "skipping"
 
 
 # The singleton. Module-level because the HTTP handler is instantiated per

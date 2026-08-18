@@ -147,10 +147,15 @@ RE_INFO    = re.compile(r"print_info:\s*(.+?)\s*=\s*(.+?)\s*$", re.M)
 RE_READY   = re.compile(r"llama_server: (model loaded|listening on http)")
 
 # llama.cpp does not use one phrasing for a failed allocation, and some of these
-# arrive from the CUDA runtime rather than from llama.cpp at all.
+# arrive from the CUDA runtime rather than from llama.cpp at all. Current
+# Windows builds ABORT on a failed allocator instead of printing a clean
+# message - ggml-backend.cpp:179 is the NULL-buffer check in
+# ggml_backend_alloc_ctx_tensors, and its only cause is an allocation that
+# returned nothing - so the assert is an OOM signal here too.
 RE_OOM     = re.compile(r"out of memory|failed to allocate|cudaMalloc failed|"
                         r"unable to allocate|ggml_backend_.*alloc.*failed|"
-                        r"failed to create context|error loading model", re.I)
+                        r"failed to create context|error loading model|"
+                        r"GGML_ASSERT\(buffer\) failed", re.I)
 
 INFO_KEYS = ("arch", "n_layer", "n_embd", "n_head", "n_head_kv", "n_ff", "n_expert",
              "n_expert_used", "n_swa", "n_embd_head_k", "n_embd_head_v",
@@ -291,6 +296,13 @@ def build_argv(exe, model_path, c, port, probe=True, host="127.0.0.1"):
         # token - and wrong for a speed one, where the first generation would
         # otherwise pay for lazily-loaded kernels
         av.append("--no-warmup")
+    if c.get("n_cpu_ffn"):
+        # The dense-FFN tensor split, one flag per count - the same single
+        # source the planner's "KV on GPU, FFN in RAM" mode is built on.
+        # Emitted BEFORE --n-cpu-moe: llama.cpp resolves the user's own
+        # --override-tensor entries before the ones --n-cpu-moe generates, so
+        # an explicit pin must be allowed to win.
+        av += ["--override-tensor", ot_regex(c["n_cpu_ffn"])]
     if c.get("ncmoe"):
         av += ["--n-cpu-moe", str(c["ncmoe"])]
     if c.get("mmproj"):
@@ -339,6 +351,15 @@ def build_argv(exe, model_path, c, port, probe=True, host="127.0.0.1"):
                 av += ["--spec-draft-n-max", str(c["spec_n_max"])]
             if c.get("spec_n_min"):
                 av += ["--spec-draft-n-min", str(c["spec_n_min"])]
+    if spec and spec != "none" and c.get("spec_kv"):
+        # The draft model's OWN KV cache is quantised separately from the
+        # target's: llama.cpp keeps it at f16 whatever -ctk/-ctv say, and
+        # -ctkd/-ctvd are the flags that move it (both K and V, the same
+        # way the target's two are moved). Halving the draft cache halves
+        # what speculation costs in VRAM - and may cost the acceptance
+        # rate, which is exactly why the sweep measures it instead of
+        # pricing it.
+        av += ["-ctkd", c["spec_kv"], "-ctvd", c["spec_kv"]]
     return av
 
 
@@ -502,6 +523,14 @@ def suspect_reason(row):
     """Why this row should not be fitted, or "" if it looks sound."""
     if row.get("status") != "ok":
         return ""
+    if (row.get("config") or {}).get("n_cpu_ffn"):
+        # The allocation equation has no term for a tensor split: it prices
+        # whole blocks, and a block whose FFN lives in system RAM does not
+        # cost what the model says. Fitting it would smear the difference
+        # over every other coefficient, so the row stays visible as a probe
+        # and never enters the fit.
+        return ("dense FFN tensors pinned to the CPU (-ot), which the fit "
+                "model cannot price")
     fl = row.get("floor_mib")
     if fl is None:
         return "per-process VRAM could not be read"
@@ -640,6 +669,25 @@ def _drafter_block_size(drafter_path):
     return int(v) if isinstance(v, int) and v > 0 else 0
 
 
+def ot_regex(n_cpu_ffn):
+    """The --override-tensor regex that pins the first N blocks' dense FFN
+    tensors to the CPU - the planner's "KV on GPU, FFN in RAM" mode, made
+    measurable.
+
+    Every block number is spelled out rather than written as a class: a regex
+    like `blk\\.0*` would match the 0 in `blk.10`, and pinning block 10's FFN
+    by accident is exactly the kind of silent difference a measured row then
+    certifies. The trailing `\\.` after the number anchors it either way, but
+    spelling the alternation makes the intent literal instead of relying on
+    the reader to know why the anchor matters. `=CPU` is llama.cpp's buffer
+    type override: the tensor stays on the CPU whatever the device list says."""
+    n = max(0, int(n_cpu_ffn or 0))
+    if n == 0:
+        return ""
+    blocks = "|".join(str(i) for i in range(n))
+    return r"blk\.(%s)\.ffn_(gate|up|down)\.weight=CPU" % blocks
+
+
 def classify_drafter(path):
     """An explicitly named drafter file, classified for the sweep grids.
 
@@ -776,7 +824,18 @@ def _key(model, c):
             # identically to one that sets them to their neutral values - which is
             # what keeps every row recorded before this from re-running.
             float(c.get("rep_pen") if c.get("rep_pen") is not None else 1.0),
-            float(c.get("pres_pen") or 0))
+            float(c.get("pres_pen") or 0),
+            # Dense-FFN tensor offload is a placement, and a different
+            # placement is a different measurement. Appended last so rows
+            # recorded before the key existed still key the same way: a config
+            # that omits it is identical to one that pins zero blocks.
+            c.get("n_cpu_ffn") or 0,
+            # The draft cache's quant is part of what a speculative row IS - a
+            # q8_0 draft cache is a different row from an f16 one, whatever the
+            # speed difference turns out to be. Absent normalises to llama.cpp's
+            # own default (f16), so rows recorded before the key existed still
+            # key the same way.
+            c.get("spec_kv") or "f16")
 
 
 def load_rows(path):
@@ -864,7 +923,7 @@ def probe(model, axes, backend=None, timeout=420.0, port=8231, log=print):
     base = dict(BASE)
     base["ngl"] = min(base["ngl"], facts["n_layers"] or base["ngl"])
 
-    keys = [k for k in axes if k in base]
+    keys = [k for k in axes if k in base or k == "n_cpu_ffn"]
     combos = [dict(base)]
     for k in keys:
         combos = [dict(c, **{k: v}) for c in combos for v in axes[k]]

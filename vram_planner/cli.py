@@ -1,9 +1,67 @@
 """Argument parsing and the process entry point."""
-import argparse, datetime, os, sys
+import argparse, datetime, os, sys, threading, time
 from .const import __version__
 from .paths import _user_file
 from .web import serve
 from .selftest import self_test
+
+
+def _tty_skip_harness(log):
+    """The terminal's Skip: press S while a config is in flight.
+
+    Returns (on_server, skip_count, stop) for speed_sweep, or (None, None,
+    None) where there is no console to read - the feature does not exist there
+    rather than stealing keys from something else. `on_server` publishes the
+    live llama-server, `skip_count` answers bench_one's stamping question, and
+    `stop` ends the listener thread after the campaign returns.
+
+    Reading the console is a blocking business, so the listener is a daemon
+    thread polling with msvcrt - Windows-only, and only when stdin is a real
+    console, which is also when a keypress can reach anyone at all."""
+    if os.name != "nt" or not sys.stdin.isatty():
+        return None, None, None
+    try:
+        import msvcrt
+    except ImportError:
+        return None, None, None
+
+    box = {"n": 0, "proc": None}
+    lock = threading.Lock()
+    stop = threading.Event()
+
+    def on_server(p):
+        with lock:
+            box["proc"] = p
+
+    def skip_count():
+        with lock:
+            return box["n"]
+
+    def press():
+        with lock:
+            box["n"] += 1
+            proc = box["proc"]
+        if proc is not None and proc.poll() is None:
+            try:
+                proc.kill()
+            except Exception as e:
+                log("skip    : could not kill the server: %s" % e)
+        log("skip    : requested - abandoning the config in flight. Its row is "
+            "recorded as skipped and will not be re-measured; the campaign "
+            "continues with the next config.")
+
+    def listen():
+        try:
+            while not stop.is_set():
+                if msvcrt.kbhit() and msvcrt.getwch().lower() == "s":
+                    press()
+                time.sleep(0.15)
+        except Exception:
+            pass
+
+    threading.Thread(target=listen, daemon=True,
+                     name="vramplanner-skip").start()
+    return on_server, skip_count, stop
 
 
 def _forget_sweeps(names, assume_yes=False):
@@ -101,10 +159,14 @@ def main():
                          "speculation at all")
     ap.add_argument("--speed-axes", nargs="+", default=None, metavar="AXIS=V,V",
                     help="with --speed-sweep: run an explicit ladder instead of the "
-                         "staged grid, e.g. --speed-axes ngl=26,28,30 spec=none")
-    ap.add_argument("--speed-stages", default="abcd", metavar="LETTERS",
+                         "staged grid, e.g. --speed-axes ngl=26,28,30 spec=none. "
+                         "n_cpu_ffn is the -ot axis: n_cpu_ffn=0,4,8 pins the first "
+                         "blocks' dense FFN to the CPU. spec_kv is the draft "
+                         "cache quant: spec_kv=f16,q8_0")
+    ap.add_argument("--speed-stages", default="abcde", metavar="LETTERS",
                     help="with --speed-sweep: which stages to run (a=ngl wall, "
-                         "b=projector placement, c=ubatch, d=speculation)")
+                         "b=projector placement, c=ubatch, d=speculation, "
+                         "e=dense-FFN tensor offload via -ot, dense models only)")
     ap.add_argument("--speed-fill", type=int, default=None, metavar="TOKENS",
                     help="with --speed-sweep: prompt length to measure at")
     ap.add_argument("--speed-fills", nargs="+", type=int, default=None,
@@ -119,6 +181,12 @@ def main():
                          "model's trained context)")
     ap.add_argument("--speed-kv", default=None, metavar="TYPE",
                     help="with --speed-sweep: freeze KV cache quant, e.g. q8_0")
+    ap.add_argument("--speed-spec-kv", default=None, metavar="TYPE",
+                    help="with --speed-sweep: freeze the DRAFT model's KV cache "
+                         "quant (-ctkd/-ctvd), e.g. q8_0 - f16 by default, the "
+                         "way llama.cpp keeps it. Halves what speculation costs "
+                         "in VRAM, at whatever the acceptance rate turns out to "
+                         "be - which is why stage D measures it")
     ap.add_argument("--speed-chain", action="store_true",
                     help="with --speed-sweep: build each stage against the fastest "
                          "row measured so far instead of against the planner's "
@@ -129,6 +197,12 @@ def main():
                     help="with --speed-chain: re-run the stages from the winner N "
                          "times. Cheap - a config a later round revisits unchanged "
                          "is already recorded and is skipped")
+    ap.add_argument("--speed-ot", type=int, default=None, metavar="N",
+                    help="with --speed-sweep: pin the first N blocks' dense FFN "
+                         "tensors to the CPU (-ot) for the whole campaign - the "
+                         "mode the planner prices as 'KV on GPU, FFN in RAM'. "
+                         "Stage E sweeps this axis; pinning it drops stage E, "
+                         "like the projector pin drops stage B. Dense models only")
     ap.add_argument("--speed-verify", action="store_true",
                     help="with --speed-sweep: after the campaign, load the winner "
                          "once more at the PRODUCTION config and only certify it if "
@@ -277,19 +351,34 @@ def main():
             sys.exit(2)
         overrides = (parse_overrides(args.speed_verify_overrides)
                      if args.speed_verify_overrides else None)
-        r = speed_sweep(models=args.models, backend=args.backend,
-                        dry_run=args.dry_run, timeout=args.sweep_timeout,
-                        limit=args.limit, axes=axes, stages=args.speed_stages,
-                        fill=args.speed_fill, fills=args.speed_fills,
-                        ctx=args.speed_ctx, kv=args.speed_kv,
-                        n_predict=args.n_predict, repeat=args.repeat,
-                        chain=args.speed_chain, rounds=args.speed_rounds,
-                        verify=args.speed_verify, verify_overrides=overrides,
-                        chat_template_file=args.chat_template_file,
-                        chat_template_kwargs=args.chat_template_kwargs,
-                        reasoning=args.reasoning,
-                        reasoning_preserve=args.reasoning_preserve,
-                        drafter=args.drafter)
+        # S skips the config in flight without ending the campaign: the run is
+        # killed, its row recorded as skipped, and the next config starts. The
+        # listener needs a real console, so it simply does not exist in pipes;
+        # a dry run has no runs, so it is not armed there either.
+        on_server, skip_count, skip_stop = None, None, None
+        if not args.dry_run:
+            on_server, skip_count, skip_stop = _tty_skip_harness(print)
+        if on_server:
+            print("  keys    : press S to skip the config in flight - it is recorded "
+                  "as skipped and will not be re-measured; the campaign continues")
+        try:
+            r = speed_sweep(models=args.models, backend=args.backend,
+                            dry_run=args.dry_run, timeout=args.sweep_timeout,
+                            limit=args.limit, axes=axes, stages=args.speed_stages,
+                            fill=args.speed_fill, fills=args.speed_fills,
+                            ctx=args.speed_ctx, kv=args.speed_kv, spec_kv=args.speed_spec_kv,
+                            n_predict=args.n_predict, repeat=args.repeat,
+                            chain=args.speed_chain, rounds=args.speed_rounds,
+                            verify=args.speed_verify, verify_overrides=overrides,
+                            chat_template_file=args.chat_template_file,
+                            chat_template_kwargs=args.chat_template_kwargs,
+                            reasoning=args.reasoning,
+                            reasoning_preserve=args.reasoning_preserve,
+                            drafter=args.drafter, ot=args.speed_ot,
+                            on_server=on_server, skip_count=skip_count)
+        finally:
+            if skip_stop:
+                skip_stop.set()
         sys.exit(0 if r else 1)
     if args.fit:
         from .fit import report

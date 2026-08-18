@@ -186,8 +186,10 @@ def extract_config(model):
     mtp_layers = list(range((n_layers or 0) - n_mtp, n_layers or 0)) if n_mtp else []
     # Kept from before the heads are zeroed: with MTP speculative decoding enabled
     # (llama.cpp --spec-type draft-mtp, LM Studio's "Speculative Decoding: MTP")
-    # these blocks DO run and DO grow a cache. Measured f16 regardless of
-    # --cache-type-k/v, so the draft cache ignores the KV quant setting.
+    # these blocks DO run and DO grow a cache. The number is the measured f16
+    # bytes per token - llama.cpp keeps the draft cache at f16 regardless of
+    # --cache-type-k/v - and it stays the geometry: plan.py scales it by the
+    # draft cache's OWN quant (spec_kv, the -ctkd/-ctvd flags) at pricing time.
     mtp_kv_per_token = 0.0
     for i in mtp_layers:
         if i < len(kv_heads_per_layer):

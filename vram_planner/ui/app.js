@@ -1543,6 +1543,7 @@ function sweepForm(pf){
       ${raw(sweepStage("b", "B &middot; projector", "Vision tower in VRAM or in system RAM"))}
       ${raw(sweepStage("c", "C &middot; ubatch", "Physical batch size"))}
       ${raw(sweepStage("d", "D &middot; speculation", "MTP and DFlash draft depths, plus the n-gram types"))}
+      ${raw(sweepStage("e", "E &middot; FFN offload", "First blocks&rsquo; dense FFN tensors to the CPU (-ot), measured at the split the campaign won &mdash; and the freed tensors buy layers back. Dense models only."))}
     </div>
     <div class="row" style="margin-top:10px">
       <div class="field"><label for="swfill">Context filled (tokens)</label>
@@ -1572,6 +1573,30 @@ function sweepForm(pf){
           model, which bought back whole expert layers. Sweeping it is stage B. Before this
           control the only way to pin it was to write
           <span class="mono">mmproj_offload=false</span> into the axes box.</details></p>
+    </div>
+    <div class="field" style="max-width:24em">
+      <label for="swot">Dense FFN blocks on CPU (-ot)</label>
+      <input type="number" id="swot" min="0" step="1" placeholder="blank = sweep it (stage E)">
+      <p class="hint">Pin the count when you already know it &mdash; e.g. the plan&rsquo;s
+        &ldquo;KV on GPU, FFN in RAM&rdquo;. Stage E then drops, exactly like the projector
+        pin drops stage B. Dense models only; an MoE&rsquo;s experts are stage A&rsquo;s
+        <span class="mono">--n-cpu-moe</span> ladder.</p>
+    </div>
+    <div class="field" style="max-width:24em">
+      <label for="swspec_kv">Draft model KV cache</label>
+      <select id="swspec_kv">
+        <option value="f16">f16 (llama.cpp default)</option>
+        <option value="q8_0">q8_0</option>
+        <option value="bf16">bf16</option>
+        <option value="q4_0">q4_0</option>
+        <option value="q5_0">q5_0</option>
+        <option value="q5_1">q5_1</option>
+        <option value="q4_1">q4_1</option>
+      </select>
+      <p class="hint">Stage D measures speculation with the draft cache at this quant
+        (<span class="mono">-ctkd/-ctvd</span>). f16 is what llama.cpp defaults to;
+        q8_0 halves what speculation costs in VRAM &mdash; at whatever the acceptance
+        rate turns out to be, which is exactly why it is measured and not priced.</p>
     </div>
     <div class="field" style="max-width:24em">
       <label for="swdrafter">Draft model</label>
@@ -1734,6 +1759,7 @@ function sweepBody(){
   const swdp = $("swdraftpath") ? $("swdraftpath").value.trim() : "";
   return { path: SWEEP.path, stages: sweepStages(), context: parseInt($("ctx").value),
            kv_type: $("kv").value,
+           spec_kv_type: ($("swspec_kv") ? $("swspec_kv").value : null) || "f16",
            fill: $("swfills") && $("swfills").value.trim()
              ? null : v("swfill"),
            fills: $("swfills") && $("swfills").value.trim()
@@ -1748,6 +1774,9 @@ function sweepBody(){
            // which is a different thing from absent and has to survive as one.
            mmproj_offload: (($("swmmproj") && $("swmmproj").value) || "") === ""
              ? null : $("swmmproj").value === "ram" ? false : true,
+           // Blank means "sweep it" - stage E's job - and has to survive as a
+           // distinct third state, exactly like the projector pin above.
+           ot: v("swot"),
            // A typed path wins; otherwise the select, where "" is auto (the
            // server's discovery, the long-standing default) and __none__ is no
            // drafter at all.
@@ -1842,6 +1871,11 @@ async function sweepStop(){
   pollSweep();
 }
 
+async function sweepSkip(){
+  try{ await fetch("/api/speed/skip", { method: "POST" }); }catch(e){}
+  pollSweep();
+}
+
 async function pollSweep(){
   let st;
   try{ st = await (await fetch("/api/speed/status?since=" + SWEEP.since)).json(); }
@@ -1895,6 +1929,12 @@ function sweepRunning(st){
       from the unchained grid and can move.</p>` : "")}
     <div class="prog"><i style="width:${pct}%"></i></div>
     <div class="actions">
+      <button class="ghost" type="button" data-action="sweep-skip" ${
+        st.aborting ? "disabled" : ""}>&#8635; Skip run</button>
+      <span class="muted small">abandons the config in flight: the server is killed, its
+        row is recorded as skipped, and the campaign moves on. The row is never
+        re-measured, so use this for a run that is clearly not going to work &mdash;
+        not for one you merely want to re-try.</span>
       <button class="ghost" type="button" data-action="sweep-stop" ${
         st.aborting ? "disabled" : ""}>&#9632; ${st.cancelling && !st.aborting
           ? "Stop now &mdash; abandon this config" : "Stop"}</button>
@@ -2554,6 +2594,7 @@ const ACTIONS = {
   "sweep-recheck": () => loadPreflight().then(() => drawSweep({ results: false })),
   "sweep-plan":  () => sweepPlan(),
   "sweep-start": () => sweepStart(),
+  "sweep-skip":  () => sweepSkip(),
   "sweep-stop":  () => sweepStop(),
   // Picking a row IS the step-3 question - "build me this one" - so it goes
   // there rather than leaving you to find the tab yourself.

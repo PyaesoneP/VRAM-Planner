@@ -3,7 +3,9 @@ import os
 from .const import _mib
 from .gguf import load_gguf, parse_meta_only
 from .model import classify_tensors, extract_config
-from .kv import kv_bytes_per_token, kv_bytes_per_token_growing, kv_bytes_total, kv_bytes_total_at, max_ctx_for_kv_budget, recurrent_bytes, resolve_kv_lengths, swa_cache_len
+from .kv import (KV_TYPE_BYTES, kv_bytes_per_token, kv_bytes_per_token_growing,
+                 kv_bytes_total, kv_bytes_total_at, max_ctx_for_kv_budget,
+                 recurrent_bytes, resolve_kv_lengths, swa_cache_len)
 from .compute import MTP_SPEC_CONST_MIB, MTP_SPEC_PER_SEQ_MIB, compute_buffer_split, compute_buffer_terms, graph_is_split, output_head_on_gpu, vision_config, vision_grid, vision_peak_mib
 from .gpu import gpu_list, platform_support
 from .speed import estimate_speed
@@ -219,7 +221,7 @@ def analyze(path, ctx, kv_type, n_ubatch, flash_attn,
             include_mmproj=True, n_cpu_moe_override=None,
             bw_vram_gbs=None, bw_ram_gbs=None, ram_eff=None, ctx_fill=None,
             bw_note="", mtp_spec=False, dflash=False, drafter=None,
-            image_px=None, vision_flash_attn=True):
+            image_px=None, vision_flash_attn=True, spec_kv="f16"):
     # The file is authoritative when it is here; the stored card stands in when it
     # is not. Reading a real file also refreshes the card, so the library builds
     # up as a side effect of ordinary use rather than needing to be curated.
@@ -320,11 +322,18 @@ def analyze(path, ctx, kv_type, n_ubatch, flash_attn,
                                     ngl, compute_override_mib)
 
     # MTP speculative decoding: the draft blocks run after all, so they get the KV
-    # cache back - at f16, whatever the configured KV quant - plus a fixed pool and
-    # one slot per sequence. Comes off the top of the budget like the projector.
+    # cache back - at the draft cache's OWN quant (spec_kv, f16 unless -ctkd/-ctvd
+    # say otherwise), whatever the target's KV quant - plus a fixed pool and one
+    # slot per sequence. Comes off the top of the budget like the projector.
+    #
+    # The KV terms below are all the measured-f16 geometry (mtp_kv_per_token is
+    # the f16 bytes per token, and the DFlash cache is sized by kv_bytes_per_token
+    # at f16), so the ones that scale do so by the quant's bytes per element; the
+    # pool and per-sequence slot are graph buffers and do not.
+    spec_kv_bpe = KV_TYPE_BYTES.get(spec_kv, 2.0) / 2.0
     spec_mib = 0.0
     if mtp_spec and cfg.get("mtp_kv_per_token"):
-        spec_mib = (_mib(cfg["mtp_kv_per_token"] * ctx)
+        spec_mib = (_mib(cfg["mtp_kv_per_token"] * ctx * spec_kv_bpe)
                     + MTP_SPEC_CONST_MIB + MTP_SPEC_PER_SEQ_MIB * max(1, n_seq))
 
     # DFlash speculative decoding: the drafter is a SECOND model file sharing the
@@ -367,7 +376,7 @@ def analyze(path, ctx, kv_type, n_ubatch, flash_attn,
             if cfg.get("mtp_kv_per_token"):
                 mtp_fallback = True
                 if not mtp_spec:
-                    spec_mib = (_mib(cfg["mtp_kv_per_token"] * ctx)
+                    spec_mib = (_mib(cfg["mtp_kv_per_token"] * ctx * spec_kv_bpe)
                                 + MTP_SPEC_CONST_MIB
                                 + MTP_SPEC_PER_SEQ_MIB * max(1, n_seq))
                 warnings.append(
@@ -390,12 +399,13 @@ def analyze(path, ctx, kv_type, n_ubatch, flash_attn,
         dc = dflash_info.get("cfg") or {}
         block = dflash_info["block_size"]
         weights_d = _mib(dflash_info["tensor_bytes"])
-        # The draft KV cache is the drafter's own KV - f16, like the MTP draft
-        # cache, whatever the target's KV quant - held at the trained block depth
-        # times a fixed slack for the cells llama.cpp keeps around each block
-        # (its draft cache in the reference log carried ~7 blocks per cell row).
+        # The draft KV cache is the drafter's own KV, priced at the draft cache's
+        # quant (spec_kv) the way the MTP draft cache is, whatever the target's KV
+        # quant - held at the trained block depth times a fixed slack for the
+        # cells llama.cpp keeps around each block (its draft cache in the
+        # reference log carried ~7 blocks per cell row).
         try:
-            draft_kv_mib = _mib(kv_bytes_per_token(dc, "f16")
+            draft_kv_mib = _mib(kv_bytes_per_token(dc, spec_kv)
                                 * block * DRAFT_KV_BLOCK_SLACK)
         except Exception:
             draft_kv_mib = 0.0
@@ -420,7 +430,8 @@ def analyze(path, ctx, kv_type, n_ubatch, flash_attn,
                             "model's own MTP blocks stay idle, so this plan "
                             "prices the drafter's MTP cache only.")
         drafter_mib = _mib(drafter_mtp["tensor_bytes"])
-        drafter_cache_mib = (_mib(drafter_mtp["cfg"]["mtp_kv_per_token"] * ctx)
+        drafter_cache_mib = (_mib(drafter_mtp["cfg"]["mtp_kv_per_token"] * ctx
+                                  * spec_kv_bpe)
                              + MTP_SPEC_CONST_MIB
                              + MTP_SPEC_PER_SEQ_MIB * max(1, n_seq))
         spec_mib = drafter_mib + drafter_cache_mib
@@ -531,6 +542,7 @@ def analyze(path, ctx, kv_type, n_ubatch, flash_attn,
         "inputs": {
             "context": ctx, "kv_type": kv_type, "n_ubatch": n_ubatch, "n_seq": n_seq,
             "mtp_spec": bool(mtp_spec), "dflash": bool(dflash),
+            "spec_kv": spec_kv,
             "mtp_depth": (int(cfg.get("n_mtp_layers") or 0)
                           if (mtp_spec or mtp_fallback) else None),
             "drafter": (os.path.abspath(drafter) if drafter

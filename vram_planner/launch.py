@@ -39,7 +39,7 @@ web.py can import it freely.
 """
 import datetime, json, os, re
 
-from .sweep import backends_dir, build_argv, find_backends, find_drafter_for
+from .sweep import backends_dir, build_argv, find_backends, find_drafter_for, ot_regex
 
 SHELLS = ("powershell", "bash")
 
@@ -75,6 +75,7 @@ SAMPLER_FLAGS = (
 _PARAM_BY_FLAG = {
     "-m": "Model", "--mmproj": "Mmproj", "-md": "Draft", "-ngl": "Ngl", "-c": "Ctx",
     "-ub": "Ubatch", "--n-cpu-moe": "NCpuMoe", "--spec-draft-n-max": "DraftMax",
+    "--override-tensor": "OverrideTensor",
     "--host": "BindHost", "--port": "Port",
 }
 # Model, mmproj and the DFlash drafter are resolved paths, not tunables: they
@@ -249,8 +250,9 @@ def script_name(model_path, shell):
 def _lines_from_argv(argv, var):
     """Group argv (past the exe) into one readable line per setting.
 
-    `var(name)` renders a script variable reference. -ctk/-ctv are held on one
-    line because they are one decision, not two."""
+    `var(name)` renders a script variable reference. -ctk/-ctv and
+    -ctkd/-ctvd are each held on one line because they are one decision,
+    not two."""
     lines, i = [], 0
     while i < len(argv):
         tok = argv[i]
@@ -262,6 +264,8 @@ def _lines_from_argv(argv, var):
         param = _PARAM_BY_FLAG.get(tok)
         rendered = var(param) if param else val
         if tok == "-ctv" and lines and lines[-1][0] == "-ctk":
+            lines[-1] += [tok, rendered]
+        elif tok == "-ctvd" and lines and lines[-1][0] == "-ctkd":
             lines[-1] += [tok, rendered]
         else:
             lines.append([tok, rendered])
@@ -286,8 +290,8 @@ def _params_used(argv):
 # Samplers matter for a SPECULATIVE row (greedy is speculation's best case) and
 # nothing for a bandwidth-bound decode, but the header cannot know which case
 # it is in, so any difference is named.
-_EVIDENCE_KEYS = ("ctx", "kv", "fa", "seq", "ub", "ngl", "ncmoe", "fill",
-                  "spec", "spec_n_max", "mmproj_offload")
+_EVIDENCE_KEYS = ("ctx", "kv", "fa", "seq", "ub", "ngl", "ncmoe", "n_cpu_ffn",
+                  "fill", "spec", "spec_n_max", "spec_kv", "mmproj_offload")
 
 _SAMPLER_KEYS = ("temp", "top_k", "top_p", "min_p", "rep_pen", "pres_pen")
 
@@ -327,6 +331,13 @@ def _config_divergence(c, measured, sampling=None):
             a, b = bool(a), bool(b)
         if k == "mmproj_offload":
             a, b = a is not False, b is not False
+        if k == "spec_kv":
+            # f16 is llama.cpp's default on both sides: a row recorded before
+            # the knob existed WAS measured at f16, and a script that does not
+            # name a quant launches f16. Absent must not hide a real mismatch
+            # the other way around either - q8_0 launched over an old row is
+            # exactly the divergence this check exists to report.
+            a, b = a or "f16", b or "f16"
         if a is not None and b is not None and a != b:
             diffs.append("%s %s->%s" % (k, b, a))
     for k in _SAMPLER_KEYS:
@@ -371,6 +382,26 @@ def _provenance(model_path, c, measured, backend, tmpl=(None, None),
     if not measured:
         out.append("Settings : PREDICTED by the planner, not measured. Run the speed")
         out.append("           sweep to replace these with numbers off your own card.")
+        return out
+    if measured.get("status") == "skipped":
+        # A skipped row is on disk so the campaign does not re-run it - that is
+        # its entire job. It is not a measurement, and a script that said
+        # "MEASURED" over it would be exactly the lie the header exists to
+        # prevent. It stays launchable: the config may be fine, merely judged.
+        out.append("Settings : NOT MEASURED - this config was SKIPPED during the sweep.")
+        out.append("           The row exists so the campaign does not re-measure it,")
+        out.append("           not as a measurement. Re-run the sweep (or drop the")
+        out.append("           skip) for numbers off your own card.")
+        return out
+    if measured.get("status") == "spilled":
+        # Same logic, different judge: the machine, not the user. The row is on
+        # disk so it is never re-measured - the run was aborted mid-measurement
+        # because the process was spilling into shared memory or the card was
+        # busy, so the few numbers it does carry are numbers nobody wants.
+        out.append("Settings : NOT MEASURED - this config SPILLED during the sweep, so")
+        out.append("           its run was aborted instead of wasting the minutes it")
+        out.append("           would have crawled through. The row exists so the")
+        out.append("           campaign does not re-measure it, not as a measurement.")
         return out
     bits = []
     if measured.get("tok_s"):
@@ -437,6 +468,11 @@ def _powershell(model_path, c, argv, backend, mmproj, draft, sampling, port,
         "NCpuMoe": ("[int]", str(c.get("ncmoe") or 0)),
         "DraftMax": ("[int]", str(c.get("spec_n_max") or 0)),
         "Port": ("[int]", str(port)),
+        # The regex that pins the first N blocks' dense FFN tensors to the CPU.
+        # A string, not an int, because changing WHICH tensors move is a
+        # legitimate edit - and an invalid regex is refused by llama-server,
+        # which is the correct outcome rather than a silently ignored pin.
+        "OverrideTensor": ("[string]", ps_quote(ot_regex(c.get("n_cpu_ffn") or 0))),
     }
     # Pad on the whole "[type]$Name" token, not on the name: the type prefixes
     # differ in length, so aligning the names alone leaves the = signs ragged.
@@ -686,6 +722,7 @@ def _bash(model_path, c, argv, backend, mmproj, draft, sampling, port, bind_host
     defaults = {
         "NGL": c.get("ngl", 0), "CTX": c.get("ctx", 4096), "UBATCH": c.get("ub", 512),
         "NCPUMOE": c.get("ncmoe") or 0, "DRAFTMAX": c.get("spec_n_max") or 0,
+        "OVERRIDETENSOR": ot_regex(c.get("n_cpu_ffn") or 0),
         "PORT": port,
     }
     for p in params:

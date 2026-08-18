@@ -168,12 +168,14 @@ is the one worth running after a change.
 | flag | |
 |---|---|
 | `--speed-sweep` | drive `llama-server` across a grid, recording how fast it generates |
-| `--speed-stages LETTERS` | which stages run, default `abcd` — A layer wall, B projector, C ubatch, D speculation |
+| `--speed-stages LETTERS` | which stages run, default `abcde` — A layer wall, B projector, C ubatch, D speculation, E dense-FFN `-ot` offload |
 | `--speed-axes AXIS=V,V` | sweep exact values as a cross product instead of the stages |
 | `--speed-ctx N` / `--speed-kv TYPE` | freeze context and KV quant for the campaign |
 | `--speed-fill TOKENS` | prompt depth to measure at — decode slows as context fills, so this conditions every row |
 | `--speed-chain` | build each stage from the previous stage's winner rather than one fixed baseline |
 | `--speed-rounds N` | with `--speed-chain`: re-run the stages from the winner |
+| `--speed-ot N` | pin the first N blocks' dense FFN tensors to the CPU (`-ot`); drops stage E — dense models only |
+| `--speed-spec-kv TYPE` | freeze the draft cache's quant for the campaign (`-ctkd/-ctvd`); f16 by default — q8_0 halves what speculation costs, at whatever the acceptance rate turns out to be |
 | `--speed-verify` | after the campaign, load the winner at the production config |
 | `--speed-verify-overrides AXIS=V,V` | what "production" means, e.g. `spec=draft-mtp spec_n_max=2` |
 | `--n-predict N` / `--repeat N` | tokens per pass (128) and passes per config (3, median) |
@@ -633,8 +635,13 @@ tok/s a long way and are invisible to it, so there is a second harness for them:
 
 - **Speculative decoding.** `speed.py` has no acceptance-rate term, and
   `per_token_bytes()` skips MTP blocks because they do not run during ordinary decode.
-  The planner can price what speculation *costs* — an f16 draft cache, whatever
-  `--cache-type-k` says — and nothing of what it saves.
+  The planner can price what speculation *costs* — a draft cache, quant and all
+  (llama.cpp keeps it f16 whatever `--cache-type-k` says; `--speed-spec-kv q8_0` pins the
+  draft cache's own `-ctkd/-ctvd` pair) — and nothing of what it saves.
+- **The dense-FFN `-ot` split.** The planner prices "KV on GPU, FFN in RAM" (stage E of
+  the sweep) — pinning whole blocks' FFN tensors to the CPU with `--override-tensor`
+  frees VRAM without losing KV, which layer offload always drags off with it. Its real
+  per-token cost is exactly the sort of thing the roofline should not be believed for.
 - **Prompt processing**, which is not modelled anywhere here on purpose.
 
 Run it **from the web UI** — step 2, *Measure real speed* — or from the command line:
@@ -646,6 +653,7 @@ python -m vram_planner --speed-sweep --speed-chain # each stage built from what 
 python -m vram_planner --speed-report              # every row, fastest first
 python -m vram_planner --speed-report --insights   # what the campaigns FOUND
 python -m vram_planner --speed-sweep --speed-axes "ngl=28,30 spec=draft-mtp spec_n_max=1,2,3"
+python -m vram_planner --speed-sweep --speed-ot 8   # pin FFN of the first 8 blocks to CPU
 ```
 
 In the browser it is the same harness: it takes context and KV quant from the form and
@@ -654,6 +662,18 @@ and stops between configs rather than mid-measurement — nothing is lost either
 because every row is already on disk and keyed, so starting again resumes. It refuses to
 start while anything else holds the GPU, and names what: a resident model does not make
 the sweep *fail*, it makes every row wrong in the same direction, which is worse.
+
+A config that is clearly not going to work (a server that wedges, for instance) can be
+abandoned without ending the campaign: press **S** in the terminal or **Skip run** in the
+browser. The run is killed on the spot — otherwise a hung server sits out the whole
+generation timeout — its row is recorded as `skipped` so a resumed sweep never re-measures
+it, and the next config starts.
+
+The machine makes the same judgement itself: a pass at a fraction of what the model
+normally delivers means WDDM spilled the process into shared memory or the card is busy,
+so the measurement is **aborted** and the row recorded as `spilled` — keyed and never
+re-measured, like `skipped`, instead of crawling to the end and landing as a
+plausible-looking number that has to be explained away later.
 
 ### Chaining the stages
 

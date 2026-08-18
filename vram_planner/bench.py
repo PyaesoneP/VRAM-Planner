@@ -420,9 +420,29 @@ _TEMPLATE_KEYS = ("chat_template_file", "chat_template_kwargs",
 _SWEEP_SAMPLER_KEYS = ("temp", "top_k", "top_p", "min_p", "rep_pen", "pres_pen")
 
 
+def _skip_stamp(row, skip_count, base):
+    """Was this run abandoned because the user asked to skip it?
+
+    `skip_count` is a callable returning how many skips the controlling layer
+    (terminal keypress, web button) has requested so far; `base` is what it
+    returned when the run started. A press lands on EXACTLY the run it was
+    made during: the count only grows, so a press that misses a completed row
+    is consumed by the comparison and never bleeds into the next config.
+
+    `ok` and `oom` rows are complete measurements and stay what they are - an
+    OOM row in particular is the wall the ladder is read from, and overwriting
+    it with a skip would be throwing the one result the run produced. Every
+    other status means the run was interrupted mid-way, which is what a skip
+    does, so the interruption is named honestly: the row is recorded, keyed,
+    and never re-measured - by this campaign, or by a resumed one."""
+    if skip_count is None or skip_count() <= base:
+        return False
+    return row.get("status") not in ("ok", "oom")
+
+
 def bench_one(backend, model_path, c, port=BENCH_PORT, timeout=420.0,
               n_predict=N_PREDICT, repeat=N_REPEAT, gen_timeout=1800, log=print,
-              on_server=None):
+              on_server=None, skip_count=None, abort_floor=None):
     """Load one config, measure it, tear it down.
 
     Two kinds of pass, because prefill and decode want opposite things from the
@@ -445,6 +465,7 @@ def bench_one(backend, model_path, c, port=BENCH_PORT, timeout=420.0,
     # dict: an absolute path is not a setting anyone is sweeping over, and every
     # comparison in this file groups on config equality.
     stored = {k: v for k, v in c.items() if k not in _TEMPLATE_KEYS}
+    base_skips = skip_count() if skip_count else 0
     row = {"status": "error", "config": stored,
            "model": os.path.basename(model_path), "backend": backend["build"],
            "speed": True, "n_predict": n_predict, "repeat": repeat}
@@ -520,42 +541,74 @@ def bench_one(backend, model_path, c, port=BENCH_PORT, timeout=420.0,
                 cold = generate(srv.url, prompt, min(16, n_predict), gen_timeout,
                                 cache_prompt=False, sampling=samp, seed=1000)
                 row["cold"] = cold
-                runs = [generate(srv.url, prompt, n_predict, gen_timeout,
-                                 cache_prompt=True, sampling=samp, seed=1000 + i)
-                        for i in range(max(1, repeat))]
+                # The abort floor: a pass at a fraction of what this model
+                # normally delivers is not a slower config, it is a card that
+                # stopped being usable - WDDM spilled the process into shared
+                # memory, or the machine is busy. Measuring it to the end is the
+                # waste the floor exists to stop: the passes crawl, and the
+                # number, when it lands, is garbage that has to be explained
+                # away later. The row is then recorded with status `spilled` -
+                # honest, keyed, and never re-measured - instead of `ok` with a
+                # plausible-looking slow number. See _abort_floor().
+                aborted = None
+                if abort_floor:
+                    t = cold["timings"].get("predicted_per_second")
+                    if t and t < abort_floor:
+                        aborted = t
+                runs = []
+                if aborted is None:
+                    for i in range(max(1, repeat)):
+                        r = generate(srv.url, prompt, n_predict, gen_timeout,
+                                     cache_prompt=True, sampling=samp,
+                                     seed=1000 + i)
+                        runs.append(r)
+                        if abort_floor:
+                            t = r["timings"].get("predicted_per_second")
+                            if t and t < abort_floor:
+                                aborted = t
+                                break
                 row["runs"] = runs
-                dec = [r["timings"].get("predicted_per_second") for r in runs]
-                dec = [x for x in dec if x]
-                pre = cold["timings"].get("prompt_per_second")
-                row["tok_s"] = round(statistics.median(dec), 3) if dec else None
-                row["tok_s_all"] = [round(x, 3) for x in dec]
-                row["prefill_tok_s"] = round(pre, 1) if pre else None
-                row["sample"] = runs[0].get("sample")
-                dr = [r.get("distinct_ratio") for r in runs
-                      if r.get("distinct_ratio") is not None]
-                row["distinct_ratio"] = round(min(dr), 3) if dr else None
-                cb = [r.get("copyback_ratio") for r in runs
-                      if r.get("copyback_ratio") is not None]
-                row["copyback_ratio"] = round(min(cb), 3) if cb else None
-                # Acceptance is the number that explains a speculative result.
-                # Absent on non-speculative runs, and absent on builds that do
-                # not report it - both are fine, and both are visible as None
-                # rather than as a fabricated zero.
-                dn = [r["timings"].get("draft_n") for r in runs]
-                da = [r["timings"].get("draft_n_accepted") for r in runs]
-                # `any(da)` would treat a genuine 0% acceptance as "not reported"
-                # and drop the whole group, so the row - and the launcher header
-                # built from it - would say nothing where it should say that
-                # speculation drafted N tokens and got none of them back. That is
-                # the most useful thing a speculative row can tell you. Test for
-                # PRESENCE instead, which still excludes builds that do not report
-                # the field at all.
-                if any(dn) and any(x is not None for x in da):
-                    tot_n = sum(x for x in dn if x)
-                    tot_a = sum(x for x in da if x)
-                    row["draft_n"] = tot_n
-                    row["draft_accepted"] = tot_a
-                    row["accept_rate"] = round(tot_a / tot_n, 4) if tot_n else None
+                if aborted is not None:
+                    row["status"] = "spilled"
+                    row["abort_floor"] = abort_floor
+                    row["gen_error"] = ("aborted mid-measurement: decode at %.2f "
+                                        "tok/s, below the %.2f tok/s this model "
+                                        "normally does - WDDM spilled it into "
+                                        "shared memory, or the card is busy"
+                                        % (aborted, abort_floor))
+                else:
+                    dec = [r["timings"].get("predicted_per_second") for r in runs]
+                    dec = [x for x in dec if x]
+                    pre = cold["timings"].get("prompt_per_second")
+                    row["tok_s"] = round(statistics.median(dec), 3) if dec else None
+                    row["tok_s_all"] = [round(x, 3) for x in dec]
+                    row["prefill_tok_s"] = round(pre, 1) if pre else None
+                    row["sample"] = runs[0].get("sample")
+                    dr = [r.get("distinct_ratio") for r in runs
+                          if r.get("distinct_ratio") is not None]
+                    row["distinct_ratio"] = round(min(dr), 3) if dr else None
+                    cb = [r.get("copyback_ratio") for r in runs
+                          if r.get("copyback_ratio") is not None]
+                    row["copyback_ratio"] = round(min(cb), 3) if cb else None
+                    # Acceptance is the number that explains a speculative result.
+                    # Absent on non-speculative runs, and absent on builds that do
+                    # not report it - both are fine, and both are visible as None
+                    # rather than as a fabricated zero.
+                    dn = [r["timings"].get("draft_n") for r in runs]
+                    da = [r["timings"].get("draft_n_accepted") for r in runs]
+                    # `any(da)` would treat a genuine 0% acceptance as "not reported"
+                    # and drop the whole group, so the row - and the launcher header
+                    # built from it - would say nothing where it should say that
+                    # speculation drafted N tokens and got none of them back. That is
+                    # the most useful thing a speculative row can tell you. Test for
+                    # PRESENCE instead, which still excludes builds that do not report
+                    # the field at all.
+                    if any(dn) and any(x is not None for x in da):
+                        tot_n = sum(x for x in dn if x)
+                        tot_a = sum(x for x in da if x)
+                        row["draft_n"] = tot_n
+                        row["draft_accepted"] = tot_a
+                        row["accept_rate"] = round(tot_a / tot_n, 4) if tot_n else None
             except Exception as e:
                 row["status"] = "genfail"
                 row["gen_error"] = "%s: %s" % (type(e).__name__, e)
@@ -572,11 +625,20 @@ def bench_one(backend, model_path, c, port=BENCH_PORT, timeout=420.0,
     finish_row(row, srv, log_dir=log_dir)
     # finish_row takes its verdict from the server, which came up fine; a
     # generation that then failed is still a failed measurement.
-    if row.get("gen_error"):
+    if row.get("gen_error") and row["status"] == "ok":
         row["status"] = "genfail"
     elif row["status"] == "ok" and not row.get("tok_s"):
         row["status"] = "genfail"
         row["gen_error"] = "server reported no predicted_per_second"
+    # The controlling layer (terminal S key, web Skip button) kills the server
+    # to end the run promptly - a hung config would otherwise sit out its whole
+    # generation timeout - and the row is stamped with the reason instead of a
+    # lie. A stamped row is RECORDED, so it keys and a resumed campaign skips
+    # it, which is the entire point: a skip is a judgement, and re-measuring a
+    # config the user already judged wastes the same load it just wasted.
+    if _skip_stamp(row, skip_count, base_skips):
+        row["status"] = "skipped"
+        row["gen_error"] = "skipped by user"
     # The Windows failure mode is not an OOM. WDDM spills past dedicated VRAM
     # into system RAM and the load SUCCEEDS, so the row says "ok" and only the
     # numbers give it away: a negative floor, and decode falling off a cliff.
@@ -594,6 +656,47 @@ def bench_one(backend, model_path, c, port=BENCH_PORT, timeout=420.0,
 # Excess shared memory over a ladder's own baseline, above which the driver has
 # moved something. NOT an absolute reading - see demoted().
 SHARED_SPILL_MIB = 64.0
+
+# The fraction of a campaign's own median tok/s below which a pass is not a
+# slower config but a card that stopped being usable. The wall being found
+# moves a ladder by tens of percent; a WDDM demotion or a busy machine moves
+# it by 6x or more, and no real knob in this grid does that. Shared by the
+# mid-run abort (_abort_floor) and the recorded-rows verdict (_infer_demotion),
+# so a row judged too slow to finish measuring is judged the same way after
+# the fact.
+SLOW_FRAC = 0.15
+
+
+def _abort_floor(rows, cfg, model):
+    """The slowest decode this config may plausibly run at, or None.
+
+    A row at a tiny fraction of what the same model normally delivers on this
+    card is not a slower config, it is a measurement of a card that stopped
+    being usable - WDDM spilled the process into shared memory, or the machine
+    is busy with something else. Measuring it is the waste the campaign exists
+    to avoid: the passes run at a crawl, and the number, when it lands, is
+    garbage that has to be explained away later.
+
+    The reference is the median of the healthy rows already measured for this
+    model - this campaign's own rows first, recorded ones included - and the
+    floor is a small fraction of that median, so a config that is merely
+    slower (the wall being found, a heavier draft) never trips it. No rows, no
+    floor: a config with nothing to be judged against is measured to the end."""
+    cand = []
+    for r in rows:
+        if r.get("status") != "ok" or not r.get("tok_s"):
+            continue
+        if r.get("model") != model:
+            continue
+        if r.get("spilled") or not trustworthy(r):
+            continue
+        cand.append(r["tok_s"])
+    if len(cand) < 2:
+        return None
+    cand.sort()
+    mid = (cand[len(cand) // 2] if len(cand) % 2
+           else (cand[len(cand) // 2 - 1] + cand[len(cand) // 2]) / 2.0)
+    return round(mid * SLOW_FRAC, 3)
 
 
 def demoted(row):
@@ -639,8 +742,12 @@ def demoted(row):
 # user pinned, flash attention is mandatory with a quantised cache, and -np 1
 # because every extra sequence buys recurrent state nobody asked for.
 SPEED_BASE = {"ctx": 131072, "kv": "q8_0", "fa": True, "seq": 1, "ub": 512,
-              "ngl": 26, "ncmoe": 0, "fill": 2048, "spec": "none",
-              "mmproj_offload": True}
+              "ngl": 26, "ncmoe": 0, "n_cpu_ffn": 0, "fill": 2048,
+              "spec": "none", "mmproj_offload": True,
+              # The draft cache's quant, frozen like kv is: llama.cpp keeps it
+              # at f16 unless -ctkd/-ctvd say otherwise. Stage D measures
+              # whatever this says, and the planner prices it the same way.
+              "spec_kv": "f16"}
 
 # Stage A finds the wall, and the stages after it start from what A found. That
 # ordering is the whole design: an ngl that spills makes every later comparison a
@@ -689,7 +796,8 @@ def planner_split(model_path, c):
                     compute_override_mib=None, safety_pct=PLAN_SAFETY_PCT,
                     n_seq=int(c.get("seq") or 1),
                     include_mmproj=(c.get("mmproj_offload") is not False),
-                    mtp_spec=bool(c.get("spec") == "draft-mtp"))
+                    mtp_spec=bool(c.get("spec") == "draft-mtp"),
+                    spec_kv=c.get("spec_kv") or "f16")
         pl = r.get("plan") or {}
         n = pl.get("n_gpu_layers")
         return (int(n) if n is not None else None,
@@ -733,6 +841,11 @@ def ngl_ladder(model_path, c, n_layers, is_moe=False):
     return list(range(lo, hi + 1)), seed_ngl
 
 STAGE_C_UB = [256, 512, 1024, 2048]
+
+# Stage E's ladder is every `nl // STAGE_E_STEP`th block from 0 to n_layers,
+# plus the last rung - always around a dozen loads whatever the model size,
+# and every rung beyond the first OOM is pruned by the monotone wall anyway.
+STAGE_E_STEP = 8
 
 STAGE_D_SPEC = [("none", 0), ("draft-mtp", 1), ("draft-mtp", 2), ("draft-mtp", 3),
                 ("draft-mtp", 5), ("ngram-mod", 0), ("ngram-cache", 0),
@@ -813,13 +926,17 @@ _MONOTONE_AXES = {"ngl": "up", "ub": "up", "ctx": "up", "spec_n_max": "up"}
 # cost more - which is why it is never architecture-gated.
 _MONOTONE_MOE = {"ncmoe": "down"}
 
+# On a DENSE model the FFN tensor pin is monotone the same way as the expert
+# split: more blocks' dense FFN on the CPU means less VRAM, so the wall is the
+# SMALLEST n_cpu_ffn that fits. It is the dense counterpart of _MONOTONE_MOE -
+# the two knobs are each other's architecture - so it is gated the other way.
+_MONOTONE_FFN = {"n_cpu_ffn": "down"}
+
 
 def _wall_val(c, axis):
     """The axis value, normalised the way _key() normalises optional keys."""
-    if axis == "ncmoe":
-        return c.get("ncmoe") or 0
-    if axis == "spec_n_max":
-        return c.get("spec_n_max") or 0
+    if axis in ("ncmoe", "spec_n_max", "n_cpu_ffn"):
+        return c.get(axis) or 0
     return c.get(axis)
 
 
@@ -873,6 +990,8 @@ def _tag_axes(cfgs, axes, is_moe):
     tags = [(a, d) for a, d in _MONOTONE_AXES.items() if a in axes]
     if is_moe:
         tags.extend((a, d) for a, d in _MONOTONE_MOE.items() if a in axes)
+    else:
+        tags.extend((a, d) for a, d in _MONOTONE_FFN.items() if a in axes)
     if not tags:
         return
     for c in cfgs:
@@ -916,7 +1035,7 @@ def _depth_extras(out, base, facts, extra_fills, axis, direction):
 
 
 def stage_configs(letter, b, nl, is_moe, rungs, mmproj=None, facts=None,
-                  drafter=None):
+                  drafter=None, e_ngl=None):
     """The configs one stage varies, from the baseline it is handed.
 
     One knob at a time, deliberately - the same reasoning as sweep.build_grid,
@@ -999,6 +1118,30 @@ def stage_configs(letter, b, nl, is_moe, rungs, mmproj=None, facts=None,
             for nmax in range(1, bs + 1):
                 add(spec="draft-dflash", spec_n_max=nmax, stage="D",
                     md=drafter["path"], wall=[("spec_n_max", "up")])
+    elif letter == "e" and not is_moe:
+        # The -ot tensor split: every block stays on the GPU and the first v
+        # blocks' dense FFN tensors (gate/up/down) move to the CPU - the
+        # planner's "KV on GPU, FFN in RAM" mode, measured instead of derived.
+        # Dense models only: an MoE has no dense FFN to pin, and stage A's
+        # n_cpu_moe ladder is that model's FFN knob already.
+        #
+        # The ladder starts where the split is BELIEVED to belong: at ngl=nl,
+        # the mode's own layout, in the unchained grid - and at the carried
+        # winner's ngl under a chained campaign (e_ngl), because the FFN bytes
+        # are then spent on what actually won. Either way the layers stay put
+        # and only tensors move; the freed tensors buy LAYERS back, which is
+        # the frontier walk (_e_frontier) stage E runs in speed_sweep().
+        step = max(1, nl // STAGE_E_STEP)
+        rungs = list(range(0, nl + 1, step))
+        if rungs[-1] != nl:
+            rungs.append(nl)
+        base_ngl = int(e_ngl if e_ngl is not None else nl)
+        for v in rungs:
+            # ngl=base_ngl by construction - the whole point is that the LAYERS
+            # stay put and only tensors move - so the ladder walks downward
+            # from the split it is handed: each rung frees what the rung below
+            # kept.
+            add(ngl=base_ngl, n_cpu_ffn=v, stage="E", wall=[("n_cpu_ffn", "down")])
     return out
 
 
@@ -1014,7 +1157,7 @@ def _dedupe(cfgs, seen=None):
     return out
 
 
-def build_speed_grid(facts, mmproj=None, base=None, stages="abcd", model_path=None,
+def build_speed_grid(facts, mmproj=None, base=None, stages="abcde", model_path=None,
                      drafter=None):
     """The whole staged grid, one knob at a time from one fixed baseline.
 
@@ -1026,7 +1169,7 @@ def build_speed_grid(facts, mmproj=None, base=None, stages="abcd", model_path=No
     b, nl, is_moe, rungs = grid_context(facts, mmproj, base, model_path,
                                         drafter=drafter)
     cfgs, seen = [], set()
-    for letter in "abcd":
+    for letter in "abcde":
         if letter in stages:
             cfgs.extend(_dedupe(
                 stage_configs(letter, b, nl, is_moe, rungs, mmproj, facts,
@@ -1046,14 +1189,16 @@ CHAIN_MARGIN = 0.02
 
 # Neutral value per config key, so a row that omits one groups with a row that
 # sets it explicitly to its default. Anything absent here defaults to None.
-_CONFIG_DEFAULTS = {"ncmoe": 0, "spec_n_max": 0, "fill": 0, "seq": 1,
-                    "temp": 0.0, "top_k": 0, "top_p": 1.0, "min_p": 0.0,
-                    "rep_pen": 1.0, "pres_pen": 0.0}
+_CONFIG_DEFAULTS = {"ncmoe": 0, "spec_n_max": 0, "n_cpu_ffn": 0, "fill": 0,
+                    "seq": 1, "temp": 0.0, "top_k": 0, "top_p": 1.0,
+                    "min_p": 0.0, "rep_pen": 1.0, "pres_pen": 0.0,
+                    "spec_kv": "f16"}
 
-# What carries forward. Not ctx / kv / fill / seq / fa: those are frozen by the
-# form and are the campaign's definition rather than any of its results. Not
-# `stage`, which is a label.
-CARRY_KEYS = ("ngl", "ncmoe", "ub", "mmproj_offload", "spec", "spec_n_max", "md")
+# What carries forward. Not ctx / kv / spec_kv / fill / seq / fa: those are
+# frozen by the form and are the campaign's definition rather than any of its
+# results. Not `stage`, which is a label.
+CARRY_KEYS = ("ngl", "ncmoe", "n_cpu_ffn", "ub", "mmproj_offload", "spec",
+              "spec_n_max", "md")
 
 # Below this fraction of unique 8-word windows the output is repetition, not
 # work. One constant because the run-time table and the trustworthy() gate must
@@ -1141,6 +1286,12 @@ def comparable(r, model, base, n_predict=None, repeat=None, prompt_id=None,
     c = r.get("config") or {}
     if not (c.get("ctx") == base.get("ctx")
             and c.get("kv") == base.get("kv")
+            # The draft cache's quant is frozen like the target's: a row
+            # measured with a q8_0 draft cache is not a slower or faster
+            # version of an f16 one - they are two experiments. Absent means
+            # llama.cpp's f16 default on both sides, so rows recorded before
+            # the knob existed still compare.
+            and (c.get("spec_kv") or "f16") == (base.get("spec_kv") or "f16")
             and (c.get("fill") or 0) == (base.get("fill") or 0)
             and (c.get("seq") or 1) == (base.get("seq") or 1)
             and bool(c.get("fa")) == bool(base.get("fa"))):
@@ -1214,9 +1365,18 @@ def resolve_rounds(chain, rounds):
 
 
 def _carry_summary(c):
-    return ("ngl %s ncmoe %s ub %s spec %s"
-            % (c.get("ngl"), c.get("ncmoe") or 0, c.get("ub"),
-               c.get("spec") or "none"))
+    s = ("ngl %s ncmoe %s ub %s spec %s"
+         % (c.get("ngl"), c.get("ncmoe") or 0, c.get("ub"),
+            c.get("spec") or "none"))
+    # The FFN pin is the one placement that does not show in ngl/ncmoe, so a
+    # carried baseline that uses it would read as the plain split.
+    if c.get("n_cpu_ffn"):
+        s += " ffn-cpu %s" % c.get("n_cpu_ffn")
+    # Same for the draft cache's quant: f16 is llama.cpp's default and needs no
+    # saying, anything else changes what a speculative baseline actually IS.
+    if c.get("spec_kv") and c.get("spec_kv") != "f16":
+        s += " spec-kv %s" % c.get("spec_kv")
+    return s
 
 
 def verify_config(win_c, overrides=None):
@@ -1237,7 +1397,8 @@ def verify_config(win_c, overrides=None):
 def _verify_step(backend, model_path, facts, name, base, path, pid, gpu,
                  overrides=None, port=BENCH_PORT, timeout=420.0,
                  n_predict=N_PREDICT, repeat=N_REPEAT, log=print,
-                 template=(None, None, None, None), template_id=_ANY):
+                 template=(None, None, None, None), template_id=_ANY,
+                 on_server=None, skip_count=None):
     """Load the campaign's winner at the PRODUCTION config, exactly once.
 
     The staged search measures each knob at the config the grid asked for, and
@@ -1267,7 +1428,8 @@ def _verify_step(backend, model_path, facts, name, base, path, pid, gpu,
            "  fill %s" % (c.get("fill") or 0)
            if c.get("fill") else ""))
     row = bench_one(backend, model_path, c, port=port, timeout=timeout,
-                    n_predict=n_predict, repeat=repeat, log=log)
+                    n_predict=n_predict, repeat=repeat, log=log,
+                    on_server=on_server, skip_count=skip_count)
     row.update({"arch": facts["arch"], "n_layers": facts["n_layers"],
                 "when": int(time.time()), "gpu": gpu})
     with open(path, "a", encoding="utf-8") as fh:
@@ -1277,6 +1439,13 @@ def _verify_step(backend, model_path, facts, name, base, path, pid, gpu,
     good = row.get("status") == "ok" and trustworthy(row)
     if good:
         log("verify  : OK - the winner loads at your production config and is certified")
+    elif row.get("status") == "skipped":
+        # A skip is a judgement, not a verdict: the verification load was
+        # abandoned on request, so nothing was certified - and nothing was
+        # disproved either.
+        log("verify  : SKIPPED - the verification load was abandoned on request.")
+        log("          No verdict, favourable or not. Run the sweep again and let")
+        log("          the verify row finish to certify the winner.")
     else:
         log("verify  : FAILED - the winner does not fit your production config (%s%s)"
             % (row.get("status"), row.get("gen_error") or row.get("error") or ""))
@@ -1343,16 +1512,44 @@ def preflight(log=print, need_free_pct=0.85):
     return st["ok"]
 
 
+def _resume_recorded(rows, n_predict, repeat, pid, tmpl_id):
+    """The rows of a store a resumed campaign may treat as already done.
+
+    `ok` and `oom` are measurements - the rungs a ladder is read from. `skipped`
+    and `spilled` are judgements, by the user and by the machine respectively,
+    and a judgement is exactly what a resumed campaign must not re-litigate:
+    re-measuring a config the user already skipped wastes the same load it just
+    wasted, and a config that spilled into shared memory (or ran while the card
+    was busy) re-spends the minutes the abort saved. Rows of any other status
+    failed for a reason that may not hold tomorrow - a transient exit, a
+    generation error - so they are re-measured, not carried.
+
+    `n_predict`, `repeat`, `pid` and `tmpl_id` gate what counts as the SAME
+    measurement: a row taken at another depth or under another template is a
+    different experiment, not this campaign's work already done."""
+    recorded = {}
+    for r in rows:
+        if (r.get("config") and r.get("status") in ("ok", "oom", "skipped", "spilled")
+                and r.get("n_predict") == n_predict and r.get("repeat") == repeat
+                and r.get("prompt_id") == pid
+                # ...and under the same chat template. A thinking template
+                # answers at a different length than a terse one, so a row
+                # measured without one is not this campaign's row already done.
+                and r.get("template_id") == tmpl_id):
+            recorded[_key(r["model"], r["config"])] = r
+    return recorded
+
+
 def speed_sweep(models=None, backend=None, dry_run=False, timeout=420.0,
-                port=BENCH_PORT, limit=None, axes=None, stages="abcd", fill=None,
+                port=BENCH_PORT, limit=None, axes=None, stages="abcde", fill=None,
                 fills=None, ctx=None, kv=None,
                 n_predict=N_PREDICT, repeat=N_REPEAT, log=print, skip_preflight=False,
                 on_row=None, should_stop=None, on_total=None,
-                should_abort=None, on_server=None,
+                should_abort=None, on_server=None, skip_count=None,
                 chain=False, rounds=1, verify=False, verify_overrides=None,
                 chat_template_file=None, chat_template_kwargs=None,
                 reasoning=None, reasoning_preserve=None, sampling=None,
-                mmproj_offload=None, drafter=None):
+                mmproj_offload=None, drafter=None, ot=None, spec_kv=None):
     """Run the speed grid and append one row per config. Resumable like --sweep.
 
     `on_row` is called with each finished row, `on_total` when the number of
@@ -1360,6 +1557,16 @@ def speed_sweep(models=None, backend=None, dry_run=False, timeout=420.0,
     All three default to None, so the CLI path is unchanged. They exist for the
     web UI: it needs structured rows as they land rather than a transcript to
     scrape, and it needs a way to end a two-hour campaign early.
+
+    `skip_count` is how a config in flight gets ABANDONED without ending the
+    campaign: the controlling layer (terminal S key, web Skip button) kills the
+    server and bumps its counter; the run then fails promptly instead of sitting
+    out its generation timeout, and bench_one() stamps the row `skipped`. The
+    row is recorded and keyed, so a resumed campaign never re-measures it - the
+    user already judged it once, and making it pay for that judgement twice is
+    exactly what the skip exists to prevent. A press that lands between runs is
+    harmless: nothing is in flight to kill, and the counter comparison in
+    bench_one() binds each press to the run it was made during.
 
     Stopping is deliberately BETWEEN configs. Killing a server mid-measurement
     would write a half-row, and there is no need: rows are resume-keyed by config
@@ -1471,6 +1678,11 @@ def speed_sweep(models=None, backend=None, dry_run=False, timeout=420.0,
         base["ctx"] = ctx
     if kv is not None:
         base["kv"] = kv
+    # The draft cache's quant, frozen like the target's: stage D then measures
+    # speculation at the cache it will actually run with, and the planner seeds
+    # the ladder (planner_split) under the same assumption.
+    if spec_kv is not None:
+        base["spec_kv"] = spec_kv
     # Stage B IS the projector sweep. Pinning the placement and then running it
     # anyway would re-measure the axis that was just fixed - the configs would
     # all carry the pinned value, so the stage would spend loads proving one
@@ -1480,6 +1692,28 @@ def speed_sweep(models=None, backend=None, dry_run=False, timeout=420.0,
         log("note    : projector pinned to %s, so stage B is dropped - that stage "
             "IS the projector sweep"
             % ("VRAM" if mmproj_offload else "system RAM"))
+    # Stage E and the FFN pin are each other's halves, and both are dense-only.
+    # The MoE check comes first: an MoE has no dense FFN tensors for either to
+    # move, and stage A's ncmoe ladder is that model's FFN knob already.
+    if facts.get("is_moe"):
+        if ot is not None:
+            log("note    : n_cpu_ffn pins DENSE FFN tensors, and this model routes "
+                "its experts - the pin was dropped")
+            ot = None
+        if "e" in (stages or ""):
+            stages = (stages or "").replace("e", "")
+            log("note    : stage E is the dense-FFN tensor sweep, and this model "
+                "routes its experts - stage A already sweeps --n-cpu-moe, so E "
+                "was dropped")
+    elif ot is not None:
+        # None keeps stage E's job as it was; a number pins the count and makes
+        # the stage a no-op, which is said out loud rather than left as a dozen
+        # configs that all carry the pin and measure one thing.
+        base["n_cpu_ffn"] = ot
+        if "e" in (stages or ""):
+            stages = (stages or "").replace("e", "")
+            log("note    : dense FFN pinned to %d blocks on CPU, so stage E is "
+                "dropped - that stage IS the FFN sweep" % ot)
     cfgs = build_speed_grid(facts, mmproj=mmproj, base=base, stages=stages,
                             model_path=mp, drafter=drafter)
     if axes:
@@ -1539,16 +1773,7 @@ def speed_sweep(models=None, backend=None, dry_run=False, timeout=420.0,
     # ladder, it is a rung that was already climbed - and printing only a count
     # of them turned a complete six-rung ladder into three rows with the OOM
     # boundary missing, which reads as the tool ignoring what was asked for.
-    recorded = {}
-    for r in load_rows(path):
-        if (r.get("config") and r.get("status") in ("ok", "oom")
-                and r.get("n_predict") == n_predict and r.get("repeat") == repeat
-                and r.get("prompt_id") == pid
-                # ...and under the same chat template. A thinking template
-                # answers at a different length than a terse one, so a row
-                # measured without one is not this campaign's row already done.
-                and r.get("template_id") == tmpl_id):
-            recorded[_key(r["model"], r["config"])] = r
+    recorded = _resume_recorded(load_rows(path), n_predict, repeat, pid, tmpl_id)
     done = set(recorded)
     plan = [c for c in cfgs if _key(os.path.basename(mp), c) not in done]
     skipped = len(cfgs) - len(plan)
@@ -1578,6 +1803,11 @@ def speed_sweep(models=None, backend=None, dry_run=False, timeout=420.0,
                           else "greedy (temp 0) - reproducible across configs, and "
                                "speculation's BEST case, so read acceptance as an "
                                "upper bound"))
+    # The draft cache's quant is frozen like kv, and f16 is llama.cpp's default,
+    # so it is only said when it is not the thing everyone would assume.
+    if (base.get("spec_kv") or "f16") != "f16":
+        log("draftkv : %s (-ctkd/-ctvd) - stage D measures the draft cache at this"
+            % base["spec_kv"])
     log("output  : %s" % path)
     log("configs : %d to run, %d already recorded" % (len(plan), skipped))
     log("estimate: ~%.1f h  (load + %d warm + %d x %d tokens per config)"
@@ -1603,10 +1833,10 @@ def speed_sweep(models=None, backend=None, dry_run=False, timeout=420.0,
             first = (stages or "a")[0]
             shown = [c for c in plan if (c.get("stage") or "").lower() == first]
         for c in shown:
-            log("  %-2s ctx %-7d kv %-5s ngl %-3d ncmoe %-3d ub %-5d fill %-7d "
-                "spec %-13s nmax %-2d mmproj %s"
+            log("  %-2s ctx %-7d kv %-5s ngl %-3d ncmoe %-3d ot %-3d ub %-5d "
+                "fill %-7d spec %-13s nmax %-2d mmproj %s"
                 % (c.get("stage", "-"), c["ctx"], c["kv"], c["ngl"],
-                   c.get("ncmoe") or 0, c["ub"],
+                   c.get("ncmoe") or 0, c.get("n_cpu_ffn") or 0, c["ub"],
                    c.get("fill") or 0, c.get("spec") or "none",
                    c.get("spec_n_max") or 0,
                    "vram" if c.get("mmproj_offload") is not False else "ram"))
@@ -1646,8 +1876,8 @@ def speed_sweep(models=None, backend=None, dry_run=False, timeout=420.0,
         return None
 
     log("")
-    log("%-2s %-4s %-5s %-5s %-8s %-13s %-4s %-6s | %8s %9s %7s %6s %6s"
-        % ("st", "ngl", "ncmoe", "ub", "fill", "spec", "nmax", "mmproj",
+    log("%-2s %-4s %-5s %-4s %-5s %-8s %-13s %-4s %-6s | %8s %9s %7s %6s %6s"
+        % ("st", "ngl", "ncmoe", "ot", "ub", "fill", "spec", "nmax", "mmproj",
            "tok/s", "prefill", "VRAM", "accept", "distin"))
     # The rungs already climbed, printed in place before the new ones. Resume
     # exists so a stopped campaign is not re-paid for, but a ladder is read as a
@@ -1682,6 +1912,22 @@ def speed_sweep(models=None, backend=None, dry_run=False, timeout=420.0,
             tries = {}
             walls = {}
             extras_done = [False]
+            # Stage E's frontier walk state. `base` is the ngl the first ladder
+            # sits at (the carried winner's under a chained campaign); `pin` is
+            # the least n_cpu_ffn > 0 PROVEN to fit there, recorded rows
+            # included, so a resumed or repeated round does not re-derive it;
+            # once both are known the ngl-up probes are appended (see the hook
+            # below and _e_frontier).
+            e_base = None
+            for c0 in cfgs:
+                if (c0.get("stage") or "") == "E":
+                    e_base = c0["ngl"] if e_base is None else min(e_base, c0["ngl"])
+            ew = {"base": e_base,
+                  "pin": _e_walk_pin(recorded, e_base, base) if e_base is not None
+                  else None,
+                  "started": False}
+            e_ran = [False]     # a first-ladder row ran in this group
+            e_ok = [False]      # ...and at least one of them fitted
             i = -1
             while True:
                 i += 1
@@ -1714,6 +1960,14 @@ def speed_sweep(models=None, backend=None, dry_run=False, timeout=420.0,
                             if on_total:
                                 on_total(total[0], planned=max(planned, total[0]))
                             continue
+                    if e_base is not None and e_ran[0] and not e_ok[0]:
+                        log("")
+                        log("note    : stage E measured nothing - no -ot row fit at "
+                            "ngl %s on this card" % e_base)
+                        log("          the FFN-offload mode pins every layer on the "
+                            "GPU, so it needs more")
+                        log("          room than this model has; the layers-in-RAM "
+                            "mode is this card's answer")
                     return True
                 c = queue[i]
                 # The wall tag rides the config to the queue and is stripped
@@ -1725,9 +1979,19 @@ def speed_sweep(models=None, backend=None, dry_run=False, timeout=420.0,
                         "are keyed, so re-running resumes here."
                         % (len(out), total[0]))
                     return False
+                # A config in flight can also end because it is UNUSABLE, not
+                # because anyone asked: a pass at a fraction of what this model
+                # normally delivers means the process was spilled into shared
+                # memory or the card is busy, and measuring it to the end is the
+                # waste the floor exists to stop. The floor is this campaign's
+                # own median so far (recorded rows included) scaled down - see
+                # _abort_floor() - and None until there is something to judge
+                # against.
+                floor = _abort_floor(out + list(recorded.values()), c, name)
                 row = bench_one(b, mp, c, port=port, timeout=timeout,
                                 n_predict=n_predict, repeat=repeat, log=log,
-                                on_server=on_server)
+                                on_server=on_server, skip_count=skip_count,
+                                abort_floor=floor)
                 row.update({"arch": facts["arch"], "n_layers": facts["n_layers"],
                             "when": int(time.time()), "gpu": gpu})
                 # A hard stop kills the server mid-request, so this row failed
@@ -1745,8 +2009,13 @@ def speed_sweep(models=None, backend=None, dry_run=False, timeout=420.0,
                 os.fsync(fh.fileno())
                 out.append(row)
                 # Keep `done` current so a later round skips what this one just
-                # measured, the same way a restarted campaign would.
-                if row.get("status") in ("ok", "oom"):
+                # measured, the same way a restarted campaign would. `skipped`
+                # counts: the user judged the config and a chained round must
+                # not re-propose it. `spilled` counts for the same reason: a
+                # config that spilled into shared memory (or ran while the card
+                # was busy) was judged by the machine, and re-measuring it just
+                # wastes the load again.
+                if row.get("status") in ("ok", "oom", "skipped", "spilled"):
                     done.add(_key(name, c))
                 log(_fmt_row(c, row, len(out), total[0]))
                 if on_row:
@@ -1780,8 +2049,10 @@ def speed_sweep(models=None, backend=None, dry_run=False, timeout=420.0,
                 # and B choose the fastest split that FITS, which is by
                 # construction the one with the least headroom left. Stage D
                 # then asks for a draft KV cache that llama.cpp keeps at f16
-                # whatever -ctk says. So the speculative rows OOM, and the
-                # campaign concludes speculation does not work on this model.
+                # whatever -ctk says, unless the campaign pinned a draft quant
+                # (-ctkd/-ctvd, --speed-spec-kv). So the speculative rows OOM,
+                # and the campaign concludes speculation does not work on this
+                # model.
                 #
                 # It concluded that twice this week and was wrong both times.
                 # draft-mtp OOMed at ngl 31 and was the best config measured at
@@ -1806,6 +2077,40 @@ def speed_sweep(models=None, backend=None, dry_run=False, timeout=420.0,
                     total[0] = len(out) + (len(queue) - i - 1)
                     if on_total:
                         on_total(total[0], planned=max(planned, total[0]))
+                # Stage E's SECOND ladder: the first ladder pins FFN tensors to
+                # the CPU at the base split, and every rung that fits frees
+                # VRAM - and freed VRAM buys LAYERS back. That interaction is
+                # what a one-knob grid cannot express, so the walk expresses
+                # it: once the least pin that fits is known, the ngl-up probes
+                # are appended with the pin held. Each probe is tagged ngl-up,
+                # so the first OOM prunes the rest - ngl is monotone up, the
+                # draft wall's logic turned around. Probes (ngl above the
+                # base) never re-trigger this hook; first-ladder rows keep
+                # their own ffn-down wall.
+                if (c.get("stage") == "E" and ew["base"] is not None
+                        and c["ngl"] == ew["base"]):
+                    e_ran[0] = True
+                    f = c.get("n_cpu_ffn") or 0
+                    if row.get("status") == "ok" and f > 0:
+                        ew["pin"] = f if ew["pin"] is None else min(ew["pin"], f)
+                    if row.get("status") == "ok":
+                        e_ok[0] = True
+                    if (not ew["started"] and ew["pin"] is not None
+                            and row.get("status") == "ok"):
+                        ew["started"] = True
+                        probes = [p for p in _e_frontier(c, ew["base"], ew["pin"],
+                                                         int(facts.get("n_layers") or 0))
+                                  if _key(name, p) not in done]
+                        if probes:
+                            log("          ^ FFN offload fits with ffn-cpu %s - the "
+                                "freed tensors buy layers back, so the ngl-up walk "
+                                "starts there (%d more config%s)"
+                                % (ew["pin"], len(probes),
+                                   "" if len(probes) == 1 else "s"))
+                            queue.extend(probes)
+                            total[0] = len(out) + len(queue) - i - 1
+                            if on_total:
+                                on_total(total[0], planned=max(planned, total[0]))
 
         if not chain:
             # With deeper fills, stage A's rows run first, then the depth rows
@@ -1830,7 +2135,7 @@ def speed_sweep(models=None, backend=None, dry_run=False, timeout=420.0,
             budget = limit
             seen = set()
             for rd in range(1, max(1, int(rounds or 1)) + 1):
-                for letter in "abcd":
+                for letter in "abcde":
                     if letter not in stages:
                         continue
                     if budget is not None and budget <= 0:
@@ -1840,7 +2145,15 @@ def speed_sweep(models=None, backend=None, dry_run=False, timeout=420.0,
                         carried=carried, drafter=drafter)
                     todo = [c for c in _dedupe(
                                 stage_configs(letter, gb, gnl, gmoe, grungs,
-                                              mmproj, facts, drafter), seen)
+                                              mmproj, facts, drafter,
+                                              # Stage E ladders from the split
+                                              # the campaign actually won, not
+                                              # from ngl=nl: the -ot rows must
+                                              # start where the carried config
+                                              # fits, or they re-prove a wall
+                                              # the chain already measured.
+                                              e_ngl=int(gb.get("ngl") or gnl)
+                                              if letter == "e" else None), seen)
                             if _key(name, c) not in done]
                     if budget is not None:
                         todo = todo[:budget]
@@ -1903,7 +2216,8 @@ def speed_sweep(models=None, backend=None, dry_run=False, timeout=420.0,
                                 overrides=verify_overrides, port=port,
                                 timeout=timeout, n_predict=n_predict,
                                 repeat=repeat, log=log,
-                                template=(tmpl_f, tmpl_k, rea, rea_p), template_id=tmpl_id)
+                                template=(tmpl_f, tmpl_k, rea, rea_p), template_id=tmpl_id,
+                                on_server=on_server, skip_count=skip_count)
     return {"rows": out, "path": path, "stopped": stopped, "planned": total[0],
             "chained": bool(chain), "verified": verified}
 
@@ -1947,12 +2261,65 @@ def _draft_probe(c, is_moe, rung, depth):
     return d
 
 
+def _e_frontier(c, base_ngl, pin, nl):
+    """The second ladder of stage E: ngl walked back UP with the pin held.
+
+    One corner of the (ngl, ffn) frontier per row - the cheapest corner, which
+    is the whole point of a frontier: pin the least FFN offload that fits at
+    the base split, then one row per layer above it. Tagged ("ngl", "up") so
+    the first OOM prunes every higher rung - ngl is monotone up, and `_wall`
+    is stripped before a row is measured (run_group pops it), so the tag never
+    reaches a row, a resume key or disk. `c` is the first-ladder row that
+    proved the pin; the probes inherit its family (spec, depth, ubatch,
+    projector placement), differing only on the axis the walk varies."""
+    probes = []
+    for r in range(base_ngl + 1, nl + 1):
+        d = dict(c)
+        d.pop("_wall", None)
+        d["ngl"] = r
+        d["n_cpu_ffn"] = pin
+        d["_wall"] = [("ngl", "up")]
+        probes.append(d)
+    return probes
+
+
+def _e_walk_pin(recorded, base_ngl, base):
+    """The least n_cpu_ffn > 0 already PROVEN to fit at the base split.
+
+    The frontier walk pins the smallest pin that fits, so a resumed or
+    repeated round does not re-derive it: any ok row at this ngl in the same
+    family (same spec, depth, ubatch, projector placement) is the same
+    evidence, even when an earlier round recorded it. ffn 0 is not a pin - it
+    is the plain split the baseline already is - and a `spilled` row loaded
+    on the edge, so only clean fits count."""
+    got = None
+    for r in (recorded or {}).values():
+        c = r.get("config") or {}
+        if r.get("status") != "ok" or c.get("ngl") != base_ngl:
+            continue
+        f = int(c.get("n_cpu_ffn") or 0)
+        if f <= 0:
+            continue
+        if (c.get("spec") or "none") != (base.get("spec") or "none"):
+            continue
+        if (c.get("spec_n_max") or 0) != (base.get("spec_n_max") or 0):
+            continue
+        if (c.get("ub") or 0) != (base.get("ub") or 0):
+            continue
+        if bool(c.get("mmproj_offload") is not False) != \
+                bool(base.get("mmproj_offload") is not False):
+            continue
+        got = f if got is None else min(got, f)
+    return got
+
+
 def _spec_retry(c, row, facts, tries, drafter=None):
     """The next config a draft family's wall walk measures, or None.
 
-    A draft model needs its own KV cache and llama.cpp keeps it at f16 whatever
-    the main cache is quantised to, so speculation costs several hundred MiB the
-    split it is being tried at was never chosen to leave room for. Stage D only
+    A draft model needs its own KV cache, and llama.cpp keeps it at f16 unless
+    the campaign pinned a draft quant (-ctkd/-ctvd, --speed-spec-kv) - so
+    speculation costs several hundred MiB the split it is being tried at was
+    never chosen to leave room for. Stage D only
     ever tries it at the split stage A/B settled on - by construction the fastest
     one that fits, usually the one with the least headroom - so the draft rows
     OOM and the campaign reads "speculation does not work" when what it measured
@@ -1982,6 +2349,13 @@ def _spec_retry(c, row, facts, tries, drafter=None):
     # as though it were draft-mtp.
     spec = (c.get("spec") or "none")
     if spec not in ("draft-mtp", "draft-dflash"):
+        return None
+    # Stage E owns its own walk (see _e_frontier). Its rows OOM against the
+    # layer and FFN walls, and THIS walk - which reads every OOM as a draft
+    # cache that cannot fit - would walk ngl down one rung per row while the
+    # row's own ffn pin climbs with it, testing a diagonal no family ever ran.
+    # The frontier walk answers E's OOMs with the split that actually fits.
+    if (c.get("stage") or "") == "E":
         return None
     if row.get("status") not in ("ok", "oom"):
         return None
@@ -2027,9 +2401,10 @@ def _spec_retry(c, row, facts, tries, drafter=None):
 def _spec_wall_note(out, todo, base, log):
     """Say what an all-OOM speculation stage actually means.
 
-    A draft model needs its own KV cache, and llama.cpp keeps it at f16 whatever
-    the main cache is quantised to - so speculation costs several hundred MiB
-    that the split it is being tried at was never chosen to leave room for.
+    A draft model needs its own KV cache, and llama.cpp keeps it at f16 unless
+    the campaign pinned a draft quant (-ctkd/-ctvd, --speed-spec-kv) - so
+    speculation costs several hundred MiB that the split it is being tried at
+    was never chosen to leave room for.
 
     Stage D only ever tries it at the split stage A/B settled on, and that split
     is by construction the FASTEST one that fits, which usually means the one
@@ -2059,20 +2434,23 @@ def _spec_wall_note(out, todo, base, log):
     log("")
     log("note    : every draft-* row OOMed at %s %s. That is not a verdict on"
         % (axis, cur))
-    log("          speculation - the draft KV cache is f16 whatever -ctk says, and")
+    log("          speculation - the draft KV cache is %s whatever -ctk says, and"
+        % (base.get("spec_kv") or "f16"))
     log("          this split was picked as the fastest that FITS, so it had no room")
     log("          spare. Vary the split and the speculation together:")
     log("            --speed-axes %s=%s spec=draft-mtp spec_n_max=2%s"
         % (axis, ",".join(str(v) for v in sorted(rungs)),
            " mmproj_offload=false" if base.get("mmproj_offload") is False else ""))
     log("          or paste that into 'Sweep exact values instead of the stages'.")
+    log("          (A q8_0 draft cache --speed-spec-kv q8_0 also halves what")
+    log("          speculation costs, if the acceptance rate survives it.)")
     log("")
 
 
 def _fmt_row(c, row, i=None, n=None):
-    head = ("%-2s %-4d %-5d %-5d %-8d %-13s %-4d %-6s | "
-            % (c.get("stage", "-"), c["ngl"], c.get("ncmoe") or 0, c["ub"],
-               c.get("fill") or 0,
+    head = ("%-2s %-4d %-5d %-4d %-5d %-8d %-13s %-4d %-6s | "
+            % (c.get("stage", "-"), c["ngl"], c.get("ncmoe") or 0,
+               c.get("n_cpu_ffn") or 0, c["ub"], c.get("fill") or 0,
                c.get("spec") or "none", c.get("spec_n_max") or 0,
                "vram" if c.get("mmproj_offload") is not False else "ram"))
     if row.get("status") != "ok":
@@ -2152,6 +2530,10 @@ def spill_note(row):
         return ("  SPILLED - floor fell %.0f MiB below the rest of this campaign, "
                 "which is memory the driver moved out of VRAM"
                 % row["spill_inferred"])
+    if row.get("collapse_inferred"):
+        return ("  SPILLED - %.2fx the speed of this campaign's own median, which "
+                "is not a slower config: the card was busy or the process was "
+                "demoted mid-run" % row["collapse_inferred"])
     sh = row.get("shared_mib")
     if x is None and sh is not None and sh > SHARED_SPILL_MIB:
         # Mid-campaign there is no ladder yet, so the counter has no baseline to
@@ -2459,6 +2841,27 @@ def _infer_demotion(rows):
         if r.get("status") == "ok" and r.get("shared_mib") is not None:
             r["spilled"] = bool(r.get("suspect")) or demoted(r)
 
+    # The RATE is the third signal, and it catches what the two memory signals
+    # cannot: a process demoted by a BUSY machine shows no excess shared usage
+    # and no floor collapse - the counters never move, the speed does. A row at
+    # a fraction of its group's median tok/s is not a slower config - the wall
+    # being found moves a ladder by tens of percent, never by 6x (SLOW_FRAC) -
+    # it is a measurement of a card that stopped being usable, and left
+    # unflagged it would read as a trustworthy number and sit in the corpus
+    # forever. Flagged the same way a spill is: excluded from every conclusion,
+    # but still a row in the table. Runs AFTER the loops above so a verdict
+    # from a memory signal is never overwritten; the groups are the same ones
+    # the memory signals grouped on.
+    for grp in groups.values():
+        ts = [x["tok_s"] for x in grp if x.get("tok_s")]
+        if len(ts) < 3:
+            continue
+        mid = _median(ts)
+        for r in grp:
+            if r.get("tok_s") and r["tok_s"] < mid * SLOW_FRAC:
+                r["spilled"] = True
+                r["collapse_inferred"] = round(r["tok_s"] / mid, 3)
+
 
 def rank_rows(rows):
     """Measured rows, fastest first.
@@ -2483,8 +2886,8 @@ def rank_rows(rows):
 # ---------------------------------------------------------------------------
 
 # Every config field that identifies WHICH experiment a row belongs to.
-_CONFIG_KEYS = ("ctx", "kv", "fa", "seq", "ub", "ngl", "ncmoe", "spec",
-                "spec_n_max", "mmproj_offload", "fill",
+_CONFIG_KEYS = ("ctx", "kv", "fa", "seq", "ub", "ngl", "ncmoe", "n_cpu_ffn",
+                "spec", "spec_n_max", "spec_kv", "mmproj_offload", "fill",
                 # Samplers belong here for the same reason _key() carries them:
                 # greedy is speculation's BEST case, so two rows taken under
                 # different sampler settings are not two configs, they are two
@@ -2504,10 +2907,15 @@ _CONFIG_KEYS = ("ctx", "kv", "fa", "seq", "ub", "ngl", "ncmoe", "spec",
 EFFECT_AXES = (
     ("ngl", "GPU layers", ("ngl",), None),
     ("ncmoe", "CPU expert layers", ("ncmoe",), None),
+    ("n_cpu_ffn", "CPU FFN blocks", ("n_cpu_ffn",), 0),
     ("ub", "ubatch", ("ub",), 512),
     ("spec", "speculation", ("spec", "spec_n_max"), "none"),
     ("projector", "projector", ("mmproj_offload",), "VRAM"),
     ("kv", "KV quant", ("kv",), "f16"),
+    # The draft cache's own quant is an axis like the target's: an explicit
+    # ladder over it measures the acceptance-rate price of a smaller cache, and
+    # an insight reports what q8_0 bought relative to the f16 reference.
+    ("spec_kv", "draft KV quant", ("spec_kv",), "f16"),
 )
 
 
@@ -2519,7 +2927,7 @@ def _axis_value(r, axis):
         return "%s/%d" % (s, n) if s != "none" else "none"
     if axis == "projector":
         return "RAM" if c.get("mmproj_offload") is False else "VRAM"
-    if axis in ("ncmoe", "fill"):
+    if axis in ("ncmoe", "fill", "n_cpu_ffn"):
         return c.get(axis) or 0
     return c.get(axis)
 
@@ -2854,14 +3262,14 @@ def report(path=None, log=print):
     if not rows:
         log("No speed rows recorded yet. Run --speed-sweep.")
         return False
-    log("%-30s %-4s %-5s %-5s %-8s %-13s %-4s %-6s %8s %9s %7s %7s"
-        % ("model", "ngl", "ncmoe", "ub", "fill", "spec", "nmax", "mmproj", "tok/s",
-           "prefill", "VRAM", "accept"))
+    log("%-30s %-4s %-5s %-4s %-5s %-8s %-13s %-4s %-6s %8s %9s %7s %7s"
+        % ("model", "ngl", "ncmoe", "ot", "ub", "fill", "spec", "nmax",
+           "mmproj", "tok/s", "prefill", "VRAM", "accept"))
     for r in rows:
         c = r["config"]
-        log("%-30s %-4d %-5d %-5d %-8d %-13s %-4d %-6s %8.2f %9.1f %7.0f %7s%s"
-            % (r["model"][:30], c["ngl"], c.get("ncmoe") or 0, c["ub"],
-               c.get("fill") or 0,
+        log("%-30s %-4d %-5d %-4d %-5d %-8d %-13s %-4d %-6s %8.2f %9.1f %7.0f %7s%s"
+            % (r["model"][:30], c["ngl"], c.get("ncmoe") or 0,
+               c.get("n_cpu_ffn") or 0, c["ub"], c.get("fill") or 0,
                c.get("spec") or "none", c.get("spec_n_max") or 0,
                "vram" if c.get("mmproj_offload") is not False else "ram",
                r["tok_s"], r.get("prefill_tok_s") or 0.0,

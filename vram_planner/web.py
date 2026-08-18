@@ -29,6 +29,14 @@ UI_FILES = {
     "/app.js":   ("app.js",     "application/javascript; charset=utf-8"),
 }
 
+# The POST endpoints, named once so a route added on one side cannot silently
+# miss the other. /api/speed/skip was added to the handler without the list and
+# the Skip button 404'd for a whole campaign round - a fetch that catches its
+# own errors shows nothing when the server says "not found".
+_POSTS = ("/api/analyze", "/api/calibrate", "/api/script", "/api/script/save",
+          "/api/speed/plan", "/api/speed/start", "/api/speed/stop",
+          "/api/speed/skip", "/api/speed/delete", "/api/recommend")
+
 
 def read_ui(name):
     """Read one UI file. Read per request, not cached at import: editing the CSS
@@ -111,8 +119,12 @@ class Handler(BaseHTTPRequestHandler):
         path = data.get("path") or ""
         return {
             "models": [path] if path and os.path.exists(path) else None,
-            "stages": (data.get("stages") or "abcd").lower(),
+            "stages": (data.get("stages") or "abcde").lower(),
             "ctx": as_int("context"), "kv": data.get("kv_type") or None,
+            # The draft cache's quant, frozen like the target's: stage D measures
+            # speculation at the cache it will actually run with. Absent means
+            # llama.cpp's f16 default.
+            "spec_kv": data.get("spec_kv_type") or None,
             "fill": as_int("fill") if not data.get("fills") else None,
             # Deeper fills for the top stage-A rungs, once the wall is known -
             # the depth slope as part of the campaign instead of a second run.
@@ -125,6 +137,10 @@ class Handler(BaseHTTPRequestHandler):
             # each knob at the split that won rather than at the planner's guess.
             "chain": bool(data.get("chain", True)),
             "rounds": max(1, as_int("rounds", 1) or 1),
+            # Dense FFN blocks pinned to the CPU (-ot). None keeps stage E's
+            # job as it was; a number fixes the count and drops stage E, like
+            # the projector pin drops stage B.
+            "ot": as_int("ot"),
             # verify is opt-in from the browser, like --speed-verify on the CLI
             "verify": bool(data.get("verify")),
             "verify_overrides": (parse_overrides(data.get("verify_overrides").split())
@@ -206,6 +222,7 @@ class Handler(BaseHTTPRequestHandler):
                                should_stop=job.cancelled, on_total=job.set_total,
                                should_abort=job.aborting,
                                on_server=job.set_live_proc,
+                               skip_count=job.skipped,
                                skip_preflight=True, **kw)
 
         ok, msg = JOB.start("speed sweep", work)
@@ -604,10 +621,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         u = urlparse(self.path)
-        POSTS = ("/api/analyze", "/api/calibrate", "/api/script", "/api/script/save",
-                 "/api/speed/plan", "/api/speed/start", "/api/speed/stop",
-                 "/api/speed/delete", "/api/recommend")
-        if u.path not in POSTS:
+        if u.path not in _POSTS:
             return self._send(404, {"error": "not found"})
         try:
             n = int(self.headers.get("Content-Length", 0))
@@ -631,6 +645,10 @@ class Handler(BaseHTTPRequestHandler):
         if u.path == "/api/speed/stop":
             from .job import JOB
             ok, msg = JOB.cancel()
+            return self._send(200, {"ok": ok, "message": msg})
+        if u.path == "/api/speed/skip":
+            from .job import JOB
+            ok, msg = JOB.skip()
             return self._send(200, {"ok": ok, "message": msg})
         try:
             path = data["path"]

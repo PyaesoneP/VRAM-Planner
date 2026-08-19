@@ -213,7 +213,7 @@ one at every stage.
 
 | stage | promotes | why |
 |---|---|---|
-| **A** | the value at the **wall** — largest `ctx` (speed mode) or `-ngl` (context mode) that loads; smallest `--n-cpu-moe` on an MoE | the axis is monotone in VRAM, so the value at the wall is the one worth having |
+| **A** | the value at the **wall** — largest `ctx` (speed mode); smallest `-ot` exile, or largest `-ngl`, (context mode); smallest `--n-cpu-moe` on an MoE | the axis is monotone in VRAM, so the value at the wall is the one worth having |
 | **C** | the **largest `-ub`** that loads | ubatch is a prefill knob; decode barely moves with it |
 | **D** | the **fastest** row, by more than 2% | a draft scheme's worth is its acceptance rate, and no ordering of depths implies it |
 
@@ -229,6 +229,20 @@ The wall is still only taken from rows that **loaded cleanly**: an `oom` is not 
 candidate, and neither is a row that loaded and then spilled, looped or copied. A rung
 that loads but runs more than 5% below the fastest row on its ladder is refused too —
 that is not the wall, it is a different failure wearing the costume of a result.
+
+Which end of an axis is the good end comes from one lookup, `bench.axis_direction()`,
+over the same tables the OOM pruning walks — so the ladder, the promotion, the draft
+retry walk and the recommendation card cannot disagree about it. `-ot` and
+`--n-cpu-moe` are the two that run **downward**: they measure how much has been
+*exiled*, so fewer blocks moved off the card is more resident and the wall is the
+minimum.
+
+**The recommendation card ranks the same way.** `recommend.recommend()` asks
+`mode_axis()` which knob the category on screen leaves free and hands the surviving rows
+to the same `bench.pick_extreme()` the stages promote with — so "the best measured
+config" on the plan page and the config a campaign would carry forward are the same row
+by construction, not by two places agreeing to rank the same way. Outside the two-plan
+regime the card falls back to fastest-wins, because nothing has been left free.
 
 Three rules make it safe:
 

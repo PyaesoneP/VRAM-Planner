@@ -1465,6 +1465,48 @@ def comparable(r, model, base, n_predict=None, repeat=None, prompt_id=None,
     return True
 
 
+def axis_direction(axis):
+    """Which way `axis` runs toward the wall: "up" if larger costs more VRAM.
+
+    One lookup for every caller, over the same tables the OOM pruning walks, so
+    the ladder, the promotion and the recommendation cannot disagree about which
+    end of an axis is the good end. "down" is the pair of knobs that measure how
+    much has been EXILED - --n-cpu-moe and -ot - where fewer blocks moved off the
+    card is more resident and the wall is the minimum.
+    """
+    return (_MONOTONE_AXES.get(axis) or _MONOTONE_MOE.get(axis)
+            or _MONOTONE_FFN.get(axis) or "up")
+
+
+def pick_extreme(cand, axis, direction=None):
+    """The row at the wall along `axis`, ties broken toward the faster one.
+
+    Split out of best_config() because the recommendation asks the same question
+    of the same rows: on an axis that is monotone in VRAM the value worth having
+    is the one at the wall, and ranking those rows by tok/s ranks jitter - a
+    27B dense model moves 4.2% of tok/s across a DOUBLING of context, and
+    downward, so fastest-wins promotes the SMALLEST window in the one mode whose
+    whole purpose is the largest.
+
+    STAGE_EXTREME_SLACK is the guard that keeps that from being blind: a rung
+    that loaded and then ran far slower than its neighbours is not "the largest
+    that fits", it is a different failure, and it is dropped before the extreme
+    is taken. Callers pass rows they have already gated with trustworthy() and
+    comparable(); this only orders them.
+    """
+    if not cand:
+        return None
+    direction = direction or axis_direction(axis)
+    quickest = max(r["tok_s"] for r in cand)
+    pool = [r for r in cand
+            if r["tok_s"] >= quickest * (1.0 - STAGE_EXTREME_SLACK)] or cand
+
+    def val(r):
+        return (r.get("config") or {}).get(axis) or 0
+    return (max(pool, key=lambda r: (val(r), r["tok_s"])) if direction == "up"
+            else min(pool, key=lambda r: (val(r), -r["tok_s"])))
+
+
 def best_config(rows, model, base, n_predict=None, repeat=None,
                 incumbent_tok_s=None, margin=CHAIN_MARGIN, prompt_id=None,
                 template_id=_ANY, swept="", axis=None, objective="fastest"):
@@ -1496,20 +1538,7 @@ def best_config(rows, model, base, n_predict=None, repeat=None,
     if not cand:
         return None, None
     if objective == "extreme" and axis:
-        # "up" means the value costs more VRAM as it rises, so the wall is its
-        # maximum; "down" is n_cpu_moe, where fewer experts exiled is more
-        # resident and the wall is its minimum. Read from the same tables the
-        # OOM pruning uses, so the walk and the promotion cannot disagree.
-        direction = _MONOTONE_AXES.get(axis) or _MONOTONE_MOE.get(axis) or "up"
-        quickest = max(r["tok_s"] for r in cand)
-        pool = [r for r in cand
-                if r["tok_s"] >= quickest * (1.0 - STAGE_EXTREME_SLACK)] or cand
-
-        def val(r):
-            return (r.get("config") or {}).get(axis) or 0
-        # Ties on the axis break toward the faster row, in both directions.
-        win = (max(pool, key=lambda r: (val(r), r["tok_s"])) if direction == "up"
-               else min(pool, key=lambda r: (val(r), -r["tok_s"])))
+        win = pick_extreme(cand, axis)
     else:
         win = max(cand, key=lambda r: r["tok_s"])
         if incumbent_tok_s and win["tok_s"] <= incumbent_tok_s * (1.0 + margin):
@@ -2566,10 +2595,9 @@ def _spec_retry(c, row, facts, tries, drafter=None, axis=None):
     # Which way is "freer" is not per-axis knowledge, it is the monotone
     # direction the OOM pruning already uses: an axis tagged "up" costs more
     # VRAM as it rises, so freeing means going down; "down" axes (n_cpu_moe,
-    # n_cpu_ffn) free VRAM by going up. Reading it from the same tables is what
+    # n_cpu_ffn) free VRAM by going up. Reading it from the same table is what
     # keeps the walk and the pruning from ever disagreeing.
-    direction = _MONOTONE_AXES.get(axis) or _MONOTONE_MOE.get(axis) or \
-        _MONOTONE_FFN.get(axis) or "up"
+    direction = axis_direction(axis)
     if axis == "ctx":
         r = _spec_ctx_rung(st["rung"])
         if r is None:

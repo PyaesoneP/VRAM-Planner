@@ -178,6 +178,12 @@ input:focus,select:focus{outline:none;border-color:var(--wt)}
 .chip:hover{color:var(--ink)}
 .chip[aria-pressed="true"]{border-color:var(--kv);color:var(--kv)}
 
+/* The category chips are three answers to one question, not a list of presets,
+   so they share the row rather than hugging their labels - and the selected one
+   is filled, because unlike a context preset there is always exactly one. */
+.modechips .chip{flex:1 1 0;text-align:center;padding:6px 9px}
+.modechips .chip[aria-pressed="true"]{background:var(--sunk)}
+
 details.adv{margin-top:6px;border-top:1px dashed var(--line);padding-top:var(--s3)}
 details.adv > summary{
   cursor:pointer;color:var(--muted);font-size:var(--t-small);font-family:var(--mono);
@@ -283,6 +289,7 @@ details.adv[open] > summary::before{transform:rotate(90deg)}
   padding:3px 10px;border-radius:999px;border:1px solid var(--line2);color:var(--muted);
 }
 .pill.ok{border-color:var(--ok);color:var(--ok)}
+.rec-head .pills{display:flex;align-items:center;gap:6px;flex-wrap:wrap;justify-content:flex-end}
 .rec-cfg{
   font-size:var(--t-hero);font-weight:600;color:var(--ink);
   margin:var(--s3) 0 var(--s2);line-height:1.2;overflow-wrap:anywhere;

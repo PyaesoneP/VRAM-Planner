@@ -70,6 +70,30 @@
       </div>
 
       <div class="field">
+        <label id="planmodelabel">Plan for</label>
+        <div class="chips modechips" id="planmodechips" role="group"
+             aria-labelledby="planmodelabel"></div>
+        <p class="hint">A model too big for the card has no single best split &mdash; it has one
+          per question, and this is the question. <b>Auto</b> takes the speed plan whenever it
+          already covers the context above, and the context plan when it does not.
+          <details class="why"><summary>what each one gives up</summary>
+            <b>Speed</b> keeps every block&rsquo;s attention and KV on the GPU and exiles every
+            dense FFN to RAM (<span class="mono">-ngl all</span> +
+            <span class="mono">-ot</span>): nothing is left to pay with, so the context becomes
+            whatever still fits. <b>Context</b> holds the window you typed above and walks
+            <span class="mono">-ngl</span> down until it fits, paying in layers.
+            <br><br>The choice also decides what &ldquo;best&rdquo; means among the recorded
+            measurements: the recommendation at the top of the results takes the largest
+            <em>context</em> that loaded in the speed plan, and the most <em>layers</em> (or the
+            least FFN exiled) that loaded in the context plan &mdash; not the fastest row.
+            Decode re-reads the KV for the tokens present rather than the window allocated, so
+            tok/s barely moves across contexts and ranking by it ranks noise.
+            <br><br>A model that fits whole, and an MoE &mdash; whose
+            <span class="mono">--n-cpu-moe</span> has one answer &mdash; have no such choice, and
+            this is ignored for them.</details></p>
+      </div>
+
+      <div class="field">
         <label for="kv">KV cache quant</label>
         <select id="kv">
           <option value="f16">f16 &mdash; 2.00 bytes/element</option>

@@ -16,11 +16,23 @@
 const $ = id => document.getElementById(id);
 let SYS = null, MODELS = [], LAST = null, CTX_MAX = null;
 
-// Which of the two dense plans the fit card is showing. Null means "let the
-// planner decide", which is what the first analyze sends; after that it is the
-// user's pick, and it rides both the next analyze and the sweep so the campaign
-// optimises the plan on screen rather than the one the server would have chosen.
+// Which of the two dense plans is being asked for. Null is "auto" - let the
+// planner decide - and it is what the form opens on; anything else is the
+// user's pick, set either from the chips above Analyze or from the toggle over
+// the results, which are two renderings of this one variable.
+//
+// It rides the next analyze AND the sweep, so the campaign optimises the plan on
+// screen; and it decides what "best" means among the recorded rows, because the
+// two categories do not share an objective (see recommend.mode_axis).
 let PLAN_MODE = null;
+
+// Auto's label needs the plan to be on screen before it can say which way auto
+// went, so the chips are rebuilt whenever either the pick or the plan changes.
+const PLAN_MODES = [
+  ["auto",    "Auto",    "whichever answers the context above"],
+  ["speed",   "Speed",   "all layers on the GPU; context is what fits"],
+  ["context", "Context", "hold the context; pay in layers"]
+];
 
 const CALIB_TERMS = ["floor", "ctx", "act", "nofa"];
 
@@ -84,6 +96,7 @@ async function boot(){
     $("sys").innerHTML = h`<span class="muted small">system read failed: ${e}</span>`;
   }
   buildCtxChips();
+  drawPlanModeChips();
   loadBandwidth();
   showPastSweeps();
 }
@@ -265,6 +278,56 @@ function setCtxMax(nctx){
 }
 
 function setCtx(v){ $("ctx").value = v; markCtx(); }
+
+/* ------------------------------------------------------------- plan mode
+ *
+ * The category, asked BEFORE the analyze rather than discovered after it. The
+ * chips here and the toggle over the results write the same PLAN_MODE, so there
+ * is one piece of state and no way for the two to disagree - the failure mode
+ * of every second control that means the same thing.
+ *
+ * "auto" is null on the wire: the server reads an absent mode as "you decide"
+ * and answers with whichever plan covers the context that was asked for. */
+function drawPlanModeChips(){
+  const box = $("planmodechips");
+  if(!box) return;
+  const cur = PLAN_MODE || "auto";
+  const went = (LAST && LAST.plans) ? LAST.plan_mode : null;
+  box.innerHTML = PLAN_MODES.map(([id, label, hint]) =>
+    h`<button type="button" class="chip" data-action="set-plan-mode" data-mode="${id}"
+              title="${hint}" aria-pressed="${id === cur ? "true" : "false"}">${
+      label + (id === "auto" && !PLAN_MODE && went ? " · " + went : "")}</button>`).join("");
+}
+
+/** Set the category, and show it without a round trip where that is possible.
+ *
+ *  analyze() returns BOTH dense plans every time, so switching between them is
+ *  local: swap which one the cards read from and redraw. The recommendation is
+ *  not local - "best measured" means a different thing per category, so the
+ *  reconciliation has to be asked again - hence REC_FOR is cleared, which is
+ *  the only thing that can defeat loadRecommendation()'s identity guard when
+ *  the plan object itself has not changed. */
+function setPlanMode(m){
+  const next = (m === "auto") ? null : m;
+  if(next === PLAN_MODE) return;
+  PLAN_MODE = next;
+  if(!LAST){ drawPlanModeChips(); return; }
+  const plans = LAST.plans;
+  // Auto is not a plan, it is a rule - the same one analyze() applies: take the
+  // speed plan whenever it already covers the context that was asked for.
+  const sp = plans && plans.speed;
+  const pick = PLAN_MODE || (sp && (sp.max_ctx || 0) >= (LAST.inputs.context || 0)
+                             ? "speed" : "context");
+  if(plans && plans[pick] && LAST.plan_mode !== pick){
+    LAST.plan_mode = pick;
+    LAST.plan = plans[pick];
+    LAST.speed = LAST.plan.speed || LAST.speed;
+    REC_FOR = null;               // "best measured" means a different thing now
+  }
+  // Redrawn even when nothing was swapped: this model may have had no choice to
+  // offer, and the card that says so is the only thing that changed.
+  render(LAST);
+}
 
 function markCtx(){
   const cur = parseInt($("ctx").value) || 0;
@@ -477,6 +540,7 @@ const REC_KIND = {
   stale:     "conditions",
   samplers:  "samplers",
   depth:     "depth",
+  regime:    "layout",
   untrusted: "no usable rows"
 };
 
@@ -541,9 +605,13 @@ function renderRecommendation(){
 
   const measured = REC.source === "measured";
   const cfg = REC.config || {};
-  const badge = measured
-    ? '<span class="pill ok">● measured</span>'
-    : '<span class="pill">estimated</span>';
+  // Two pills in one flex child: .rec-head is space-between, so loose siblings
+  // would spread the badges across the header instead of grouping them right.
+  const badge = '<span class="pills">'
+    + (REC.mode ? h`<span class="pill">for ${REC.mode}</span>` : "")
+    + (measured ? '<span class="pill ok">● measured</span>'
+                : '<span class="pill">estimated</span>')
+    + '</span>';
 
   // The headline number differs by source on purpose: a measured row has a real
   // tok/s and a real process VRAM reading, and an estimate has neither - showing
@@ -566,13 +634,23 @@ function renderRecommendation(){
         cfgLine(REC.predicted)}</b>.</p>`
     : "";
 
+  // What "best" meant here. The two categories do not share an objective, and a
+  // card that showed the fastest row under a CONTEXT plan would be recommending
+  // the smallest window in the mode whose whole purpose is the largest one.
   const foot = measured
-    ? h`<p class="note">From the fastest recorded row this campaign can stand behind — rows that
-        spilled, looped or copied the prompt back are never eligible, however fast they read.
-        ${REC.n_trusted} of ${REC.n_rows} recorded row${REC.n_rows === 1 ? "" : "s"} qualified.</p>`
+    ? h`<p class="note">The best recorded row for <b>${REC.mode || "this plan"}</b>: ${
+        REC.goal || "the fastest row measured"}, among the rows this campaign can stand behind —
+        rows that spilled, looped or copied the prompt back are never eligible, however fast
+        they read. ${REC.n_trusted} of ${REC.n_rows} recorded row${
+        REC.n_rows === 1 ? "" : "s"} qualified.${
+        REC.objective === "extreme"
+          ? " Not the fastest row: decode re-reads the KV for the tokens present rather than"
+            + " the window allocated, so tok/s barely moves along this axis and ranking by it"
+            + " ranks noise."
+          : ""}</p>`
     : h`<p class="note">Nothing measured for this model yet, so this is the planner's arithmetic:
-        the <b>largest split that fits</b>, which is not the same question as the fastest.
-        Step 2 measures the difference.</p>`;
+        the <b>largest split that fits</b>, which is not the same question as ${
+        REC.goal || "the fastest"}. Step 2 measures the difference.</p>`;
 
   return h`<section class="card rec ${measured ? "is-measured" : ""}">
     <div class="rec-head"><h2>Run this</h2>${raw(badge)}</div>
@@ -616,7 +694,17 @@ function recToScript(){
  * one, so flipping is free - no round trip, and every card below re-renders
  * from the plan that was picked. */
 function renderModes(r){
-  if(!r.plans || !r.plans.speed || !r.plans.context) return "";
+  if(!r.plans || !r.plans.speed || !r.plans.context){
+    // A mode was asked for and there was no choice to make. Saying so beats a
+    // control that silently does nothing: an MoE's --n-cpu-moe has one answer,
+    // and a model that fits whole has no split to trade at all.
+    if(!PLAN_MODE) return "";
+    return h`<section class="card modes"><p class="note">Planned for
+      <b>${PLAN_MODE}</b>, but this model has only one answer &mdash; ${
+      r.is_moe ? "its experts move with --n-cpu-moe, which trades nothing against the context"
+               : "it fits at the context you asked for"}. The choice applies to a dense model
+      that does not fit.</p></section>`;
+  }
   const mode = r.plan_mode || "speed";
   const btn = (id, title, sub) => h`<button type="button" class="modebtn${
     mode === id ? " on" : ""}" data-action="plan-mode" data-mode="${id}"
@@ -635,7 +723,8 @@ function renderModes(r){
     <p class="note">Both exile every block&rsquo;s dense FFN to RAM (<b>-ot</b>); they differ in
       what is left free. <b>Speed</b> pins every layer on the GPU so all the KV stays in VRAM
       and the window is whatever still fits. <b>Context</b> holds the window you asked for and
-      gives up layers to pay for it.</p>
+      gives up layers to pay for it. The same choice sits above <b>Analyze fit</b>, and it also
+      decides which recorded row <b>Run this</b> calls the best one.</p>
   </section>`;
 }
 
@@ -970,6 +1059,7 @@ function render(r){
   }
   $("out").innerHTML = h`<div id="rec"></div>` + renderStepper(r) +
                        renderGlossary() + panel;
+  drawPlanModeChips();
   drawRecommendation();
   // Needs the recorded rows and a round trip, and the plan is what the button
   // was pressed for - so it fills in after the page rather than holding it up.
@@ -1601,7 +1691,11 @@ function sweepForm(pf){
       ${raw(sweepStage("a", "A &middot; the wall", (LAST && LAST.is_moe)
         ? "How few experts can sit on the CPU before it spills (--n-cpu-moe)"
         : (LAST && LAST.plan_mode === "context")
-          ? "How many blocks fit at this context before it spills (-ngl)"
+          // Named the way ngl_ladder() picks it: the context plan pays in the
+          // cheapest currency first, so the axis is -ot while every block still
+          // fits and only becomes -ngl once a full exile is not enough.
+          ? "How little has to leave the card at this context before it spills "
+            + "(-ot, then -ngl)"
           : "How large a context fits with every block on the GPU (-c)"))}
       ${raw(sweepStage("c", "C &middot; ubatch", "Physical batch size"))}
       ${raw(sweepStage("d", "D &middot; speculation", "MTP and DFlash draft depths, plus the n-gram types"))}
@@ -2656,18 +2750,10 @@ const ACTIONS = {
                          if(stepNow() !== "script"){ setStep("script"); return; }
                          drawSweep({ grid: false, script: true, history: true }); },
   "set-step":    el => setStep(el.dataset.step),
-  // Both plans are already on LAST, so the flip is local: swap which one the
-  // cards read from and redraw. PLAN_MODE then rides the next analyze and the
-  // sweep, so the campaign optimises the plan that is on screen.
-  "plan-mode":   el => {
-    const m = el.dataset.mode;
-    if(!LAST || !LAST.plans || !LAST.plans[m] || LAST.plan_mode === m) return;
-    PLAN_MODE = m;
-    LAST.plan_mode = m;
-    LAST.plan = LAST.plans[m];
-    LAST.speed = LAST.plan.speed || LAST.speed;
-    render(LAST);
-  },
+  // The toggle over the results and the chips above Analyze are the same
+  // control: both go through setPlanMode(), which owns the one variable.
+  "plan-mode":     el => setPlanMode(el.dataset.mode),
+  "set-plan-mode": el => setPlanMode(el.dataset.mode),
   "sweep-open":  el => openCampaign(el.dataset.id),
   "sweep-del":     el => askDelete(el.dataset.id),
   "sweep-del-yes": el => doDelete(el.dataset.id),

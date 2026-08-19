@@ -3212,6 +3212,110 @@ def _run_suite(require_refs, tmp, skipped_real):
         print("  RECOMM measured wins, spilled never does, every delta named    %s"
               % ("OK" if rec_ok else "FAIL"))
         rec_all = budget_ok and verdict_ok and rec_ok
+
+        # 4) "Best" is per CATEGORY, because the two categories do not share an
+        #    objective. Each dense mode pins one placement and leaves exactly one
+        #    knob free, and along a knob that is monotone in VRAM the value worth
+        #    having is the one at the wall - not the one that read fastest. Rows
+        #    move ~4% of tok/s across a DOUBLING of context, and downward, so
+        #    ranking a SPEED campaign by tok/s recommends the smallest window in
+        #    the one mode whose whole purpose is the largest.
+        from vram_planner.recommend import mode_axis
+        from vram_planner.bench import axis_direction, pick_extreme
+
+        nL = 48
+        sp_pr = {"plan_mode": "speed",
+                 "plan": {"kind": "dense_speed", "mode": "speed", "n_gpu_layers": nL,
+                          "n_cpu_ffn": nL, "max_ctx": 65536, "fits_fully": False},
+                 "config": {"n_layers": nL},
+                 "inputs": {"context": 32768, "kv_type": "f16", "n_ubatch": 512,
+                            "n_seq": 1, "flash_attn": True, "vram_budget_mib": 16376,
+                            "gpu_reserve_mib": 512, "safety_pct": 5}}
+        s_base = {"kv": "f16", "fa": True, "seq": 1, "fill": 2048}
+        # The trap, exactly as measured: the SMALLEST window is the fastest row,
+        # by a margin far inside the noise the slack is sized for.
+        s_rows = [{"model": "m.gguf", "status": "ok", "tok_s": t, "proc_vram_mib": 15000,
+                   "config": dict(s_base, ctx=c, ngl=nL, n_cpu_ffn=nL, ub=512)}
+                  for c, t in ((32768, 9.10), (65536, 8.95), (131072, 8.80))]
+        s_got = recommend(sp_pr, s_rows, sweep_budget_mib=sweep_eff)
+        mode_ok = (mode_axis(sp_pr) == ("ctx", "up")
+                   and s_got["axis"] == "ctx" and s_got["objective"] == "extreme"
+                   and s_got["source"] == "measured"
+                   # the largest window that loaded, not the fastest row
+                   and s_got["config"]["ctx"] == 131072
+                   and "context" in s_got["goal"])
+        # ...and the slack is not blind: a window that loaded and then ran off a
+        # cliff is a different failure, not "the largest that fits".
+        s_thrash = s_rows[:2] + [dict(s_rows[2], tok_s=2.0,
+                                      config=dict(s_rows[2]["config"]))]
+        mode_ok = mode_ok and recommend(sp_pr, s_thrash,
+                                        sweep_budget_mib=sweep_eff)["config"]["ctx"] == 65536
+
+        # CONTEXT holds the window and pays in the cheapest currency first: while
+        # every block still fits the free knob is the -ot exile and LESS exiled is
+        # better, so the wall runs downward. That direction was wrong until
+        # axis_direction() learned the dense table - it read n_cpu_ffn as "up"
+        # and promoted the MOST exiled rung, the opposite of the answer.
+        cx_pr = {"plan_mode": "context",
+                 "plan": {"kind": "dense_context", "mode": "context", "n_gpu_layers": nL,
+                          "n_cpu_ffn": 30, "max_ctx": 32768, "fits_fully": False},
+                 "config": {"n_layers": nL},
+                 "inputs": dict(sp_pr["inputs"])}
+        c_rows = [{"model": "m.gguf", "status": "ok", "tok_s": t, "proc_vram_mib": 15000,
+                   "config": dict(s_base, ctx=32768, ngl=nL, n_cpu_ffn=f, ub=512)}
+                  for f, t in ((26, 8.20), (30, 8.30), (40, 8.35))]
+        c_got = recommend(cx_pr, c_rows, sweep_budget_mib=sweep_eff)
+        mode_ok = mode_ok and (mode_axis(cx_pr) == ("n_cpu_ffn", "down")
+                               and axis_direction("n_cpu_ffn") == "down"
+                               and c_got["config"]["n_cpu_ffn"] == 26
+                               and "FFN" in c_got["goal"])
+        # ...and once a full exile is not enough, whole blocks leave and the free
+        # knob becomes -ngl, which runs the other way. Same rule as ngl_ladder().
+        cx_deep = {"plan_mode": "context",
+                   "plan": dict(cx_pr["plan"], n_gpu_layers=31, n_cpu_ffn=nL),
+                   "config": {"n_layers": nL}, "inputs": dict(sp_pr["inputs"])}
+        mode_ok = mode_ok and mode_axis(cx_deep) == ("ngl", "up")
+
+        # A category exempts its own axis from the staleness gate, and nothing
+        # else: a speed plan did not ASK for a context, it proposed one, so a row
+        # that found a larger window is the answer improving. A row at another KV
+        # quant is still a different experiment.
+        wrong_kv = [dict(s_rows[2], config=dict(s_rows[2]["config"], kv="q8_0"))]
+        kv_got = recommend(sp_pr, wrong_kv, sweep_budget_mib=sweep_eff)
+        mode_ok = mode_ok and "stale" in {d["kind"] for d in kv_got["deltas"]}
+        mode_ok = mode_ok and "stale" not in {d["kind"] for d in s_got["deltas"]}
+
+        # Off the two-plan regime nothing is left free, so fastest-wins stands -
+        # which is what every MoE and every fits-whole plan gets, and what the
+        # cases above this one are still asserting.
+        mode_ok = mode_ok and mode_axis(pr) == (None, None)             and recommend(pr, [win], sweep_budget_mib=15864)["objective"] == "fastest"
+        # ...and a plan_mode with no matching plan is not a category either: the
+        # browser can hold "speed" while looking at an MoE.
+        mode_ok = mode_ok and mode_axis({"plan_mode": "speed",
+                                         "plan": {"kind": "moe"}}) == (None, None)
+        # The free axis only means something among rows that pinned everything
+        # else the way this category does. Measured on the real store: the SPEED
+        # card answered "the largest context that loaded" with a row at -ngl 28,
+        # a CONTEXT campaign's row where most of the model is in RAM and 128k
+        # naturally fits - the other plan's answer wearing this plan's badge.
+        other_regime = {"model": "m.gguf", "status": "ok", "tok_s": 4.0,
+                        "proc_vram_mib": 15000,
+                        "config": dict(s_base, ctx=262144, ngl=20, n_cpu_ffn=0, ub=512)}
+        pin_got = recommend(sp_pr, s_rows + [other_regime], sweep_budget_mib=sweep_eff)
+        mode_ok = mode_ok and (pin_got["config"]["ctx"] == 131072
+                               and pin_got["config"]["ngl"] == nL
+                               and "regime" not in {d["kind"] for d in pin_got["deltas"]})
+        # ...and with nothing measured in this layout at all it still answers,
+        # saying which question the rows it had were answering instead.
+        only_other = recommend(sp_pr, [other_regime], sweep_budget_mib=sweep_eff)
+        mode_ok = mode_ok and (only_other["source"] == "measured"
+                               and "regime" in {d["kind"] for d in only_other["deltas"]})
+        # pick_extreme() is the same function the campaign promotes with, so the
+        # card and the sweep cannot land on different rows.
+        mode_ok = mode_ok and pick_extreme(s_rows, "ctx")["config"]["ctx"] == 131072             and pick_extreme([], "ctx") is None
+        print("  RECMODE speed takes the widest window, context the least exiled  %s"
+              % ("OK" if mode_ok else "FAIL"))
+        rec_all = rec_all and mode_ok
     except Exception as e:
         rec_all = False
         print("  RECOMMEND raised %s: %s  FAIL" % (type(e).__name__, e))

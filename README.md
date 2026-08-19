@@ -393,9 +393,32 @@ asked for and walks `-ngl` down until it fits, with the same FFN exile. On an Mo
 `_plan_moe` searches up from `--n-cpu-moe 0` for the first split that fits. All of
 them stop at the first feasible config. That is a **memory** answer.
 
-**The sweep returns the fastest row it measured.** That is a **speed** answer,
-and the two coincide only if throughput rises monotonically with offload. It
-does not:
+**Which question you are asking is a control, not a discovery.** *Plan for* sits
+in tier 1 of the form, above **Analyze fit**: *Auto*, *Speed*, *Context*. Auto —
+the default — takes the speed plan whenever it already covers the context you
+typed, and the context plan when it does not. `analyze()` returns **both** plans
+whichever one you pick, so the toggle over the results flips between them with no
+round trip; the chips and that toggle are two renderings of one variable, and it
+rides the next analyze and the speed campaign as well, so the sweep optimises the
+plan you are looking at. A model that fits whole, and an MoE — whose
+`--n-cpu-moe` has one answer — have no such choice, and the card says so rather
+than leaving a control that silently does nothing.
+
+**The sweep returns the best row it measured** — and what "best" means follows
+the category, because the two do not share an objective. Each dense plan pins one
+placement and leaves exactly one knob free: the **context** in the speed plan,
+the **`-ot` exile** (then `-ngl`, once a full exile is not enough) in the context
+plan. Along a knob that is monotone in VRAM the value worth having is the one at
+the **wall**, not the one that read fastest — measured rows move 4.2% of tok/s
+across a *doubling* of context, and downward, so ranking a speed campaign by
+tok/s recommends the smallest window in the mode whose whole purpose is the
+largest one. So the recommendation ranks the way the campaign promotes:
+`recommend.mode_axis()` names the free knob and `bench.pick_extreme()` takes the
+extreme along it, with `STAGE_EXTREME_SLACK` refusing a rung that loaded and then
+thrashed. Off the two-plan regime nothing is left free and fastest-wins stands.
+
+Either way it is a **measured** answer, and it coincides with the plan only if
+throughput rises monotonically with offload. It does not:
 
 - a row that spills into shared system memory *loads*, reports `ok`, and runs
   off a cliff — so the biggest thing that "fits" can be the slowest thing you
@@ -429,7 +452,10 @@ Three things changed:
    plan, including the ones that did not.
 3. **`recommend.recommend()` reconciles the two.** A trustworthy measured row
    supersedes the estimate; rows that spilled, looped or copied the prompt back
-   are never eligible however fast they read. When the two answers differ, the
+   are never eligible however fast they read. It answers for the **category on
+   screen**: the card is badged `for speed` / `for context` and says which
+   criterion picked the row — *the largest context that loaded*, *the least dense
+   FFN exiled to RAM that loaded* — and switching the toggle re-asks it. When the two answers differ, the
    card at the top of the page names each reason — `objective`, `budget`,
    `axis` (knobs no plan can predict), `depth`, `samplers` and `stale` — instead
    of leaving you to notice that step 1 said `ncmoe 32` and step 2's best row

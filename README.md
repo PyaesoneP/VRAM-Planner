@@ -168,13 +168,14 @@ is the one worth running after a change.
 | flag | |
 |---|---|
 | `--speed-sweep` | drive `llama-server` across a grid, recording how fast it generates |
-| `--speed-stages LETTERS` | which stages run, default `abcde` — A layer wall, B projector, C ubatch, D speculation, E dense-FFN `-ot` offload |
+| `--speed-stages LETTERS` | which stages run, default `acd` — A the wall, C ubatch, D speculation |
+| `--speed-mode auto\|speed\|context` | dense only: which question stage A answers — `speed` sweeps context at `-ngl` all, `context` sweeps `-ngl` at a fixed context |
 | `--speed-axes AXIS=V,V` | sweep exact values as a cross product instead of the stages |
 | `--speed-ctx N` / `--speed-kv TYPE` | freeze context and KV quant for the campaign |
 | `--speed-fill TOKENS` | prompt depth to measure at — decode slows as context fills, so this conditions every row |
 | `--speed-chain` | build each stage from the previous stage's winner rather than one fixed baseline |
 | `--speed-rounds N` | with `--speed-chain`: re-run the stages from the winner |
-| `--speed-ot N` | pin the first N blocks' dense FFN tensors to the CPU (`-ot`); drops stage E — dense models only |
+| `--speed-ot N` | pin the first N blocks' dense FFN tensors to the CPU (`-ot`) instead of the plan mode's every-block pin — dense models only |
 | `--speed-spec-kv TYPE` | freeze the draft cache's quant for the campaign (`-ctkd/-ctvd`); f16 by default — q8_0 halves what speculation costs, at whatever the acceptance rate turns out to be |
 | `--speed-verify` | after the campaign, load the winner at the production config |
 | `--speed-verify-overrides AXIS=V,V` | what "production" means, e.g. `spec=draft-mtp spec_n_max=2` |
@@ -384,10 +385,13 @@ too much to be worth pretending about.
 The planner and the speed sweep answer different questions, and for a long time
 neither of them said so.
 
-**The planner returns the largest split that fits.** `_plan_dense` searches down
-from every layer for the first `-ngl` whose total lands under the budget;
-`_plan_moe` searches up from `--n-cpu-moe 0` for the first that does. Both stop
-at the first feasible config. That is a **memory** answer.
+**The planner returns the largest split that fits.** On a dense model that does
+not fit, it returns two of them — one per question. *Plan for speed* pins `-ngl`
+at every block and exiles every block's dense FFN to RAM (`-ot`), then solves for
+the largest context that still fits; *plan for context* holds the context you
+asked for and walks `-ngl` down until it fits, with the same FFN exile. On an MoE
+`_plan_moe` searches up from `--n-cpu-moe 0` for the first split that fits. All of
+them stop at the first feasible config. That is a **memory** answer.
 
 **The sweep returns the fastest row it measured.** That is a **speed** answer,
 and the two coincide only if throughput rises monotonically with offload. It
@@ -638,10 +642,11 @@ tok/s a long way and are invisible to it, so there is a second harness for them:
   The planner can price what speculation *costs* — a draft cache, quant and all
   (llama.cpp keeps it f16 whatever `--cache-type-k` says; `--speed-spec-kv q8_0` pins the
   draft cache's own `-ctkd/-ctvd` pair) — and nothing of what it saves.
-- **The dense-FFN `-ot` split.** The planner prices "KV on GPU, FFN in RAM" (stage E of
-  the sweep) — pinning whole blocks' FFN tensors to the CPU with `--override-tensor`
-  frees VRAM without losing KV, which layer offload always drags off with it. Its real
-  per-token cost is exactly the sort of thing the roofline should not be believed for.
+- **The dense-FFN `-ot` split.** Both dense plan modes are built on it — pinning whole
+  blocks' FFN tensors to the CPU with `--override-tensor` frees VRAM without losing KV,
+  which layer offload always drags off with it. Its real per-token cost is exactly the
+  sort of thing the roofline should not be believed for, which is why the mode you pick
+  decides what stage A of the sweep then measures.
 - **Prompt processing**, which is not modelled anywhere here on purpose.
 
 Run it **from the web UI** — step 2, *Measure real speed* — or from the command line:
@@ -653,6 +658,8 @@ python -m vram_planner --speed-sweep --speed-chain # each stage built from what 
 python -m vram_planner --speed-report              # every row, fastest first
 python -m vram_planner --speed-report --insights   # what the campaigns FOUND
 python -m vram_planner --speed-sweep --speed-axes "ngl=28,30 spec=draft-mtp spec_n_max=1,2,3"
+python -m vram_planner --speed-sweep --speed-mode speed    # sweep context at -ngl all
+python -m vram_planner --speed-sweep --speed-mode context  # sweep -ngl at a fixed context
 python -m vram_planner --speed-sweep --speed-ot 8   # pin FFN of the first 8 blocks to CPU
 ```
 

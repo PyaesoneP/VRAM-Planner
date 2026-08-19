@@ -233,6 +233,23 @@ details.adv[open] > summary::before{transform:rotate(90deg)}
 }
 
 .card.lead{border-color:var(--line2)}
+
+/* The two dense plans. A segmented pair rather than a chip row: these are
+   mutually exclusive answers to the same question, and each carries the number
+   that makes the trade legible before you click it. */
+.card.modes{padding-bottom:var(--s3)}
+.moderow{display:flex;gap:8px;flex-wrap:wrap;margin:7px 0 4px}
+.modebtn{
+  flex:1 1 12em;display:flex;flex-direction:column;gap:2px;align-items:flex-start;
+  padding:9px 12px;text-align:left;border:1px solid var(--line);
+  border-radius:var(--radius-sm);background:var(--panel2);color:var(--muted);
+  cursor:pointer;
+}
+.modebtn b{color:var(--ink);font-size:var(--t-small);letter-spacing:.03em}
+.modebtn span{font-family:var(--mono);font-size:var(--t-small);color:var(--dim)}
+.modebtn:hover{border-color:var(--line2)}
+.modebtn.on{border-color:var(--kv);background:var(--sunk)}
+.modebtn.on b, .modebtn.on span{color:var(--kv)}
 .verdict{border-left:3px solid var(--rsv);padding-left:var(--s4)}
 .verdict.ok{border-color:var(--ok)}
 .verdict.warn{border-color:var(--warn)}

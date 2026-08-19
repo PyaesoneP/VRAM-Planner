@@ -163,10 +163,22 @@ def main():
                          "n_cpu_ffn is the -ot axis: n_cpu_ffn=0,4,8 pins the first "
                          "blocks' dense FFN to the CPU. spec_kv is the draft "
                          "cache quant: spec_kv=f16,q8_0")
-    ap.add_argument("--speed-stages", default="abcde", metavar="LETTERS",
-                    help="with --speed-sweep: which stages to run (a=ngl wall, "
-                         "b=projector placement, c=ubatch, d=speculation, "
-                         "e=dense-FFN tensor offload via -ot, dense models only)")
+    # Kept a literal rather than bench.STAGES: cli.py imports bench lazily, and
+    # an argparse default would drag the whole subprocess-heavy module into
+    # every --help. selftest asserts the two agree.
+    ap.add_argument("--speed-stages", default="acd", metavar="LETTERS",
+                    help="with --speed-sweep: which stages to run (a=the wall, "
+                         "c=ubatch, d=speculation). Stage A's axis follows "
+                         "--speed-mode: context for a speed plan, -ngl for a "
+                         "context plan, --n-cpu-moe on an MoE")
+    ap.add_argument("--speed-mode", default="auto", metavar="MODE",
+                    choices=("auto", "speed", "context"),
+                    help="with --speed-sweep, dense models: which question stage A "
+                         "answers. 'speed' keeps every block's attention and KV on "
+                         "the GPU with the dense FFN exiled (-ngl all, -ot) and "
+                         "sweeps CONTEXT for the largest window that loads; "
+                         "'context' holds the context and sweeps -ngl. 'auto' asks "
+                         "the planner which one this model and card land in")
     ap.add_argument("--speed-fill", type=int, default=None, metavar="TOKENS",
                     help="with --speed-sweep: prompt length to measure at")
     ap.add_argument("--speed-fills", nargs="+", type=int, default=None,
@@ -201,8 +213,8 @@ def main():
                     help="with --speed-sweep: pin the first N blocks' dense FFN "
                          "tensors to the CPU (-ot) for the whole campaign - the "
                          "mode the planner prices as 'KV on GPU, FFN in RAM'. "
-                         "Stage E sweeps this axis; pinning it drops stage E, "
-                         "like the projector pin drops stage B. Dense models only")
+                         "Both plan modes pin every block, so this is only for "
+                         "measuring a different split. Dense models only")
     ap.add_argument("--speed-verify", action="store_true",
                     help="with --speed-sweep: after the campaign, load the winner "
                          "once more at the PRODUCTION config and only certify it if "
@@ -375,6 +387,8 @@ def main():
                             reasoning=args.reasoning,
                             reasoning_preserve=args.reasoning_preserve,
                             drafter=args.drafter, ot=args.speed_ot,
+                            plan_mode=(None if args.speed_mode == "auto"
+                                       else args.speed_mode),
                             on_server=on_server, skip_count=skip_count)
         finally:
             if skip_stop:

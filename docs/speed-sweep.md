@@ -66,7 +66,7 @@ only in the driving:
 | | CLI | browser |
 |---|---|---|
 | context / KV quant | `--speed-ctx`, `--speed-kv` | taken from the form and frozen |
-| stages | `--speed-stages abcd` | tick boxes |
+| stages | `--speed-stages acd` | tick boxes |
 | preview | `--dry-run` | **Preview grid** |
 | progress | printed rows | live table, ordered as measured |
 | stopping | Ctrl-C | **Stop**, which lands between configs |
@@ -102,15 +102,36 @@ for you (§3.1).
 
 | stage | what it varies | why it is first/last |
 |---|---|---|
-| **A** | `-ngl` (dense) or `--n-cpu-moe` (MoE) | Finds the wall. Every later comparison is meaningless at a config that spills. |
-| **B** | projector in VRAM vs system RAM | Only if the model ships an `mmproj`. Moves the ceiling, so it re-walks stage A's ladder. |
+| **A** | the wall — see below for which knob it is made of | Finds the wall. Every later comparison is meaningless at a config that spills. |
 | **C** | `-ub` (physical batch) | Mostly a *prefill* knob; costs VRAM, so it interacts with the wall. |
-| **D** | `--spec-type` and draft depth | Needs the winner of A–C to be settled first. |
-| **E** | `-ot` dense FFN tensor pin (dense only) | The counterpart of stage A's `--n-cpu-moe`: what the plan's "KV on GPU, FFN in RAM" mode actually costs — and, under `--speed-chain`, what the freed tensors buy back in layers (§5.2). |
+| **D** | `--spec-type` and draft depth | Needs the winner of A and C to be settled first. |
+
+Stage A's axis is not fixed — it is whichever knob the wall is made of for the question
+being asked (`--speed-mode`, §5):
+
+| model / mode | pinned | stage A ladders | the wall is |
+|---|---|---|---|
+| dense, `--speed-mode speed` | `-ngl` all, `-ot` all blocks | **context** | the largest window that loads |
+| dense, `--speed-mode context` | context | **`-ot`**, or `-ngl` — see below | the smallest FFN exile, or the largest layer count |
+| MoE | `-ngl` all | **`--n-cpu-moe`** | the smallest expert offload that fits |
 
 Stage A's ladder is **seeded from the planner** — `plan.analyze()` is asked where the
 split falls for this model, this card and this context, and the ladder brackets that.
 You do not hand-pick rungs.
+
+The context mode has **two shapes**, and stage A takes whichever one the plan
+landed in. Context is paid for in the cheapest currency first: exiling dense FFN
+(`-ot`) frees VRAM without costing any KV, so while every block still fits on the GPU
+the axis is `n_cpu_ffn` and the wall is the **smallest** exile that loads — the most FFN
+kept in VRAM. That is the same shape as an MoE's `--n-cpu-moe` ladder and for the same
+reason. Only when a *full* exile still is not enough does the axis become `-ngl`, and
+whole blocks start leaving with their KV.
+
+**Stages B and E were retired.** B swept the projector's placement, which is a decision
+rather than a measurement: say where it goes on the plan form and both the plan and the
+campaign use that. E swept the dense-FFN `-ot` pin, which both plan modes now fix at
+every block — that pin is what *makes* them the modes they are, so there was no question
+left for a ladder to answer. `--speed-ot N` still pins some other count by hand.
 
 **Depth is not a stage.** It is the `--speed-fill` axis, and it matters more than any
 single setting (see §8). Run the top two or three configs again at a realistic fill:
@@ -180,23 +201,60 @@ Between stages the log says what it decided, including when it decided nothing:
 
 ```
 stage C round 1: 4 configs at ngl 31 ncmoe 0 ub 512 spec none
-  baseline -> ngl 31 ncmoe 0 ub 1024 spec none   (8.42 tok/s, stage C)
+  baseline -> ngl 31 ncmoe 0 ub 1024 spec none   (largest ub that loads: 1024, 8.42 tok/s, stage C)
 stage D round 1: 8 configs at ngl 31 ncmoe 0 ub 1024 spec none
   baseline unchanged: nothing beat 8.42 tok/s by more than 2%
 ```
 
+The parenthesis names the criterion that chose the row, because it is no longer the same
+one at every stage.
+
+**What "best" means is the stage's own question**, not one rule for the whole campaign:
+
+| stage | promotes | why |
+|---|---|---|
+| **A** | the value at the **wall** — largest `ctx` (speed mode) or `-ngl` (context mode) that loads; smallest `--n-cpu-moe` on an MoE | the axis is monotone in VRAM, so the value at the wall is the one worth having |
+| **C** | the **largest `-ub`** that loads | ubatch is a prefill knob; decode barely moves with it |
+| **D** | the **fastest** row, by more than 2% | a draft scheme's worth is its acceptance rate, and no ordering of depths implies it |
+
+Stages A and C used to rank by tok/s like stage D, and on the speed mode that was
+actively wrong. Decode re-reads the KV for the tokens actually **present** (`fill`), not
+for the window that was *allocated*, so tok/s across a context ladder is nearly flat —
+measured rows on a 27B dense model move **4.2% across a doubling of context**, and
+downward. Fastest-wins therefore promoted the *smallest* window on the ladder, giving up
+half the context for 4% of speed, in the one mode whose entire headline is "the largest
+context that still fits".
+
+The wall is still only taken from rows that **loaded cleanly**: an `oom` is not a
+candidate, and neither is a row that loaded and then spilled, looped or copied. A rung
+that loads but runs more than 5% below the fastest row on its ladder is refused too —
+that is not the wall, it is a different failure wearing the costume of a result.
+
 Three rules make it safe:
 
 - **Only what was measured under the same conditions competes.** Same model, GPU, backend
-  build, context, KV quant, fill depth, `n_predict` and `repeat`. A 2k-fill row must never
-  set the baseline for a 32k campaign — that is not a slower config, it is a different
-  experiment.
+  build, context, KV quant, draft-cache quant, fill depth, sequences, flash attention,
+  samplers, chat template, prompt corpus, `n_predict` and `repeat`. A 2k-fill row must
+  never set the baseline for a 32k campaign — that is not a slower config, it is a
+  different experiment.
+  *One exception*: in the dense **speed** mode, context is the axis stage A sweeps, so it
+  stops being part of what the campaign IS and becomes what it found. There — and only
+  there — rows at different contexts compete, and the winner's context is carried forward.
 - **Spilled and looping rows never carry forward.** They stay in the table, because they
   are evidence about where the wall is; they just cannot be the thing a baseline is drawn
   from, since a bad baseline bends every stage after it in one direction, silently.
 - **A challenger must win by more than 2%.** `tok_s` is a median of `repeat` passes, so a
   1% lead is jitter — and rebasing on jitter would make the campaign explore different
-  configs on two runs of the same machine.
+  configs on two runs of the same machine. This applies to stage D, the stage that ranks
+  by speed; "which value loaded" is not a speed measurement, so the margin does not gate
+  stages A and C.
+
+What actually carries forward is a fixed set of knobs — `ngl`, `ncmoe`, `n_cpu_ffn`, `ub`,
+the projector's placement and the speculation triple (`spec`, `spec_n_max`, `md`) — plus
+`ctx` in the speed mode. Everything else a row carries is the campaign's *definition*
+rather than its result, and a stage that changed one of those would be answering a
+different question than the one being asked. The two lists move together on purpose: an
+axis that competes must also be carried, or the winner is found and then thrown away.
 
 The baseline is re-read **from disk**, not from memory, so a campaign stopped after stage A
 and restarted tomorrow recovers stage A's winner instead of falling back to the planner.
@@ -289,8 +347,8 @@ card. Run stage A at two or three contexts, pick the shortest you can live with,
 tune everything else there.
 
 ```
-python -m vram_planner --speed-sweep --models MODEL --speed-ctx 32768  --speed-stages a
-python -m vram_planner --speed-sweep --models MODEL --speed-ctx 131072 --speed-stages a
+python -m vram_planner --speed-sweep --models MODEL --speed-ctx 32768  --speed-stages a --speed-mode context
+python -m vram_planner --speed-sweep --models MODEL --speed-ctx 131072 --speed-stages a --speed-mode context
 ```
 
 Quantising the KV cache buys layers the same way (`q8_0` is about half of `f16`) and
@@ -304,7 +362,7 @@ The harness detects this from the file; you do not pass a flag. But know what ch
 
 |  | dense | MoE |
 |---|---|---|
-| stage A axis | `-ngl` | `--n-cpu-moe`, at `-ngl` = all blocks |
+| stage A axis | context or `-ngl`, by `--speed-mode` | `--n-cpu-moe`, at `-ngl` = all blocks |
 | better direction | **higher** | **lower** |
 | the wall is | the largest value that fits | the smallest value that fits |
 
@@ -344,43 +402,34 @@ It is an axis like any other (`--speed-axes "spec=draft-mtp spec_kv=f16,q8_0"`),
 report can say what the smaller cache *bought* — and the answer is allowed to be "it
 saved VRAM and lost speed", because the acceptance rate is a measurement, not a price.
 
-### 5.2 Dense FFN offload (`-ot`) — the other way to free VRAM
+### 5.2 Dense FFN offload (`-ot`) — what both dense modes are built on
 
-Dense models have two knobs, not one. Stage A's `-ngl` moves **whole blocks** — attention,
-KV and FFN together — which is expensive per token, because every block's KV leaves VRAM
-with it. The alternative the plan's "KV on GPU, FFN in RAM" mode is built on: keep every
-block on the GPU and pin the **dense FFN tensors** (`ffn_gate`, `ffn_up`, `ffn_down`) of
-the first N blocks to the CPU with llama.cpp's `--override-tensor` (`-ot`), e.g.
+Dense models have two knobs, not one. `-ngl` moves **whole blocks** — attention, KV and
+FFN together — which is expensive per token, because every block's KV leaves VRAM with it.
+The alternative: keep every block on the GPU and pin the **dense FFN tensors**
+(`ffn_gate`, `ffn_up`, `ffn_down`) of the first N blocks to the CPU with llama.cpp's
+`--override-tensor` (`-ot`), e.g.
 
 ```
 -ot "blk\.(0|1|2)\.ffn_(gate|up|down)\.weight=CPU"
 ```
 
-Stage **E** sweeps exactly that ladder — `n_cpu_ffn` from 0 to all blocks — on dense models
-only. An MoE has no dense FFN to pin (its experts are stage A's `--n-cpu-moe` ladder), so E
-is skipped there with a note. The wall is monotone **downward**, like `n_cpu_moe`: an OOM at
-16 blocks pinned proves 8 fails too.
+**Both dense plan modes pin this at every block.** That is the point: FFN weights are the
+cheap thing to exile (they stream once per token either way) and KV is the expensive thing
+to lose, so exiling the FFN is what buys either the window (speed mode) or the layers
+(context mode). The modes then differ only in which of those two is held and which is
+solved for.
 
-E's first ladder starts where the split is *believed* to belong: at `-ngl` = all blocks,
-the mode's own layout, in the plain grid — and at the **carried winner's split** under
-`--speed-chain`, because the `-ot` rows must start where the baseline actually fits, or they
-re-prove a wall the chain already measured. Either way the layers stay put and only tensors
-move.
-
-That gives E a **second ladder** — the frontier. Every FFN rung that fits frees VRAM, and
-freed VRAM buys *layers* back: once the smallest pin that fits is known, `-ngl` is walked
-back **up** one layer at a time with the pin held — one corner of the `(ngl, ffn)` frontier
-per row, instead of a cross product of hundreds of loads. The first OOM ends the walk: `ngl`
-is monotone up, so nothing above it can fit either. On a card where all layers fit without
-any pin, the walk has nothing to walk and E is the plain ladder it always was.
+Because the pin is fixed, it is no longer swept — stage E is gone. The wall along it is
+still monotone **downward** (an OOM at 16 blocks pinned proves 8 fails too), which matters
+for an explicit `--speed-axes` ladder over it.
 
 This is a **tensor** split, so it is also the one knob no layer count can describe — the
 speed model prices it the same way the plan does (`n_cpu_ffn`), and the launch script
 carries the regex as a parameter (`-OverrideTensor` / `OVERRIDETENSOR`), so which tensors
 move is an edit you can make per launch.
 
-Pin it instead of sweeping it with `--speed-ot N` (which drops stage E, exactly like
-pinning the projector drops stage B) or with any ladder:
+Measure some other count with `--speed-ot N`, or sweep it by hand:
 
 ```
 python -m vram_planner --speed-sweep --models MODEL --speed-ot 8
@@ -408,7 +457,8 @@ present), and they are worth far less.
 | `--speed-sweep` | run the staged grid |
 | `--dry-run` | print the configs and estimate, run nothing |
 | `--models NAME` | substring match on the file name |
-| `--speed-stages abcde` | which stages to run |
+| `--speed-stages acd` | which stages to run |
+| `--speed-mode auto\|speed\|context` | dense only: which question stage A answers (§5) |
 | `--speed-ctx N` / `--speed-kv TYPE` | freeze context / KV quant |
 | `--speed-fill N` | prompt length to measure at |
 | `--speed-fills N N …` | first value = campaign fill; the rest re-measure the top stage-A rungs at deeper fills (§3). Refuses to combine with `--speed-fill` |
@@ -419,7 +469,7 @@ present), and they are worth far less.
 | `--sweep-timeout SECONDS` | per-load timeout (raise it for deep fills) |
 | `--speed-chain` | build each stage from the fastest row so far (§3.1) |
 | `--speed-rounds N` | with `--speed-chain`: re-run the stages from the winner |
-| `--speed-ot N` | pin the first N blocks' dense FFN tensors to the CPU (`-ot`) for the campaign; drops stage E (§5.2). Dense models only |
+| `--speed-ot N` | pin the first N blocks' dense FFN tensors to the CPU (`-ot`) for the campaign, instead of the plan mode's every-block pin (§5.2). Dense models only |
 | `--speed-spec-kv TYPE` | freeze the DRAFT cache's quant (`-ctkd/-ctvd`) for the campaign; f16 by default (§5.1). Halves what speculation costs at `q8_0`, at whatever the acceptance rate turns out to be |
 | `--speed-verify` | re-run the winner plus the production config (§3.2) |
 | `--speed-verify-overrides "k=v,v …"` | extra knobs for the verify row, same grammar as `--speed-axes` |
@@ -560,7 +610,7 @@ E  32   0     8    512   2048     none          0    vram   |     8.10     288.4
 
 | column | meaning |
 |---|---|
-| `ot` | blocks whose dense FFN tensors are pinned to the CPU (`-ot`), stage E rows and pinned campaigns only |
+| `ot` | blocks whose dense FFN tensors are pinned to the CPU (`-ot`) — every block under either dense plan mode |
 | `tok/s` | **median of `--repeat` cache-warm passes** — pure decode |
 | `prefill` | from one cold pass, `cache_prompt` off |
 | `VRAM` | per-process dedicated VRAM, from the OS counter |
@@ -637,6 +687,37 @@ used to be, and the grid's own monotone rule prunes the redundant half of it: on
 dflash drafter the depths run **the full trained block, ascending**, and the first depth
 that OOMs at a split proves every deeper one does too (the draft cache grows with depth),
 so the walk skips straight to the split that frees room — see the `wall :` log lines.
+
+The `draft-mtp` ladder is **1, 2, 3, 4, 5, 6, 8, 10** — dense where the optimum falls and
+sparse in the tail. It used to be 1, 2, 3, 5, which skipped the depth that actually won.
+
+For **`draft-mtp` the depth ladder is not capped** at an external drafter's
+`nextn_predict_layers`. `--spec-draft-n-max` is a draft *run length*, not a count of
+prediction heads: on gemma-4-12B with an external MTP drafter, depths 1–15 gave fifteen
+different results with acceptance decaying smoothly (0.822 at depth 1, 0.540 at 4, 0.215
+at 15) and the best throughput at depth 4 — 18% above depth 1. A clamp would have made
+all fifteen identical. The cap used to reduce the ladder to a single rung for a
+one-nextn-layer drafter, which ended the wall walk the instant depth 1 fitted: the
+campaign would spend two loads finding a context where the draft cache fits and then
+never measure the depth question it went looking for.
+
+**Which knob "frees room" means depends on the mode**, the same three-way split stage A
+makes — the walk has to spend what the plan left free, or it measures a config the plan
+never proposed:
+
+| model / mode | the walk gives back | a rung is |
+|---|---|---|
+| MoE | `--n-cpu-moe` | one more block's experts on the CPU |
+| dense, `--speed-mode context` | `-ot`, or `-ngl` | one more block's FFN on the CPU, or one fewer block on the GPU — whichever axis stage A used |
+| dense, `--speed-mode speed` | **context** | a tenth of the window, snapped down to a multiple of 1024 |
+
+In the speed mode `-ngl` is pinned at every block and the `-ot` pin with it — that pair
+*is* the mode — so walking layers down there would trade the whole regime away to fit a
+draft cache and then report the result as speculation working. It gives back context
+instead, granularly: a tenth per rung is enough that two or three rungs cover a draft
+cache of a few hundred MiB against a KV cache of a few thousand, and coarser steps would
+hand back gigabytes of window to buy back megabytes. Five rungs is the limit either way,
+so the speed walk reaches roughly 60% of the starting window before it gives up.
 
 ---
 

@@ -119,8 +119,19 @@ class Handler(BaseHTTPRequestHandler):
         path = data.get("path") or ""
         return {
             "models": [path] if path and os.path.exists(path) else None,
-            "stages": (data.get("stages") or "abcde").lower(),
-            "ctx": as_int("context"), "kv": data.get("kv_type") or None,
+            "stages": (data.get("stages") or "acd").lower(),
+            # Which question stage A answers on a dense model. The browser sends
+            # whichever plan the fit card's toggle is showing, so the campaign
+            # optimises the plan the user is actually looking at.
+            "plan_mode": (data.get("plan_mode") or None),
+            # Context is frozen from the form in every mode but one: a dense
+            # "plan for speed" campaign SWEEPS it, and the form's value there is
+            # the context the user asked about, not one they pinned. Sending it
+            # as a freeze made stage A's own axis look like a contradiction and
+            # parked stages C and D at a window the campaign had just improved on.
+            "ctx": (None if (data.get("plan_mode") == "speed" and not data.get("axes"))
+                    else as_int("context")),
+            "kv": data.get("kv_type") or None,
             # The draft cache's quant, frozen like the target's: stage D measures
             # speculation at the cache it will actually run with. Absent means
             # llama.cpp's f16 default.
@@ -137,9 +148,9 @@ class Handler(BaseHTTPRequestHandler):
             # each knob at the split that won rather than at the planner's guess.
             "chain": bool(data.get("chain", True)),
             "rounds": max(1, as_int("rounds", 1) or 1),
-            # Dense FFN blocks pinned to the CPU (-ot). None keeps stage E's
-            # job as it was; a number fixes the count and drops stage E, like
-            # the projector pin drops stage B.
+            # Dense FFN blocks pinned to the CPU (-ot). None lets the plan mode
+            # pin every block, which is what defines both modes; a number
+            # measures some other split by hand.
             "ot": as_int("ot"),
             # verify is opt-in from the browser, like --speed-verify on the CLI
             "verify": bool(data.get("verify")),
@@ -154,11 +165,11 @@ class Handler(BaseHTTPRequestHandler):
             # and the campaign reads as "speculation does not work here".
             "axes": (parse_overrides(data.get("axes").split())
                      if data.get("axes") else None),
-            # None means "sweep it", which is stage B's job. True/False pin it
-            # for the campaign - so None is a real third value here and cannot
-            # be collapsed with False the way `or None` would.
-            "mmproj_offload": (None if data.get("mmproj_offload") is None
-                               else bool(data.get("mmproj_offload"))),
+            # Where the projector goes, taken from the plan form's own field
+            # rather than swept: "ram" is --no-mmproj-offload. None only happens
+            # for a body that predates the field, and leaves llama.cpp's default.
+            "mmproj_offload": (None if data.get("mmproj_place") in (None, "", "none")
+                               else data.get("mmproj_place") == "vram"),
             # "none" means no drafter at all (own-MTP and n-gram rows only);
             # "auto" is the server's discovery of a dflash-*.gguf next to the
             # model, the long-standing default; a path names a specific file -
@@ -432,6 +443,13 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
+        # Nothing this server returns is cacheable: the API is live state, and
+        # the UI assets change whenever the tool is updated. Without a directive
+        # a browser applies HEURISTIC caching to a static same-URL asset, so an
+        # updated app.js can silently keep serving the previous one - a feature
+        # that is present in the source, rendered by the server's own data, and
+        # simply absent from the page, with no error anywhere to say why.
+        self.send_header("Cache-Control", "no-store")
         self.end_headers()
         self.wfile.write(body)
 
@@ -663,7 +681,11 @@ class Handler(BaseHTTPRequestHandler):
                 kv_type=data.get("kv_type", "f16"),
                 n_ubatch=int(data.get("n_ubatch", 512)),
                 n_seq=int(data.get("n_seq", 1) or 1),
-                include_mmproj=bool(data.get("include_mmproj", True)),
+                # Where the projector goes: "vram" (loaded to the card),
+                # "ram" (--no-mmproj-offload) or "none". The older boolean is
+                # still honoured for a body that predates the select.
+                mmproj_place=(data.get("mmproj_place")
+                              or ("vram" if data.get("include_mmproj", True) else "none")),
                 mtp_spec=bool(data.get("mtp_spec", True)),
                 # DFlash is a second model file next to the target; the flag is
                 # the request to price it, and its absence leaves the plan on the
@@ -676,7 +698,6 @@ class Handler(BaseHTTPRequestHandler):
                 gpu_reserve_mib=float(data.get("gpu_reserve_mib", 512)),
                 compute_override_mib=float(data.get("compute_override_mib", 0)),
                 safety_pct=float(data.get("safety_pct", 5)),
-                kv_on_gpu=bool(data.get("kv_on_gpu", False)),
                 bw_vram_gbs=float(data.get("bw_vram_gbs") or 0) or None,
                 bw_ram_gbs=float(data.get("bw_ram_gbs") or 0) or None,
                 ram_eff=float(data.get("ram_eff") or 0) or None,
@@ -684,6 +705,13 @@ class Handler(BaseHTTPRequestHandler):
                 n_cpu_moe_override=(int(data["n_cpu_moe_override"])
                                     if data.get("n_cpu_moe_override") not in (None, "", False)
                                     else None),
+                n_cpu_ffn_override=(int(data["n_cpu_ffn_override"])
+                                    if data.get("n_cpu_ffn_override") not in (None, "", False)
+                                    else None),
+                # Which of the two dense plans to report. Absent means "let the
+                # planner decide", which is what the first analyze of a model
+                # sends - the toggle only has a value once one has been drawn.
+                plan_mode=(data.get("plan_mode") or None),
                 gpu_layers_override=(int(data["gpu_layers_override"])
                                      if data.get("gpu_layers_override") not in (None, "", False)
                                      else None),

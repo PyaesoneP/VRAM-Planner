@@ -110,8 +110,21 @@
         </div>
 
         <div class="field" id="mmprojfield" hidden>
-          <label class="check"><input type="checkbox" id="mmproj" checked> Load vision projector (mmproj)</label>
+          <label for="mmprojplace">Vision projector (mmproj)</label>
+          <select id="mmprojplace">
+            <option value="vram">load it into VRAM</option>
+            <option value="ram">load it into system RAM (--no-mmproj-offload)</option>
+            <option value="none">do not load it (text only)</option>
+          </select>
           <p class="hint" id="mmprojhint"></p>
+          <p class="hint">Text decoding runs at the same speed either way, so system RAM
+            gives those megabytes back to the layers without giving up images &mdash; images
+            themselves encode slower.
+            <details class="why"><summary>why this is a choice and not a measurement</summary>
+              The campaign used to sweep this placement. It is not really a speed
+              question: the projector only runs while an image is being encoded, and the
+              VRAM it holds the rest of the time is what the split has to work around.
+              Say where it goes and the plan and the measurement both use that.</details></p>
           <div id="mtprow" hidden>
             <label class="check"><input type="checkbox" id="mtpspec" checked> MTP speculative decoding</label>
             <p class="hint">On by default in LM Studio for models that ship these blocks.
@@ -165,14 +178,6 @@
             <input type="text" id="draftpath" placeholder="path to a drafter .gguf" style="margin-top:6px"></p>
         </div>
 
-        <div class="field">
-          <label class="check"><input type="checkbox" id="kvgpu"> Force ALL layers&rsquo; KV onto GPU</label>
-          <p class="hint">Advanced, llama.cpp <b>-ot</b> only. Leave off to model a normal LM Studio split.
-            <details class="why"><summary>how this differs from LM Studio's KV toggle</summary>
-              Different from LM Studio&rsquo;s &ldquo;Offload KV Cache to GPU&rdquo;, which only
-              keeps <i>GPU-layer</i> KV in VRAM. This pushes FFN weights to CPU so every
-              layer&rsquo;s KV sits in VRAM; dense generation gets slower.</details></p>
-        </div>
       </details>
 
       <!-- ---------------------------------------------------------- tier 3 -->
@@ -197,6 +202,15 @@
           <p class="hint">LM Studio&rsquo;s &ldquo;Number of layers to keep experts on CPU&rdquo; /
             llama.cpp <b>--n-cpu-moe</b>. Not the GPU Offload slider: it moves only the routed
             experts of the first N blocks, leaving their attention and KV on the GPU.</p>
+        </div>
+
+        <div class="field" id="ncpuffnfield" hidden>
+          <label for="ncpuffn">CPU FFN blocks <span class="unit">dense; blank = auto</span></label>
+          <input type="number" id="ncpuffn" step="1" min="0" placeholder="auto">
+          <p class="hint">llama.cpp <b>-ot</b>: the first N blocks&rsquo; dense FFN tensors
+            (gate/up/down) move to the CPU while their attention and KV stay on the GPU.
+            Blank lets the plan mode choose &mdash; both modes pin every block. A number
+            prices the exact split you ran instead.</p>
         </div>
 
         <p class="sublabel">BUDGETS</p>

@@ -2,7 +2,7 @@
 import os
 from .const import _mib
 from .gguf import load_gguf, parse_meta_only
-from .model import classify_tensors, extract_config
+from .model import classify_tensors, extract_config, ot_regex
 from .kv import (KV_TYPE_BYTES, kv_bytes_per_token, kv_bytes_per_token_growing,
                  kv_bytes_total, kv_bytes_total_at, max_ctx_for_kv_budget,
                  recurrent_bytes, resolve_kv_lengths, swa_cache_len)
@@ -110,10 +110,11 @@ def _verdict(plan, inputs=None, ram_free_mib=None):
         "ram_mib": ram,
         "ram_budget_mib": plan.get("ram_budget_mib"),
         "ram_free_mib": ram_free_mib,
-        # The two knobs a launcher needs, normalised across the three planners
+        # The three knobs a launcher needs, normalised across the planners
         # so a caller does not have to know which one produced this plan.
         "ngl": plan.get("n_gpu_layers"),
         "ncmoe": plan.get("n_cpu_moe") or 0,
+        "nffn": plan.get("n_cpu_ffn") or 0,
     }
 
 
@@ -216,12 +217,24 @@ def load_drafter(path):
 
 def analyze(path, ctx, kv_type, n_ubatch, flash_attn,
             vram_budget_mib, ram_budget_mib, gpu_reserve_mib,
-            compute_override_mib, safety_pct, kv_on_gpu=False,
+            compute_override_mib, safety_pct,
             gpu_layers_override=None, ram_free_mib=None, n_seq=1,
-            include_mmproj=True, n_cpu_moe_override=None,
+            include_mmproj=True, n_cpu_moe_override=None, n_cpu_ffn_override=None,
             bw_vram_gbs=None, bw_ram_gbs=None, ram_eff=None, ctx_fill=None,
             bw_note="", mtp_spec=False, dflash=False, drafter=None,
-            image_px=None, vision_flash_attn=True, spec_kv="f16"):
+            image_px=None, vision_flash_attn=True, spec_kv="f16",
+            plan_mode=None, mmproj_place=None):
+    # `mmproj_place` supersedes the older boolean: "vram" is the projector loaded
+    # to the GPU (include_mmproj=True), "none" is not loading it at all
+    # (include_mmproj=False), and "ram" is --no-mmproj-offload - the file loads,
+    # but its bytes are charged to the host. The boolean is still accepted so the
+    # calibration and fit callers, which have no opinion here, need no edits.
+    if mmproj_place is None:
+        mmproj_place = "vram" if include_mmproj else "none"
+    if mmproj_place not in ("vram", "ram", "none"):
+        raise ValueError("mmproj_place must be vram, ram or none, not %r" % (mmproj_place,))
+    include_mmproj = mmproj_place != "none"
+    mmproj_on_gpu = mmproj_place == "vram"
     # The file is authoritative when it is here; the stored card stands in when it
     # is not. Reading a real file also refreshes the card, so the library builds
     # up as a side effect of ordinary use rather than needing to be curated.
@@ -467,7 +480,11 @@ def analyze(path, ctx, kv_type, n_ubatch, flash_attn,
 
     # usable VRAM after reserving driver/OS headroom and a safety margin
     eff_vram = max(0.0, (vram_budget_mib - gpu_reserve_mib) * (1.0 - safety_pct / 100.0))
-    eff_vram = max(0.0, eff_vram - mmproj_mib - spec_mib - vis_mib)
+    # A projector pinned to system RAM (--no-mmproj-offload) costs no VRAM, so it
+    # must not be taken off the top here - doing so would shrink every split by a
+    # gigabyte the card never spends. Its bytes are charged to RAM below instead.
+    gpu_held_out = (mmproj_mib + vis_mib) if mmproj_on_gpu else 0.0
+    eff_vram = max(0.0, eff_vram - gpu_held_out - spec_mib)
 
     result = {
         "ok": True, "warnings": warnings, "config": cfg,
@@ -514,7 +531,8 @@ def analyze(path, ctx, kv_type, n_ubatch, flash_attn,
               "depth": block}
              if dflash_info else None)),
         "mmproj": ({"name": mmproj["name"], "mib": _mib(mmproj["tensor_bytes"]),
-                    "file_mib": _mib(mmproj["bytes"]), "included": bool(include_mmproj)}
+                    "file_mib": _mib(mmproj["bytes"]), "included": bool(include_mmproj),
+                    "place": mmproj_place}
                    if mmproj else None),
         "vision": ({"config": vis_cfg, "grid": vis_grid, "peak": vis_peak,
                     "ceiling": vis_ceiling, "reserved_mib": vis_mib,
@@ -556,6 +574,11 @@ def analyze(path, ctx, kv_type, n_ubatch, flash_attn,
             "ram_budget_mib": ram_budget_mib, "gpu_reserve_mib": gpu_reserve_mib,
             "eff_vram_mib": eff_vram, "safety_pct": safety_pct,
             "n_ctx_train": cfg["n_ctx_train"],
+            "mmproj_place": mmproj_place,
+            # Which question was asked. Filled in below once the dispatch knows
+            # whether the two-plan regime even applies - a model with one answer
+            # has no mode, and saying "speed" there would be an invention.
+            "plan_mode": None,
         },
     }
 
@@ -629,23 +652,18 @@ def analyze(path, ctx, kv_type, n_ubatch, flash_attn,
             break
         max_ctx_gpu = nxt
 
-    # An explicit layer count means "verify the config I actually ran", and a layer
-    # count is a layer-level idea: the KV-on-GPU planner offloads every block by
-    # definition and splits FFN TENSORS instead, so there is no -ngl for it to
-    # honour. It used to be selected first and silently drop the override, which
-    # made analyze() return the identical plan for -ngl 29 and -ngl 50 - the tool
-    # answering a question the caller had not asked, with no sign it had done so.
-    # _plan_dense and _plan_moe both already handle the override; only this path
-    # did not, so route to the layer-level planner and say why.
-    if gpu_layers_override is not None and kv_on_gpu and not cl["is_moe"] \
-            and not fully_fits and cl["ffn_dense_total"] > 0:
-        warnings.append("You pinned GPU Offload to %d layers, so this is a layer-level split "
-                        "and 'keep all KV on GPU' does not apply - that mode puts every block "
-                        "on the GPU and exiles FFN tensors instead, which no layer count can "
-                        "describe. Clear the layer override to see the KV-on-GPU plan."
-                        % gpu_layers_override)
-
+    # An explicit knob value means "verify the config I actually ran": the pair
+    # is costed exactly, whatever the plans above would have suggested. The
+    # regime planners below only ever answer their own questions, so an override
+    # routes away from them rather than being dropped - analyze() used to do
+    # exactly that, returning the identical plan for -ngl 29 and -ngl 50.
     if cl["is_moe"]:
+        if n_cpu_ffn_override is not None:
+            warnings.append(
+                "-ot pins DENSE FFN tensors (blk.N.ffn_gate/up/down), and this model "
+                "routes its experts instead - there are no such tensors to pin, so the "
+                "CPU FFN blocks value was dropped. --n-cpu-moe is this model's knob.")
+            n_cpu_ffn_override = None
         plan = _plan_moe(cfg, cl, eff_vram, ram_budget_mib, kv_total_mib, kv_per_layer_mib,
                          compute_mib, weights_mib, expert_total_mib, expert_layer_mean_mib,
                          per_layer_max_mib, per_layer_mean_mib, fully_fits, full_need,
@@ -653,13 +671,54 @@ def analyze(path, ctx, kv_type, n_ubatch, flash_attn,
                          n_seq=n_seq, embed=embed_mib, output=output_mib,
                          ngl_override=gpu_layers_override, n_cpu_moe_override=n_cpu_moe_override,
                          compute_fn=compute_fn)
-    elif (kv_on_gpu and not fully_fits and cl["ffn_dense_total"] > 0
-          and gpu_layers_override is None):
-        plan = _plan_dense_kv_on_gpu(cfg, cl, eff_vram, ram_budget_mib, kv_total_mib,
-                                     compute_mib, weights_mib, ffn_dense_total_mib,
-                                     ffn_layer_mean_mib, max_ctx_gpu, ctx, kv_type, flash_attn,
-                                     rec_total=rec_total_mib, n_ubatch=n_ubatch, n_seq=n_seq,
-                                     compute_fn=compute_fn, gpu_extra=gpu_extra_weights)
+    elif gpu_layers_override is not None or n_cpu_ffn_override is not None:
+        plan = _plan_dense(cfg, cl, eff_vram, ram_budget_mib, kv_total_mib, kv_per_layer_mib,
+                           compute_mib, weights_mib, embed_mib, output_mib,
+                           per_layer_max_mib, per_layer_mean_mib, fully_fits, full_need,
+                           max_ctx_gpu, ctx, kv_type, flash_attn,
+                           ngl_override=gpu_layers_override, n_seq=n_seq,
+                           n_cpu_ffn_override=n_cpu_ffn_override,
+                           compute_fn=compute_fn, gpu_extra=gpu_extra_weights)
+    elif not fully_fits and cl["ffn_dense_total"] > 0:
+        # Two-plan regime: the model does not fit on the GPU at this context, so
+        # there is no single answer - there is one per question being asked.
+        #   * for SPEED   keep every layer's attention and KV on the GPU (ngl =
+        #     all) and exile every dense FFN to the CPU (-ot); the answer is the
+        #     largest context that still fits that way.
+        #   * for CONTEXT keep the context pinned and walk ngl down until it fits;
+        #     the FFN stays exiled, because in this mode every GPU byte not spent
+        #     on KV is a byte taken from the context.
+        # Both plans pin the same FFN count; they differ in what is free. If the
+        # chosen context fits the speed plan, the speed plan wins - it is the
+        # faster regime and it already covers the question, so the context plan
+        # would only be reporting the same config at fewer layers.
+        plan = _plan_dense_speed(cfg, cl, eff_vram, ram_budget_mib, kv_total_mib,
+                                 weights_mib, ffn_dense_total_mib, rec_total_mib,
+                                 max_ctx_gpu, ctx, kv_type, flash_attn,
+                                 n_ubatch=n_ubatch, n_seq=n_seq,
+                                 compute_fn=compute_fn, gpu_extra=gpu_extra_weights,
+                                 compute_override_mib=compute_override_mib,
+                                 layer_max=per_layer_max_mib, layer_mean=per_layer_mean_mib,
+                                 ffn_layer_mean=ffn_layer_mean_mib)
+        context_plan = _plan_dense_context(cfg, cl, eff_vram, ram_budget_mib, kv_total_mib,
+                                           weights_mib, embed_mib, output_mib,
+                                           rec_total_mib, max_ctx_gpu, ctx, kv_type,
+                                           flash_attn,
+                                           n_seq=n_seq, compute_fn=compute_fn,
+                                           gpu_extra=gpu_extra_weights,
+                                           layer_max=per_layer_max_mib,
+                                           layer_mean=per_layer_mean_mib,
+                                           ffn_layer_mean=ffn_layer_mean_mib)
+        result["plans"] = {"speed": plan, "context": context_plan}
+        # Which plan is REPORTED is the caller's question to ask; both are always
+        # returned so the browser can toggle between them without a round trip.
+        # Absent an explicit mode the speed plan wins whenever it already covers
+        # the requested context - it is the faster regime, so the context plan
+        # would only be the same config at fewer layers.
+        mode = plan_mode if plan_mode in ("speed", "context") else (
+            "speed" if plan["max_ctx"] >= ctx else "context")
+        result["plan_mode"] = mode
+        plan = result["plans"][mode]
     else:
         plan = _plan_dense(cfg, cl, eff_vram, ram_budget_mib, kv_total_mib, kv_per_layer_mib,
                            compute_mib, weights_mib, embed_mib, output_mib,
@@ -674,53 +733,87 @@ def analyze(path, ctx, kv_type, n_ubatch, flash_attn,
     # On gemma-4-31B with its 1145 MiB projector that showed as "11045 / 10070" next
     # to a green verdict, which is exactly the sort of thing that makes a user stop
     # trusting the tool.
-    held_out = 0.0
+    # In the two-plan regime every plan is folded the same way, so the toggle
+    # shows each one on exactly the basis the selected one is reported on.
+    targets = list(result["plans"].values()) if "plans" in result else [plan]
+    held_out = 0.0        # folded back into the GPU totals
+    host_extra = 0.0      # charged to RAM instead, when the projector sits there
     if mmproj_mib > 0:
-        plan["mmproj_mib"] = mmproj_mib
-        held_out += mmproj_mib
+        for p_ in targets:
+            p_["mmproj_mib"] = mmproj_mib
+            p_["mmproj_place"] = mmproj_place
+        if mmproj_on_gpu:
+            held_out += mmproj_mib
+        else:
+            host_extra += mmproj_mib
     if spec_mib > 0:
-        plan["spec_mib"] = spec_mib
+        for p_ in targets:
+            p_["spec_mib"] = spec_mib
         held_out += spec_mib
     if vis_mib > 0:
-        plan["vision_mib"] = vis_mib
-        held_out += vis_mib
-    if held_out > 0:
-        plan["vram_used_mib"] = plan.get("vram_used_mib", 0.0) + held_out
-        if plan.get("vram_budget_mib") is not None:
-            plan["vram_budget_mib"] = plan["vram_budget_mib"] + held_out
-    # Recorded on the plan so the verdict and the UI read one budget rather than
-    # each reaching for a different field.
-    plan["ram_budget_mib"] = ram_budget_mib
-    plan["verdict"] = _verdict(plan, result["inputs"], ram_free_mib)
+        for p_ in targets:
+            p_["vision_mib"] = vis_mib
+        # The encoder's transients land wherever the tower runs, which is the same
+        # side its weights were placed on.
+        if mmproj_on_gpu:
+            held_out += vis_mib
+        else:
+            host_extra += vis_mib
+    for p_ in targets:
+        if held_out > 0:
+            p_["vram_used_mib"] = p_.get("vram_used_mib", 0.0) + held_out
+            if p_.get("vram_budget_mib") is not None:
+                p_["vram_budget_mib"] = p_["vram_budget_mib"] + held_out
+        if host_extra > 0:
+            p_["ram_used_mib"] = p_.get("ram_used_mib", 0.0) + host_extra
+        # Recorded on the plan so the verdict and the UI read one budget rather
+        # than each reaching for a different field.
+        p_["ram_budget_mib"] = ram_budget_mib
+        p_["verdict"] = _verdict(p_, result["inputs"], ram_free_mib)
+        # The projector's placement is a launch flag, not a split, so it is
+        # stamped onto the command here rather than threaded through every
+        # planner - none of which has an opinion about where it goes.
+        if include_mmproj and not mmproj_on_gpu and p_.get("llama_cmd"):
+            p_["llama_cmd"] = p_["llama_cmd"] + " --no-mmproj-offload"
+    result["inputs"]["plan_mode"] = result.get("plan_mode")
     result["plan"] = plan
 
     # ---- speed roofline ----------------------------------------------------
-    try:
-        # KV-on-GPU mode keeps every block on the GPU but exiles the dense FFN,
-        # so its placement cannot be described by a layer count alone.
-        n_cpu_ffn = 0
-        if plan.get("kind") == "dense_kv_gpu":
-            ngl = n_layers
-            n_cpu_ffn = int(plan.get("ffn_on_cpu") or n_layers)
-            plan.setdefault("n_gpu_layers", n_layers)
-        else:
-            ngl = plan.get("n_gpu_layers")
+    def _roofline(p_):
+        # The plan carries its own placement: n_gpu_layers says where the blocks
+        # are, n_cpu_ffn says which of their dense FFN tensors -ot exiled to
+        # RAM. per_token_bytes() charges each byte to the side that streams it
+        # every token.
+        try:
+            ngl = p_.get("n_gpu_layers")
             if ngl is None:
-                ngl = n_layers if plan.get("fits_fully") else 0
-        gpu_blocks = list(range(max(0, n_layers - int(ngl)), n_layers))
-        fill = ctx_fill if ctx_fill is not None else min(ctx, 8192)
-        sp = estimate_speed(cfg, cl, gpu_blocks, fill, kv_type,
-                            bw_vram_gbs or 500.0, bw_ram_gbs or 50.0,
-                            cpu_head=True,   # the head stays in RAM at every -ngl
-                            ram_eff=ram_eff, n_cpu_moe=plan.get("n_cpu_moe", 0) or 0,
-                            n_cpu_ffn=n_cpu_ffn)
-        sp["n_gpu_layers"] = int(ngl)
-        sp["n_cpu_moe"] = plan.get("n_cpu_moe", 0) or 0
-        sp["n_cpu_ffn"] = n_cpu_ffn
-        sp["bw_auto"] = bw_note or ""
-        result["speed"] = sp
-    except Exception as e:
-        result["speed"] = {"error": "%s: %s" % (type(e).__name__, e)}
+                ngl = n_layers if p_.get("fits_fully") else 0
+            n_cpu_ffn = p_.get("n_cpu_ffn") or 0
+            gpu_blocks = list(range(max(0, n_layers - int(ngl)), n_layers))
+            # A speed plan's context IS its answer, so its roofline is read at the
+            # window it actually proposes rather than at the one that was typed.
+            plan_ctx = int(p_.get("max_ctx") or ctx)
+            fill = ctx_fill if ctx_fill is not None else min(plan_ctx, 8192)
+            sp = estimate_speed(cfg, cl, gpu_blocks, fill, kv_type,
+                                bw_vram_gbs or 500.0, bw_ram_gbs or 50.0,
+                                cpu_head=True,   # the head stays in RAM at every -ngl
+                                ram_eff=ram_eff, n_cpu_moe=p_.get("n_cpu_moe", 0) or 0,
+                                n_cpu_ffn=n_cpu_ffn)
+            sp["n_gpu_layers"] = int(ngl)
+            sp["n_cpu_moe"] = p_.get("n_cpu_moe", 0) or 0
+            sp["n_cpu_ffn"] = n_cpu_ffn
+            sp["bw_auto"] = bw_note or ""
+            return sp
+        except Exception as e:
+            return {"error": "%s: %s" % (type(e).__name__, e)}
+
+    # Every plan carries its own, because the two modes run at genuinely different
+    # speeds and the browser toggles between them WITHOUT asking again - a single
+    # top-level roofline would keep showing the selected plan's number under the
+    # other plan's split.
+    for p_ in targets:
+        p_["speed"] = _roofline(p_)
+    result["speed"] = plan["speed"]
 
     # ---- vision warnings ---------------------------------------------------
     if vis_cfg and vis_peak:
@@ -780,9 +873,13 @@ def analyze(path, ctx, kv_type, n_ubatch, flash_attn,
     return result
 
 
-def _llama_flags(ctx, kv_type, flash_attn, ngl=None, n_cpu_moe=None, ot_all_experts=False):
+def _llama_flags(ctx, kv_type, flash_attn, ngl=None, n_cpu_moe=None,
+                 ot_all_experts=False, n_cpu_ffn=None):
     parts = ["llama-server", "-m <model.gguf>"]
     parts.append("-ngl %s" % (ngl if ngl is not None else 999))
+    if n_cpu_ffn:
+        # Same spelling sweep.build_argv() and the launchers emit - one source.
+        parts.append('-ot "%s"' % ot_regex(n_cpu_ffn))
     if n_cpu_moe is not None:
         parts.append("--n-cpu-moe %d" % n_cpu_moe)
     if ot_all_experts:
@@ -795,46 +892,81 @@ def _llama_flags(ctx, kv_type, flash_attn, ngl=None, n_cpu_moe=None, ot_all_expe
     return " ".join(parts)
 
 
+def _dense_cost(cfg, cl, ngl, n_cpu_ffn, layer_max, layer_mean, ffn_layer_mean):
+    """Exact BLOCK weight bytes on each side for a (-ngl, n_cpu_ffn) pair.
+
+    The single source of dense block-weight accounting: the classic split, the
+    verification path, and the speed/context planners all read through this,
+    because blocks are not interchangeable (hybrid attn vs SSM, quant varies
+    per block) and the -ot pin moves tens out of blocks that STAY on the GPU.
+    llama.cpp offloads the LAST n_gpu_layers blocks, so which blocks land on
+    the GPU matters. Embeddings, the output head, KV and recurrent state are
+    not here - the caller combines them with what it already knows."""
+    n_layers = cfg["n_layers"] or 0
+    ngl = max(0, min(int(ngl), n_layers))
+    n_cpu_ffn = max(0, min(int(n_cpu_ffn or 0), n_layers))
+    per_layer = cl.get("per_layer_bytes") or {}
+    per_ffn   = cl.get("per_layer_ffn_bytes") or {}
+    on_gpu = list(range(max(0, n_layers - ngl), n_layers))
+    s = set(on_gpu)
+    gpu_b = cpu_b = 0.0
+    for i in range(n_layers):
+        b = per_layer.get(i, 0.0)
+        # A pinned block that is resident hands its FFN to the CPU only; a
+        # pinned block already on the CPU carries the FFN there with the rest.
+        f = min(b, per_ffn.get(i, 0.0)) if (i < n_cpu_ffn and i in s) else 0.0
+        if i in s:
+            gpu_b += b - f
+        else:
+            cpu_b += b
+        cpu_b += f
+    if per_layer:
+        gpu_w, cpu_w = _mib(gpu_b), _mib(cpu_b)
+    else:
+        # metadata-only parse: no per-block table, so the pin costs the MEAN
+        # FFN per pinned block that is resident - the declared approximation
+        # the classic path uses for everything else.
+        first = max(0, n_layers - ngl)
+        n_pin = sum(1 for i in range(min(n_cpu_ffn, n_layers)) if i >= first)
+        gpu_w = min(ngl, n_layers) * layer_max - n_pin * ffn_layer_mean
+        cpu_w = (n_layers - ngl) * layer_mean + n_pin * ffn_layer_mean
+    return {"n_gpu_layers": ngl, "n_cpu_ffn": n_cpu_ffn, "on_gpu": on_gpu,
+            "cpu_blocks": [i for i in range(n_layers) if i not in s],
+            "gpu_block_mib": gpu_w, "cpu_block_mib": cpu_w}
+
+
 def _plan_dense(cfg, cl, eff_vram, ram, kv_total, kv_layer, compute, weights,
                 embed, output, layer_max, layer_mean, fully_fits, full_need,
                 max_ctx_gpu, ctx, kv_type, flash_attn, ngl_override=None, n_seq=1,
+                n_cpu_ffn_override=None,
                 compute_fn=None, gpu_extra=None):
     n_layers = cfg["n_layers"]
-    per_layer = cl.get("per_layer_bytes") or {}
     gpu_extra = gpu_extra or (lambda ngl: 0.0)
-    # llama.cpp offloads the LAST n_gpu_layers blocks (i_gpu_start = n_layer - ngl),
-    # so which blocks land on the GPU matters: on a hybrid model the attention
-    # blocks are the expensive ones and they are not evenly spread.
-    def gpu_blocks(ngl):
-        return list(range(max(0, n_layers - ngl), n_layers))
 
-    def build(ngl, forced):
+    def build(ngl, forced, n_cpu_ffn=0):
         ngl = max(0, min(int(ngl), n_layers))
+        n_cpu_ffn = max(0, min(int(n_cpu_ffn or 0), n_layers))
         full = (ngl >= n_layers)
-        cb = compute_fn(ngl) if compute_fn else {"gpu": compute, "cpu": 0.0}
+        cost = _dense_cost(cfg, cl, ngl, n_cpu_ffn, layer_max, layer_mean, 0.0)
+        # A -ot pin splits the graph even at full -ngl, so the surcharge has to
+        # know about it; passing only ngl would read every FFN pin as unsplit.
+        cb = (compute_fn(ngl, any_on_cpu=graph_is_split(n_layers, ngl, 0, n_cpu_ffn))
+              if compute_fn else {"gpu": compute, "cpu": 0.0})
         # The output head always stays in system RAM; the token embeddings follow
         # gpu_extra() - see the note where embed_on_gpu_mib is derived.
         extra = gpu_extra(ngl)
+        on_gpu, cpu_blocks = cost["on_gpu"], cost["cpu_blocks"]
+        gpu_w  = cost["gpu_block_mib"] + extra
+        cpu_w  = cost["cpu_block_mib"] + embed + output - extra
         if full:
-            gpu_w, gpu_kv = weights - embed - output + extra, kv_total
-            gpu_rec = _mib(recurrent_bytes(cfg, range(n_layers), n_seq))
-            vram_used = gpu_w + kv_total + gpu_rec + cb["gpu"]
-            cpu_w, cpu_kv, cpu_rec = embed + output - extra, 0.0, 0.0
-            cpu_layers = 0
+            gpu_kv, cpu_kv = kv_total, 0.0
         else:
-            on_gpu = gpu_blocks(ngl)
-            off = set(on_gpu)
-            gpu_w  = (_mib(sum(per_layer.get(i, 0) for i in on_gpu))
-                      or (ngl * layer_max)) + extra
             gpu_kv = _mib(kv_bytes_total(cfg, kv_type, on_gpu))
-            gpu_rec = _mib(recurrent_bytes(cfg, on_gpu, n_seq))
-            vram_used = gpu_w + gpu_kv + gpu_rec + cb["gpu"]
-            cpu_layers = n_layers - ngl
-            rest = [i for i in range(n_layers) if i not in off]
-            cpu_w = (_mib(sum(per_layer.get(i, 0) for i in rest)) or (cpu_layers * layer_mean)) \
-                    + embed + output - extra
             cpu_kv = kv_total - gpu_kv
-            cpu_rec = _mib(recurrent_bytes(cfg, rest, n_seq))
+        gpu_rec = _mib(recurrent_bytes(cfg, on_gpu, n_seq))
+        cpu_rec = _mib(recurrent_bytes(cfg, cpu_blocks, n_seq))
+        cpu_layers = n_layers - ngl
+        vram_used = gpu_w + gpu_kv + gpu_rec + cb["gpu"]
         ram_used = cpu_w + cpu_kv + cpu_rec + cb["cpu"]
         ram_ok = ram_used <= ram
         vram_ok = vram_used <= eff_vram
@@ -844,6 +976,10 @@ def _plan_dense(cfg, cl, eff_vram, ram, kv_total, kv_layer, compute, weights,
                 head += " Room for up to ~%s tokens of context." % f"{max_ctx_gpu:,}"
         else:
             head = "Split: %d of %d layers on GPU, %d on CPU." % (ngl, n_layers, cpu_layers)
+        if forced:
+            head = "Verifying your config - not a recommendation. " + head
+            if n_cpu_ffn:
+                head += " The first %d blocks' dense FFN sits on the CPU (-ot)." % n_cpu_ffn
         if forced and not vram_ok:
             head += "  WARNING: needs %.0f MiB VRAM (> %.0f budget) - spills to shared memory (slow)." % (
                 vram_used, eff_vram)
@@ -855,8 +991,13 @@ def _plan_dense(cfg, cl, eff_vram, ram, kv_total, kv_layer, compute, weights,
               "Limit to Dedicated GPU Memory: ON (avoid slow shared-memory spill)",
               ("Flash Attention: ON  (KV @ %s)" % kv_type) if kv_type != "f16"
               else "Flash Attention: optional"]
+        if n_cpu_ffn:
+            ls.append("Dense FFN of the first %d blocks pinned to the CPU via -ot "
+                      "(LM Studio has no dense-FFN-only toggle - run the llama.cpp "
+                      "command below)." % n_cpu_ffn)
         return {
             "kind": "dense", "fits_fully": full, "n_gpu_layers": ngl, "cpu_layers": cpu_layers,
+            "n_cpu_ffn": n_cpu_ffn,
             "forced_ngl": forced, "vram_ok": vram_ok,
             "vram_used_mib": vram_used, "vram_budget_mib": eff_vram,
             "ram_used_mib": ram_used, "ram_ok": ram_ok, "max_ctx_gpu": max_ctx_gpu,
@@ -864,20 +1005,26 @@ def _plan_dense(cfg, cl, eff_vram, ram, kv_total, kv_layer, compute, weights,
             "cpu_compute_mib": cb["cpu"], "gpu_recurrent_mib": gpu_rec,
             "cpu_weights_mib": cpu_w, "cpu_kv_mib": cpu_kv, "cpu_recurrent_mib": cpu_rec,
             "gpu_attn_layers": 0 if full else sum(
-                1 for i in gpu_blocks(ngl) if i in set(cfg["attn_layers"])),
+                1 for i in on_gpu if i in set(cfg["attn_layers"])),
             "n_attn_layers": len(cfg["attn_layers"]),
             "lmstudio": ls,
-            "llama_cmd": _llama_flags(ctx, kv_type, flash_attn, ngl=(99 if full else ngl)),
+            "llama_cmd": _llama_flags(ctx, kv_type, flash_attn, ngl=(99 if full else ngl),
+                                      n_cpu_ffn=n_cpu_ffn or None),
             "headline": head,
         }
 
-    if ngl_override is not None:
-        return build(ngl_override, True)
+    # An explicit knob value verifies the exact config it names: with only one
+    # typed, the other takes the full-GPU extreme, the same rule _plan_moe uses.
+    if ngl_override is not None or n_cpu_ffn_override is not None:
+        ngl = n_layers if ngl_override is None else ngl_override
+        ncpu = 0 if n_cpu_ffn_override is None else n_cpu_ffn_override
+        return build(ngl, True, ncpu)
     if fully_fits:
         return build(n_layers, False)
     # Blocks are not interchangeable (hybrid attn vs SSM, and quant varies per
     # block), so search downward for the largest ngl that actually fits rather
-    # than dividing by an average.
+    # than dividing by an average. No -ot pin: plain layer counts are what this
+    # planner answers; the regime planners own the pinned-FFN question.
     for ngl in range(n_layers, -1, -1):
         p = build(ngl, False)
         if p["vram_used_mib"] <= eff_vram:
@@ -885,124 +1032,245 @@ def _plan_dense(cfg, cl, eff_vram, ram, kv_total, kv_layer, compute, weights,
     return build(0, False)
 
 
-def _ffn_cpu_flag():
-    return r'-ot "\.ffn_(gate|up|down)\.weight=CPU"'
+def _plan_dense_speed(cfg, cl, eff_vram, ram, kv_total, weights, ffn_total,
+                      rec_total, max_ctx_gpu, ctx, kv_type, flash_attn, n_ubatch, n_seq,
+                      compute_fn, gpu_extra, compute_override_mib,
+                      layer_max, layer_mean, ffn_layer_mean):
+    """Plan FOR SPEED: every layer's attention and KV on the GPU (ngl = all),
+    every dense FFN exiled to the CPU (-ot). The answer is the LARGEST context
+    that still fits that way.
 
-
-def _plan_dense_kv_on_gpu(cfg, cl, eff_vram, ram, kv_total, compute, weights,
-                          ffn_total, ffn_layer_mean, max_ctx_gpu, ctx, kv_type, flash_attn,
-                          rec_total=0.0, n_ubatch=512, n_seq=1, compute_fn=None,
-                          gpu_extra=None):
-    """Keep ALL KV cache (and attention) on GPU by offloading dense FFN weights to CPU.
-    Dense analog of MoE expert offload. Note: FFN runs every token, so this is slower
-    for dense models than a normal layer split."""
-    n_layers = cfg["n_layers"]
-    n_ffn = cl["n_ffn_layers"]
-    # Exiling every dense FFN to the CPU makes the graph span both backends, which
-    # is what graph_is_split() means - the same thing --n-cpu-moe does for experts.
-    # This planner used to take a flat scalar and so was the one path that never
-    # paid the split surcharge, understating VRAM by the surcharge plus its
-    # per-context part. Every block is still offloaded, so the output head, and
-    # with it the logits tensor, does land on the GPU.
-    if compute_fn:
-        compute = compute_fn(n_layers, output_on_gpu=True, any_on_cpu=True)["gpu"]
-    # Weights that actually reach VRAM: blocks minus the dense FFN we are exiling.
-    # Embeddings and the output head stay in system RAM - see _plan_dense.build().
-    # This mode always offloads every block, so the embeddings follow the same rule
-    # they would at full offload - see embed_on_gpu_mib in analyze().
-    extra = (gpu_extra or (lambda ngl: 0.0))(n_layers)
+    This is the regime in which decode pays nothing for KV over PCIe - the
+    cache re-read every token stays in VRAM - at the price of streaming the
+    dense FFN from system RAM every token (per_token_bytes() charges exactly
+    that). It is the dense answer to the MoE expert split: the only weights big
+    enough to be worth moving out of VRAM. The FFN count is pinned to ALL on
+    purpose - buying any of it back would spend bytes the context is here to
+    get, and the speed sweep (which sweeps context at this exact pin) finds
+    where the regime actually stops being fast."""
+    n_layers = cfg["n_layers"] or 0
+    n_cpu_ffn = n_layers
+    gpu_extra = gpu_extra or (lambda ngl: 0.0)
+    cost = _dense_cost(cfg, cl, n_layers, n_cpu_ffn, layer_max, layer_mean, ffn_layer_mean)
+    extra = gpu_extra(n_layers)
     head_ram = _mib(cl["embed_bytes"] + cl["output_bytes"]) - extra
-    onchip_attn = weights - ffn_total - head_ram
-    # base = attention + norms + full KV, all on GPU
-    base_gpu = onchip_attn + kv_total + rec_total + compute
-    if base_gpu <= eff_vram:
-        spare = eff_vram - base_gpu
-        # Buy back FFN layers at their real byte sizes, not at the mean. The other
-        # two planners sum per-block bytes because blocks are not interchangeable -
-        # a quant mixes types across layers, and the first and last blocks are
-        # routinely bigger. Keeping the last blocks matches llama.cpp's own
-        # last-N-first offload order.
-        per_ffn = cl.get("per_layer_ffn_bytes") or {}
-        ffn_on_gpu, ffn_gpu_mib, spent = 0, 0.0, 0.0
-        for li in sorted(per_ffn, reverse=True):
-            cost = _mib(per_ffn[li])
-            if spent + cost > spare:
-                break
-            spent += cost
-            ffn_on_gpu += 1
-        if not per_ffn and ffn_layer_mean > 0:      # metadata-only parse: nothing to sum
-            ffn_on_gpu = max(0, min(int(spare / ffn_layer_mean), n_ffn))
-            spent = ffn_on_gpu * ffn_layer_mean
-        ffn_on_gpu = min(ffn_on_gpu, n_ffn)
-        ffn_gpu_mib = spent
-        ffn_on_cpu = n_ffn - ffn_on_gpu
-        vram_used = base_gpu + ffn_gpu_mib
-        cpu_weights = max(0.0, ffn_total - ffn_gpu_mib) + head_ram
-        ram_ok = cpu_weights <= ram
-        if ffn_on_cpu == 0:
-            head = "All KV on GPU and the whole model fits - no FFN offload needed."
-            cmd = _llama_flags(ctx, kv_type, flash_attn, ngl=99)
-            ls = ["GPU Offload / GPU Layers: max", "Context Length: %d" % ctx]
-        elif ffn_on_gpu == 0:
-            head = "All %s tokens of KV on GPU; every FFN layer on CPU (slow generation for dense)." % f"{ctx:,}"
-            cmd = "llama-server -m <model.gguf> -ngl 999 %s -c %d%s" % (
-                _ffn_cpu_flag(), ctx,
-                (" -fa -ctk %s -ctv %s" % (kv_type, kv_type)) if kv_type != "f16"
-                else (" -fa" if flash_attn else ""))
-            ls = ["GPU Offload / GPU Layers: max",
-                  "This mode needs llama.cpp's -ot (LM Studio has no dense-FFN-only toggle).",
-                  "Context Length: %d" % ctx]
-        else:
-            head = "All KV on GPU; FFN for %d layers on CPU, %d on GPU." % (ffn_on_cpu, ffn_on_gpu)
-            cmd = "llama-server -m <model.gguf> -ngl 999 %s -c %d%s" % (
-                _ffn_cpu_flag(), ctx,
-                (" -fa -ctk %s -ctv %s" % (kv_type, kv_type)) if kv_type != "f16"
-                else (" -fa" if flash_attn else ""))
-            ls = ["GPU Offload / GPU Layers: max",
-                  "Partial dense-FFN offload needs llama.cpp -ot (below).",
-                  "Context Length: %d" % ctx]
-        if not ram_ok:
-            head += "  WARNING: FFN needs %.0f MiB RAM (> %.0f MiB budget)." % (cpu_weights, ram)
-        return {
-            "kind": "dense_kv_gpu", "fits_fully": False, "kv_on_gpu": True,
-            "ffn_on_cpu": ffn_on_cpu, "ffn_on_gpu": ffn_on_gpu, "n_ffn_layers": n_ffn,
-            "vram_used_mib": vram_used, "vram_budget_mib": eff_vram,
-            "ram_used_mib": cpu_weights, "ram_ok": ram_ok, "max_ctx_gpu": max_ctx_gpu,
-            "gpu_weights_mib": onchip_attn + ffn_gpu_mib,
-            "gpu_kv_mib": kv_total, "compute_mib": compute, "gpu_recurrent_mib": rec_total,
-            "cpu_weights_mib": cpu_weights, "cpu_kv_mib": 0.0,
-            "lmstudio": ls, "llama_cmd": cmd, "headline": head,
-        }
-    # even attention + full KV don't fit -> the attention weights pinned to the GPU are the wall
-    # attention weights only - the KV cache cannot live apart from them
-    onchip = onchip_attn
-    attn_base = onchip + rec_total + compute
-    room = eff_vram - attn_base
-    max_ctx_kv_gpu = max_ctx_for_kv_budget(cfg, kv_type, room, n_ubatch, n_seq, flash_attn)
-    if room <= 0:
-        head = ("KV fits, but it can't be separated from its layers: all KV on GPU forces all "
-                "attention weights onto the GPU too (%.0f MiB) - that alone + the compute buffer "
-                "leaves ~0 for KV. Use a smaller quant, or a normal layer split." % onchip)
+    # What VRAM holds besides KV and compute: the non-FFN part of every block
+    # plus the embeddings the measured rule keeps on the GPU at any -ngl > 0.
+    fixed = cost["gpu_block_mib"] + extra + rec_total
+
+    def cb_split_at(c):
+        # The graph spans both backends - the FFN tensors sit in RAM while their
+        # blocks' attention runs on the GPU - so the split surcharge applies even
+        # though the layer count is full.
+        t = compute_buffer_terms(cfg, c, n_ubatch, flash_attn, n_seq, kv_type)
+        return compute_buffer_split(t, True, True, n_layers, compute_override_mib)
+
+    def cb_at(c):
+        return cb_split_at(c)["gpu"]
+
+    def kv_at(c):
+        return _mib(kv_bytes_total_at(cfg, kv_type, c, n_ubatch, n_seq, flash_attn))
+
+    def vram_at(c):
+        return fixed + cb_at(c) + kv_at(c)
+
+    # The largest context whose OWN total lands under the budget.
+    #
+    # This used to be a fixed point over max_ctx_for_kv_budget(): solve KV
+    # against the room left by the compute buffer, recompute the buffer at the
+    # answer, repeat. But the buffer grows with ctx, so the iteration can settle
+    # on a context that costs a little more than the budget it was solved
+    # against - and this number is not a hint, it is the plan, so "a little
+    # more" is a plan that does not fit reported as one that does.
+    #
+    # vram_at() is monotone non-decreasing in ctx (KV is piecewise linear -
+    # sliding-window layers cap at their window - and every other term is flat
+    # or rising), so a bisection on the total itself is exact and needs no
+    # settling. The KV solver still supplies the opening bracket, which is what
+    # keeps this to ~20 evaluations of pure arithmetic.
+    seed = max_ctx_for_kv_budget(
+        cfg, kv_type, max(0.0, eff_vram - fixed - cb_at(ctx)),
+        n_ubatch, n_seq, flash_attn)
+    hi = max(int(seed) * 2, int(ctx), 1)
+    # A context past what the model was trained on is not a config, whatever the
+    # arithmetic says - the sweep clamps it the same way.
+    if cfg["n_ctx_train"]:
+        hi = min(hi, int(cfg["n_ctx_train"]))
+    if hi < 1 or vram_at(1) > eff_vram:
+        max_ctx = 0
     else:
-        head = ("All KV on GPU also pins %.0f MiB of attention weights to the GPU; with the %.0f MiB "
-                "KV that's over the %.0f MiB budget. Max context this way: ~%s tokens."
-                % (onchip, kv_total, eff_vram, f"{max_ctx_kv_gpu:,}"))
+        lo = 1
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if vram_at(mid) <= eff_vram:
+                lo = mid
+            else:
+                hi = mid - 1
+        max_ctx = lo
+
+    # The plan is priced at the context it PROPOSES, not at the one that was
+    # typed. Those are different numbers by construction - max_ctx is the answer
+    # to "how much context can I have this way" - and pricing the answer at the
+    # question produced a plan that said "87,194 tokens fit" above a bar reading
+    # 161% OVER, because the bar was the footprint of the 131,072 that did not.
+    # Below zero there is no proposal to price, so the requested context stands
+    # and the overflow it shows is the honest reason the regime is infeasible.
+    priced_ctx = max_ctx if max_ctx > 0 else ctx
+    cb = cb_split_at(priced_ctx)
+    vram_used = vram_at(priced_ctx)
+    vram_ok = max_ctx > 0 and vram_used <= eff_vram
+    ffn_cpu_w = cost["cpu_block_mib"] + head_ram
+    ram_used = ffn_cpu_w + cb["cpu"]
+    ram_ok = ram_used <= ram
+
+    if max_ctx <= 0:
+        head = ("No context fits with every layer on the GPU: attention weights alone are "
+                "%.0f MiB, and with the compute buffer and recurrent state that is %.0f MiB "
+                "before a single token of KV. This plan is infeasible on this card - the "
+                "context plan trades layers for context instead."
+                % (cost["gpu_block_mib"] + extra, fixed + cb_at(1)))
+    else:
+        head = ("All %d layers' attention and KV on the GPU; every dense FFN on the CPU (-ot). "
+                "Largest context that still fits that way: ~%s tokens."
+                % (n_layers, f"{max_ctx:,}"))
+    if not ram_ok:
+        head += "  WARNING: FFN + head need %.0f MiB RAM (> %.0f budget)." % (ram_used, ram)
+    ls = ["GPU Offload / GPU Layers: max (all %d)" % n_layers,
+          "Every dense FFN pinned to the CPU via -ot (LM Studio has no dense-FFN-only "
+          "toggle - run the llama.cpp command below).",
+          "Context Length: up to ~%s tokens" % f"{max_ctx:,}"]
     return {
-        "kind": "dense_kv_gpu", "fits_fully": False, "kv_on_gpu": True, "kv_overflow": True,
-        "ffn_on_cpu": n_ffn, "ffn_on_gpu": 0, "n_ffn_layers": n_ffn,
-        "n_gpu_layers": n_layers,
-        "vram_used_mib": base_gpu, "vram_budget_mib": eff_vram, "ram_used_mib": ffn_total,
-        "gpu_weights_mib": onchip_attn, "gpu_kv_mib": kv_total, "compute_mib": compute,
+        "kind": "dense_speed", "mode": "speed", "fits_fully": False,
+        "n_gpu_layers": n_layers, "cpu_layers": 0, "n_cpu_ffn": n_cpu_ffn,
+        "vram_ok": vram_ok,
+        "vram_used_mib": vram_used, "vram_budget_mib": eff_vram,
+        "ram_used_mib": ram_used, "ram_ok": ram_ok,
+        "max_ctx": max_ctx, "max_ctx_gpu": max_ctx_gpu,
+        "gpu_weights_mib": cost["gpu_block_mib"] + extra,
+        "gpu_kv_mib": kv_at(priced_ctx),
+        "compute_mib": cb["gpu"], "cpu_compute_mib": cb["cpu"],
         "gpu_recurrent_mib": rec_total,
-        "cpu_weights_mib": ffn_total + head_ram, "cpu_kv_mib": 0.0, "max_ctx_gpu": max_ctx_gpu,
-        "max_ctx_kv_gpu": max_ctx_kv_gpu,
-        "lmstudio": ["Attention weights that must stay on GPU: %.0f MiB (KV can't live apart from them)." % onchip,
-                     "Those + %.0f MiB KV + %.0f MiB compute = %.0f MiB (budget %.0f MiB)."
-                     % (kv_total, compute, base_gpu, eff_vram),
-                     "Max context with all KV on GPU (FFN on CPU): ~%s tokens." % f"{max_ctx_kv_gpu:,}",
-                     "For KV-on-GPU at usable context, drop to a smaller quant (e.g. Q4_K_M)."],
-        "llama_cmd": "llama-server -m <model.gguf> -ngl 999 %s -c %d -fa -ctk %s -ctv %s" % (
-            _ffn_cpu_flag(), max(1024, max_ctx_kv_gpu), kv_type, kv_type),
+        "cpu_weights_mib": ffn_cpu_w, "cpu_kv_mib": 0.0, "cpu_recurrent_mib": 0.0,
+        "forced_ngl": False,
+        "lmstudio": ls,
+        "llama_cmd": _llama_flags(priced_ctx, kv_type, flash_attn, ngl=99,
+                                  n_cpu_ffn=n_layers),
+        "headline": head,
+    }
+
+
+def _plan_dense_context(cfg, cl, eff_vram, ram, kv_total, weights, embed, output,
+                        rec_total, max_ctx_gpu, ctx, kv_type, flash_attn, n_seq,
+                        compute_fn, gpu_extra, layer_max, layer_mean, ffn_layer_mean):
+    """Plan FOR CONTEXT: the context is pinned and it is the thing being
+    protected. Two knobs pay for it, in this order:
+
+      1. The dense FFN is exiled to the CPU (-ot), and the search asks how
+         LITTLE of it has to go. Exiling FFN frees VRAM without costing any KV,
+         so with every block still on the GPU the answer is the SMALLEST
+         n_cpu_ffn that fits - exactly the shape of the MoE planner's
+         --n-cpu-moe search, and for the same reason: those are the only weights
+         big enough to be worth moving, and moving them does not drag KV along.
+      2. Only when even a full FFN exile is not enough does -ngl come down. That
+         is the expensive step - a whole block leaving the GPU takes its KV with
+         it - so it is the fallback, not the first move.
+
+    The old planner pinned n_cpu_ffn at every block unconditionally and went
+    straight to walking -ngl. On a card with room to spare that left VRAM unused
+    and streamed FFN weights over PCIe every token for no reason.
+
+    The sibling (speed plan) pins the other way: -ngl and the FFN exile are both
+    at maximum and the CONTEXT is what is free."""
+    n_layers = cfg["n_layers"] or 0
+    gpu_extra = gpu_extra or (lambda ngl: 0.0)
+
+    def build(ngl, n_cpu_ffn):
+        cost = _dense_cost(cfg, cl, ngl, n_cpu_ffn, layer_max, layer_mean, ffn_layer_mean)
+        cb = (compute_fn(ngl, any_on_cpu=graph_is_split(n_layers, ngl, 0, n_cpu_ffn))
+              if compute_fn else {"gpu": 0.0, "cpu": 0.0})
+        extra = gpu_extra(ngl)
+        gpu_w = cost["gpu_block_mib"] + extra
+        cpu_w = cost["cpu_block_mib"] + embed + output - extra
+        if ngl >= n_layers:
+            gpu_kv, gpu_rec = kv_total, rec_total
+        else:
+            gpu_kv  = _mib(kv_bytes_total(cfg, kv_type, cost["on_gpu"]))
+            gpu_rec = _mib(recurrent_bytes(cfg, cost["on_gpu"], n_seq))
+        vram_used = gpu_w + gpu_kv + gpu_rec + cb["gpu"]
+        ram_used = cpu_w + (kv_total - gpu_kv) + (rec_total - gpu_rec) + cb["cpu"]
+        return cost, cb, extra, gpu_w, cpu_w, gpu_kv, gpu_rec, vram_used, ram_used
+
+    # Phase 1: every block on the GPU, and as much FFN kept there as fits.
+    # Ascending, so the first hit is the LEAST FFN exiled - the most weight left
+    # in VRAM. n_cpu_ffn=0 is "nothing exiled at all", which is the right answer
+    # whenever the whole model fits at this context.
+    best = None
+    n_cpu_ffn = n_layers
+    for f in range(0, n_layers + 1):
+        c = build(n_layers, f)
+        if c[7] <= eff_vram:
+            best, n_cpu_ffn = (n_layers, c), f
+            break
+    # Phase 2: a full FFN exile still does not fit, so blocks have to go too.
+    # Blocks are not interchangeable, so search downward for the largest ngl
+    # that does - the same rule the classic planner uses.
+    if best is None:
+        n_cpu_ffn = n_layers
+        for ngl in range(n_layers - 1, -1, -1):
+            c = build(ngl, n_cpu_ffn)
+            if c[7] <= eff_vram:
+                best = (ngl, c)
+                break
+    if best is None:
+        ngl, c = 0, build(0, n_cpu_ffn)
+        cost, cb, extra, gpu_w, cpu_w, gpu_kv, gpu_rec, vram_used, ram_used = c
+        head = ("The context cannot fit even with nothing on the GPU: %.0f MiB of KV alone "
+                "exceeds the %.0f MiB RAM budget plus whatever the card keeps. Lower the "
+                "context or the KV quant." % (kv_total, ram))
+        overflow = True
+    else:
+        ngl, c = best
+        cost, cb, extra, gpu_w, cpu_w, gpu_kv, gpu_rec, vram_used, ram_used = c
+        if n_cpu_ffn <= 0:
+            head = ("Context %s pinned: all %d layers on the GPU, whole - nothing "
+                    "had to be exiled to fit it." % (f"{ctx:,}", n_layers))
+        elif ngl >= n_layers:
+            head = ("Context %s pinned: all %d layers on the GPU, with the first %d "
+                    "blocks' dense FFN on the CPU (-ot) to pay for it. The other %d "
+                    "keep their FFN in VRAM."
+                    % (f"{ctx:,}", n_layers, n_cpu_ffn, n_layers - n_cpu_ffn))
+        else:
+            head = ("Context %s pinned: %d of %d layers on GPU, every dense FFN on "
+                    "the CPU (-ot). The other %d layers run on the CPU, KV and all "
+                    "- that is the price of the context."
+                    % (f"{ctx:,}", ngl, n_layers, n_layers - ngl))
+        overflow = False
+    if not (ram_used <= ram):
+        head += "  WARNING: needs %.0f MiB RAM (> %.0f budget)." % (ram_used, ram)
+    ls = ["GPU Offload / GPU Layers: %s"
+          % ("max (all %d)" % n_layers if ngl >= n_layers else ngl)]
+    if n_cpu_ffn:
+        ls.append("The first %d blocks' dense FFN pinned to the CPU via -ot (LM Studio "
+                  "has no dense-FFN-only toggle - run the llama.cpp command below)."
+                  % n_cpu_ffn)
+    ls.append("Context Length: %s tokens" % f"{ctx:,}")
+    return {
+        "kind": "dense_context", "mode": "context", "fits_fully": False,
+        "n_gpu_layers": ngl, "cpu_layers": n_layers - ngl, "n_cpu_ffn": n_cpu_ffn,
+        "kv_overflow": overflow or None,
+        "vram_ok": vram_used <= eff_vram,
+        "vram_used_mib": vram_used, "vram_budget_mib": eff_vram,
+        "ram_used_mib": ram_used, "ram_ok": ram_used <= ram,
+        "max_ctx": ctx, "max_ctx_gpu": max_ctx_gpu,
+        "gpu_weights_mib": gpu_w, "gpu_kv_mib": gpu_kv, "compute_mib": cb["gpu"],
+        "cpu_compute_mib": cb["cpu"], "gpu_recurrent_mib": gpu_rec,
+        "cpu_weights_mib": cpu_w, "cpu_kv_mib": kv_total - gpu_kv,
+        "cpu_recurrent_mib": rec_total - gpu_rec,
+        "forced_ngl": False,
+        "lmstudio": ls,
+        "llama_cmd": _llama_flags(ctx, kv_type, flash_attn,
+                                  ngl=(99 if ngl >= n_layers else ngl),
+                                  n_cpu_ffn=n_cpu_ffn or None),
         "headline": head,
     }
 

@@ -47,9 +47,21 @@ def plan_config(plan_result):
     """
     plan = (plan_result or {}).get("plan") or {}
     inp = (plan_result or {}).get("inputs") or {}
-    c = {"ngl": plan.get("n_gpu_layers"), "ncmoe": plan.get("n_cpu_moe") or 0}
-    if inp.get("context") is not None:
+    c = {"ngl": plan.get("n_gpu_layers"), "ncmoe": plan.get("n_cpu_moe") or 0,
+         # The -ot pin is what DEFINES both dense modes, so it has to survive
+         # into the launch script; without it the script asks for the layers of
+         # a speed plan and none of the tensor split that made them fit.
+         "n_cpu_ffn": plan.get("n_cpu_ffn") or 0}
+    # A speed plan's answer IS its context - the largest that fits at ngl=all with
+    # the FFN exiled - and that is generally not the number the user typed in. Take
+    # the plan's own where it has one, or every speed row is judged against a
+    # context the plan never proposed and rejected as answering another question.
+    if plan.get("max_ctx") is not None:
+        c["ctx"] = int(plan["max_ctx"])
+    elif inp.get("context") is not None:
         c["ctx"] = inp["context"]
+    if inp.get("mmproj_place") in ("vram", "ram"):
+        c["mmproj_offload"] = inp["mmproj_place"] == "vram"
     if inp.get("kv_type"):
         c["kv"] = inp["kv_type"]
     if inp.get("n_ubatch") is not None:

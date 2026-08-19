@@ -390,18 +390,22 @@ def compute_buffer_split(terms, any_on_gpu, any_on_cpu, n_gpu_layers=0, override
     return {"gpu": round(gpu, 1), "cpu": round(cpu, 1)}
 
 
-def graph_is_split(n_layers, ngl, n_cpu_moe=0):
+def graph_is_split(n_layers, ngl, n_cpu_moe=0, n_cpu_ffn=0):
     """Does the graph span both backends? THE definition of `any_on_cpu`.
 
-    Both knobs move work to the CPU and they are independent: --n-cpu-moe pins
-    the routed experts of the first M blocks there even at ngl == n_layers, so
-    testing ngl alone reports every expert offload as unsplit. The planner and
-    the calibration fit must read this from one place - when they did not, the
-    fit saw those rows as unsplit and quietly absorbed the split surcharge into
-    `const`, after which prediction charged it a second time. On a 26B MoE at
-    262k that was ~850 MiB of phantom VRAM, about two expert layers."""
+    Three knobs move work to the CPU and they are independent:
+      * -ngl < all        -> whole blocks on the CPU
+      * --n-cpu-moe M     -> only the routed experts of the first M blocks
+      * -ot FFN=CPU (N)   -> only the dense FFN tensors of the first N blocks
+    The last two pin tensors even at ngl == n_layers, so testing ngl alone
+    reports those offloads as unsplit. The planner and the calibration fit
+    must read this from one place - when they did not, the fit saw those rows
+    as unsplit and quietly absorbed the split surcharge into `const`, after
+    which prediction charged it a second time. On a 26B MoE at 262k that was
+    ~850 MiB of phantom VRAM, about two expert layers."""
     return bool((n_layers and ngl is not None and ngl < n_layers)
-                or (n_cpu_moe or 0) > 0)
+                or (n_cpu_moe or 0) > 0
+                or (n_cpu_ffn or 0) > 0)
 
 
 def output_head_on_gpu(n_layers, ngl):

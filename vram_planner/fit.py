@@ -184,7 +184,8 @@ def predict_graph(row, coeffs=None):
     cfg = row_cfg(row)
     terms = compute_buffer_terms(cfg, c["ctx"], c["ub"], c["fa"], c["seq"], c["kv"],
                                  coeffs=coeffs)
-    split = graph_is_split(cfg["n_layers"], c["ngl"], c.get("ncmoe"))
+    split = graph_is_split(cfg["n_layers"], c["ngl"], c.get("ncmoe"),
+                           c.get("n_cpu_ffn"))
     return terms["graph"] + (terms["split_extra"] if split else 0.0)
 
 
@@ -247,15 +248,17 @@ def predict_total(row):
                 vram_budget_mib=1 << 20, ram_budget_mib=1 << 20, gpu_reserve_mib=0,
                 compute_override_mib=None, safety_pct=0, n_seq=c["seq"],
                 gpu_layers_override=c["ngl"], include_mmproj=False,
-                n_cpu_moe_override=(c.get("ncmoe") or None))
+                n_cpu_moe_override=(c.get("ncmoe") or None),
+                n_cpu_ffn_override=(c.get("n_cpu_ffn") or None))
     return r["plan"].get("vram_used_mib")
 
 
 def label(row):
     c = row["config"]
-    return "%s ctx %d ngl %d ub %d np %d fa %d %s%s" % (
+    return "%s ctx %d ngl %d ub %d np %d fa %d %s%s%s" % (
         row["model"][:26], c["ctx"], c["ngl"], c["ub"], c["seq"], c["fa"], c["kv"],
-        " ncmoe %d" % c["ncmoe"] if c.get("ncmoe") else "")
+        " ncmoe %d" % c["ncmoe"] if c.get("ncmoe") else "",
+        " nffn %d" % c["n_cpu_ffn"] if c.get("n_cpu_ffn") else "")
 
 
 def cross_validate(rows, fit_fn, predict_fn, group_fn, group_name):

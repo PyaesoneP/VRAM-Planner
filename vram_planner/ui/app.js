@@ -16,6 +16,12 @@
 const $ = id => document.getElementById(id);
 let SYS = null, MODELS = [], LAST = null, CTX_MAX = null;
 
+// Which of the two dense plans the fit card is showing. Null means "let the
+// planner decide", which is what the first analyze sends; after that it is the
+// user's pick, and it rides both the next analyze and the sweep so the campaign
+// optimises the plan on screen rather than the one the server would have chosen.
+let PLAN_MODE = null;
+
 const CALIB_TERMS = ["floor", "ctx", "act", "nofa"];
 
 /* ---------------------------------------------------------------- escaping */
@@ -357,7 +363,7 @@ async function run(){
     kv_type: $("kv").value,
     n_ubatch: parseInt($("ubatch").value) || 512,
     n_seq: parseInt($("nseq").value) || 1,
-    include_mmproj: $("mmproj").checked,
+    mmproj_place: $("mmprojplace").value,
     mtp_spec: $("mtpspec").checked,
     // The drafter picker: "auto" (empty value) asks the server for the DFlash
     // drafter next to the model, "__none__" or a hidden field sends nothing,
@@ -370,6 +376,11 @@ async function run(){
       : (!$("dflashfield").hidden && $("draftpath").value.trim()
          ? $("draftpath").value.trim() : ""),
     n_cpu_moe_override: $("ncpumoe").value === "" ? null : parseInt($("ncpumoe").value),
+    n_cpu_ffn_override: $("ncpuffn").value === "" ? null : parseInt($("ncpuffn").value),
+    // Which of the two dense plans to report. Null on the first analyze of a
+    // model - the toggle has no value until a card has been drawn - and the
+    // user's pick on every one after, so re-analyzing keeps the mode on screen.
+    plan_mode: PLAN_MODE,
     bw_vram_gbs: parseFloat($("bwv").value) || 0,
     bw_ram_gbs: parseFloat($("bwr").value) || 0,
     ram_eff: parseFloat($("rameff").value) || 0,
@@ -380,7 +391,6 @@ async function run(){
     gpu_reserve_mib: parseFloat($("reserve").value) || 0,
     compute_override_mib: parseFloat($("compute").value) || 0,
     safety_pct: parseFloat($("safety").value) || 0,
-    kv_on_gpu: $("kvgpu").checked,
     gpu_layers_override: $("ngl").value.trim() === "" ? null : parseInt($("ngl").value),
     ram_free_mib: (SYS && SYS.ram) ? SYS.ram.free_mib : null,
     // Only sent when "Plan for images" is ticked. Absent means a text-only plan,
@@ -474,8 +484,10 @@ const REC_KIND = {
 function cfgLine(c){
   if(!c) return "—";
   const bits = [];
+  if(c.ctx) bits.push(num(c.ctx) + " ctx");
   if(c.ngl != null) bits.push("ngl " + c.ngl);
   if(c.ncmoe) bits.push("ncmoe " + c.ncmoe);
+  if(c.n_cpu_ffn) bits.push("ot " + c.n_cpu_ffn);
   if(c.ub) bits.push("ub " + c.ub);
   if(c.spec && c.spec !== "none")
     bits.push(c.spec + (c.spec_n_max ? "/" + c.spec_n_max : ""));
@@ -595,6 +607,38 @@ function recToScript(){
 }
 
 /* ------------------------------------------------------------ result cards */
+/* The two dense plans, as a toggle.
+ *
+ * A model that does not fit has one answer per question: keep every block's
+ * attention and KV on the GPU with the dense FFN exiled and take the largest
+ * context that still fits (SPEED), or hold the context you asked for and walk
+ * -ngl down until it fits (CONTEXT). The server computes both and preselects
+ * one, so flipping is free - no round trip, and every card below re-renders
+ * from the plan that was picked. */
+function renderModes(r){
+  if(!r.plans || !r.plans.speed || !r.plans.context) return "";
+  const mode = r.plan_mode || "speed";
+  const btn = (id, title, sub) => h`<button type="button" class="modebtn${
+    mode === id ? " on" : ""}" data-action="plan-mode" data-mode="${id}"
+    aria-pressed="${mode === id ? "true" : "false"}">
+    <b>${title}</b><span>${sub}</span></button>`;
+  const sp = r.plans.speed, cx = r.plans.context;
+  return h`<section class="card modes">
+    <p class="sublabel">PLAN FOR</p>
+    <div class="moderow">
+      ${raw(btn("speed", "Speed",
+                num(sp.max_ctx || 0) + " ctx · all " + (sp.n_gpu_layers || 0) + " layers"))}
+      ${raw(btn("context", "Context",
+                num(cx.max_ctx || r.inputs.context) + " ctx · "
+                + (cx.n_gpu_layers || 0) + " layers"))}
+    </div>
+    <p class="note">Both exile every block&rsquo;s dense FFN to RAM (<b>-ot</b>); they differ in
+      what is left free. <b>Speed</b> pins every layer on the GPU so all the KV stays in VRAM
+      and the window is whatever still fits. <b>Context</b> holds the window you asked for and
+      gives up layers to pay for it.</p>
+  </section>`;
+}
+
 function renderVerdict(r){
   const c = r.config, p = r.plan, s = r.sizes_mib, inp = r.inputs;
   // The state comes from the server now. The browser used to re-derive its own
@@ -674,9 +718,7 @@ function renderWarnings(r){
 function renderSettings(r){
   const p = r.plan;
   let tail = "";
-  if(p.max_ctx_kv_gpu != null)
-    tail = h`<p class="note">Max context with <b>all KV on GPU</b> (FFN on CPU): ~<b>${num(p.max_ctx_kv_gpu)}</b> tokens.</p>`;
-  else if(p.max_ctx_gpu != null)
+  if(p.max_ctx_gpu != null)
     tail = h`<p class="note">Max context fully on GPU at this quant: ~<b>${num(p.max_ctx_gpu)}</b> tokens.</p>`;
 
   return h`<section class="card">
@@ -863,6 +905,9 @@ function render(r){
   const c = r.config;
   $("mmprojfield").hidden = !r.mmproj;
   $("ncpumoefield").hidden = !r.is_moe;
+  // The two override fields are each other's opposite: an MoE has experts to
+  // pin and no dense FFN, a dense model the other way round.
+  $("ncpuffnfield").hidden = !!r.is_moe;
   $("mtprow").hidden = !c.n_mtp_layers;
   // Never hide the drafter field on a plan without one - the picker is how the
   // user asks for one, and its manual path input cannot be reached while hidden.
@@ -911,7 +956,7 @@ function render(r){
   if(step === "fit"){
     // The gate, and then everything the planner DERIVED - which is reference
     // material, not a next action, so it opens closed.
-    panel = renderVerdict(r) + renderWarnings(r) +
+    panel = renderModes(r) + renderVerdict(r) + renderWarnings(r) +
       tier("PREDICTED", "calculated from the model's own metadata — step 2 supersedes it") +
       h`<details class="adv derived"><summary>Settings the planner suggests, its speed
         estimate, and where the memory goes</summary>` +
@@ -1108,7 +1153,7 @@ async function calibrate(){
         n_ubatch: parseInt($("ubatch").value) || 512,
         n_seq: parseInt($("nseq").value) || 1,
         flash_attn: $("fa").checked,
-        include_mmproj: $("mmproj").checked
+        include_mmproj: $("mmprojplace").value !== "none"
       })
     })).json();
   }catch(e){ box.textContent = "calibration failed: " + e; return; }
@@ -1234,6 +1279,8 @@ function tier(label, note){
  * not a place to learn a vocabulary from. Defined once here and reused as the
  * `title` on each <th>, so the two cannot drift. */
 const TERMS = [
+  ["ctx", "context length", "The window the server was STARTED with (-c), which is what the KV cache is sized for — not how much of it was filled. Frozen for the campaign in every mode except dense “plan for speed”, where it is the axis stage A sweeps."],
+  ["ot", "CPU FFN blocks", "How many blocks had their dense FFN tensors (gate/up/down) pinned to system RAM with -ot, leaving their attention and KV in VRAM. Both dense plan modes pin every block; this column shows what actually ran."],
   ["ngl", "GPU layers", "How many transformer blocks live in VRAM. llama.cpp offloads the LAST n, so this is a count and not a list."],
   ["ncmoe", "CPU expert layers", "On an MoE only: the routed experts of the first n blocks are pushed to system RAM, leaving their attention and KV in VRAM. A different knob from ngl, and usually the one that matters — experts are most of the file and only a few of them fire per token."],
   ["ub", "ubatch", "Physical batch size: how many tokens are pushed through the graph at once during prompt processing. Sizes the compute buffer."],
@@ -1310,7 +1357,8 @@ function stepSummary(id, r){
   }
   const row = (typeof sweepPickedRow === "function") ? sweepPickedRow() : null;
   const c = row ? row.config : (SWEEP && SWEEP.predicted);
-  return c ? "ngl " + c.ngl + (c.spec && c.spec !== "none" ? " · " + c.spec : "")
+  return c ? (c.ctx ? num(c.ctx) + " ctx · " : "") + "ngl " + c.ngl
+             + (c.spec && c.spec !== "none" ? " · " + c.spec : "")
            : "not ready";
 }
 
@@ -1532,18 +1580,31 @@ function sweepFormDisabled(){
   return h`<p class="muted small">The grid controls appear once the card is free.</p>`;
 }
 
+/* What the campaign holds fixed and what it varies, said in the sublabel above
+ * the grid. This used to read "context and KV quant are frozen, not swept" for
+ * every campaign - which stopped being true the moment stage A gained a context
+ * axis, and left the one number a speed campaign is FOR invisible on the page. */
+function sweptNote(){
+  const mode = (LAST && LAST.plan_mode) || PLAN_MODE;
+  if(LAST && !LAST.is_moe && mode === "speed")
+    return h`KV quant is taken from the form above and frozen; <b>context is the axis</b>
+      &mdash; stage A sweeps it to find the largest window that loads`;
+  return h`context and KV quant are taken from the form above and frozen, not swept`;
+}
+
 function sweepForm(pf){
   const free = pf && pf.total_mib
     ? h`<span class="muted small">${fmt(pf.free_mib)} of ${fmt(pf.total_mib)} free</span>` : "";
   return h`<div class="sweepform">
-    <p class="sublabel">GRID &middot; context and KV quant are taken from the form above and
-      frozen, not swept ${raw(free)}</p>
+    <p class="sublabel">GRID &middot; ${raw(sweptNote())} ${raw(free)}</p>
     <div class="chips" role="group" aria-label="Stages">
-      ${raw(sweepStage("a", "A &middot; layer wall", "How many blocks fit before it spills"))}
-      ${raw(sweepStage("b", "B &middot; projector", "Vision tower in VRAM or in system RAM"))}
+      ${raw(sweepStage("a", "A &middot; the wall", (LAST && LAST.is_moe)
+        ? "How few experts can sit on the CPU before it spills (--n-cpu-moe)"
+        : (LAST && LAST.plan_mode === "context")
+          ? "How many blocks fit at this context before it spills (-ngl)"
+          : "How large a context fits with every block on the GPU (-c)"))}
       ${raw(sweepStage("c", "C &middot; ubatch", "Physical batch size"))}
       ${raw(sweepStage("d", "D &middot; speculation", "MTP and DFlash draft depths, plus the n-gram types"))}
-      ${raw(sweepStage("e", "E &middot; FFN offload", "First blocks&rsquo; dense FFN tensors to the CPU (-ot), measured at the split the campaign won &mdash; and the freed tensors buy layers back. Dense models only."))}
     </div>
     <div class="row" style="margin-top:10px">
       <div class="field"><label for="swfill">Context filled (tokens)</label>
@@ -1561,25 +1622,11 @@ function sweepForm(pf){
         <input type="number" id="swlimit" step="1" min="1" placeholder="all"></div>
     </div>
     <div class="field" style="max-width:24em">
-      <label for="swmmproj">Vision projector</label>
-      <select id="swmmproj">
-        <option value="">sweep it (that is stage B)</option>
-        <option value="vram">keep in VRAM</option>
-        <option value="ram">move to system RAM</option>
-      </select>
-      <p class="hint">Pin it when you already know where you want it and are sweeping something else.
-        <details class="why"><summary>why it is worth an axis</summary>
-          Where the projector lives is a real axis &mdash; it was worth ~900 MiB of VRAM on one
-          model, which bought back whole expert layers. Sweeping it is stage B. Before this
-          control the only way to pin it was to write
-          <span class="mono">mmproj_offload=false</span> into the axes box.</details></p>
-    </div>
-    <div class="field" style="max-width:24em">
       <label for="swot">Dense FFN blocks on CPU (-ot)</label>
-      <input type="number" id="swot" min="0" step="1" placeholder="blank = sweep it (stage E)">
-      <p class="hint">Pin the count when you already know it &mdash; e.g. the plan&rsquo;s
-        &ldquo;KV on GPU, FFN in RAM&rdquo;. Stage E then drops, exactly like the projector
-        pin drops stage B. Dense models only; an MoE&rsquo;s experts are stage A&rsquo;s
+      <input type="number" id="swot" min="0" step="1" placeholder="blank = the plan mode's split">
+      <p class="hint">Blank measures the split the plan mode proposes, which is every
+        block&rsquo;s dense FFN on the CPU. Fill it in only to measure some other count.
+        Dense models only; an MoE&rsquo;s experts are stage A&rsquo;s
         <span class="mono">--n-cpu-moe</span> ladder.</p>
     </div>
     <div class="field" style="max-width:24em">
@@ -1658,7 +1705,7 @@ function sweepForm(pf){
     <details class="adv" id="swaxesbox"><summary>Sweep exact values instead of the stages</summary>
       <p class="hint">The staged grid moves one knob at a time from a baseline, which cannot
         answer a question about an <b>interaction</b>. Stage D only ever tries speculation at the
-        split stage B settled on &mdash; so if that split is already at the memory ceiling, every
+        split stage A settled on &mdash; so if that split is already at the memory ceiling, every
         speculative row OOMs and the campaign reads as &ldquo;speculation does not work here&rdquo;
         when the truth is &ldquo;speculation needs one more rung of offload&rdquo;.</p>
       <div class="field">
@@ -1748,7 +1795,7 @@ function sweepStage(letter, label, hint){
 
 function sweepStages(){
   return Array.from(document.querySelectorAll(".swstage"))
-    .filter(x => x.checked).map(x => x.value).join("") || "a";
+    .filter(x => x.checked).map(x => x.value).join("") || "a";   // A alone is a campaign
 }
 
 function sweepBody(){
@@ -1770,12 +1817,13 @@ function sweepBody(){
            verify: verify,
            verify_overrides: verify ? ($("swverifyoverrides").value.trim() || null) : null,
            axes: ($("swaxes") && $("swaxes").value.trim()) || null,
-           // "" = sweep it (stage B's job). Otherwise pinned for the campaign,
-           // which is a different thing from absent and has to survive as one.
-           mmproj_offload: (($("swmmproj") && $("swmmproj").value) || "") === ""
-             ? null : $("swmmproj").value === "ram" ? false : true,
-           // Blank means "sweep it" - stage E's job - and has to survive as a
-           // distinct third state, exactly like the projector pin above.
+           // Both taken from the plan form, not swept: the projector's placement
+           // is the user's decision, and stage A's axis is whichever question the
+           // fit card's toggle is currently showing.
+           mmproj_place: $("mmprojplace").value,
+           plan_mode: (LAST && LAST.plan_mode) || PLAN_MODE || null,
+           // Blank lets the plan mode pin every block, which is what the modes
+           // are; a number measures some other split by hand.
            ot: v("swot"),
            // A typed path wins; otherwise the select, where "" is auto (the
            // server's discovery, the long-standing default) and __none__ is no
@@ -1820,7 +1868,8 @@ async function sweepPlan(){
   }catch(e){ box.innerHTML = h`<p class="note">preview failed: ${e}</p>`; return; }
   if(!d.ok){ box.innerHTML = h`<p class="note" style="color:var(--warn)">${d.error}</p>`; return; }
   const rows = (d.configs || []).map(c => h`<tr>
-    <td>${c.stage || "-"}</td><td>${c.ngl}</td><td>${c.ncmoe || 0}</td><td>${c.ub}</td>
+    <td>${c.stage || "-"}</td><td>${num(c.ctx || 0)}</td><td>${c.ngl}</td>
+    <td>${c.ncmoe || 0}</td><td>${c.n_cpu_ffn || 0}</td><td>${c.ub}</td>
     <td>${num(c.fill || 0)}</td><td class="mono">${c.spec || "none"}</td>
     <td>${c.spec_n_max || 0}</td>
     <td>${c.mmproj_offload === false ? "RAM" : "VRAM"}</td></tr>`).join("");
@@ -1846,7 +1895,8 @@ async function sweepPlan(){
         bounded: anything a round revisits unchanged is already recorded and is skipped, so a
         round only pays for combinations round 1 never tried.</p>` : "") +
     (d.planned ? h`<div class="tablewrap"><table>
-      <thead><tr><th>stage</th><th>ngl</th><th>ncmoe</th><th>ub</th><th>fill</th>
+      <thead><tr><th>stage</th><th title="${termTitle("ctx")}">ctx</th><th>ngl</th>
+        <th>ncmoe</th><th title="${termTitle("ot")}">ot</th><th>ub</th><th>fill</th>
         <th>spec</th><th>n-max</th><th>projector</th></tr></thead>
       <tbody>${raw(rows)}</tbody></table></div>` : "");
 }
@@ -2011,7 +2061,9 @@ function rowFlags(r){
 }
 
 const ROW_HEAD = h`<thead><tr><th></th><th>tok/s</th><th>prefill</th>
+  <th title="${termTitle("ctx")}">ctx</th>
   <th title="${termTitle("ngl")}">ngl</th><th title="${termTitle("ncmoe")}">ncmoe</th>
+  <th title="${termTitle("ot")}">ot</th>
   <th title="${termTitle("ub")}">ub</th><th title="${termTitle("fill")}">fill</th>
   <th title="${termTitle("spec")}">spec</th><th title="${termTitle("proj")}">proj</th>
   <th title="${termTitle("accepted")}">accepted</th><th>VRAM</th><th></th>
@@ -2055,7 +2107,8 @@ function sweepRow(r, i, pickable){
     <td>${raw(failed ? h`<span style="color:var(--warn)">${r.status}</span>`
                      : h`<b>${(r.tok_s || 0).toFixed(2)}</b>`)}</td>
     <td>${(r.prefill_tok_s || 0).toFixed(0)}</td>
-    <td>${c.ngl}</td><td>${c.ncmoe || 0}</td><td>${c.ub}</td>
+    <td>${num(c.ctx || 0)}</td>
+    <td>${c.ngl}</td><td>${c.ncmoe || 0}</td><td>${c.n_cpu_ffn || 0}</td><td>${c.ub}</td>
     <td>${num(c.fill || 0)}</td>
     <td class="mono">${c.spec || "none"}${c.spec_n_max ? "/" + c.spec_n_max : ""}</td>
     <td>${c.mmproj_offload === false ? "RAM" : "VRAM"}</td>
@@ -2503,7 +2556,8 @@ function depthPanel(depth){
     const c = d.config || {};
     const pts = d.points.map(p => h`<span class="vchip">${num(p.fill)}
       <i>${p.tok_s.toFixed(2)}</i></span>`).join(" → ");
-    return h`<tr><td class="mono small">ngl ${c.ngl} ub ${c.ub} ${c.spec || "none"}</td>
+    return h`<tr><td class="mono small">${num(c.ctx || 0)} ctx ngl ${c.ngl} ub ${
+      c.ub} ${c.spec || "none"}</td>
       <td>${raw(pts)}</td>
       <td class="gain ${d.drop_pct > 20 ? "down" : ""}">&minus;${(d.drop_pct || 0).toFixed(0)}%</td>
       </tr>`;
@@ -2520,8 +2574,8 @@ function paretoPanel(pf){
   if(!pf || pf.length < 2) return "";
   const body = pf.map(r => { const c = r.config || {};
     return h`<tr><td><b>${(r.tok_s || 0).toFixed(2)}</b></td><td>${fmt(r.proc_vram_mib)}</td>
-      <td class="mono small">ngl ${c.ngl} ncmoe ${c.ncmoe || 0} ub ${c.ub} ${
-        c.spec || "none"}</td></tr>`; }).join("");
+      <td class="mono small">${num(c.ctx || 0)} ctx ngl ${c.ngl} ncmoe ${
+        c.ncmoe || 0} ub ${c.ub} ${c.spec || "none"}</td></tr>`; }).join("");
   return h`<p class="sublabel" style="margin-top:16px">SPEED VS VRAM</p>
     <p class="note">Nothing measured is both faster <i>and</i> smaller than these. &ldquo;The
       fastest&rdquo; and &ldquo;the fastest that still leaves the desktop a card to draw on&rdquo;
@@ -2602,6 +2656,18 @@ const ACTIONS = {
                          if(stepNow() !== "script"){ setStep("script"); return; }
                          drawSweep({ grid: false, script: true, history: true }); },
   "set-step":    el => setStep(el.dataset.step),
+  // Both plans are already on LAST, so the flip is local: swap which one the
+  // cards read from and redraw. PLAN_MODE then rides the next analyze and the
+  // sweep, so the campaign optimises the plan that is on screen.
+  "plan-mode":   el => {
+    const m = el.dataset.mode;
+    if(!LAST || !LAST.plans || !LAST.plans[m] || LAST.plan_mode === m) return;
+    PLAN_MODE = m;
+    LAST.plan_mode = m;
+    LAST.plan = LAST.plans[m];
+    LAST.speed = LAST.plan.speed || LAST.speed;
+    render(LAST);
+  },
   "sweep-open":  el => openCampaign(el.dataset.id),
   "sweep-del":     el => askDelete(el.dataset.id),
   "sweep-del-yes": el => doDelete(el.dataset.id),

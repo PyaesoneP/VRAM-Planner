@@ -29,6 +29,29 @@ RE_EXPS = re.compile(r'^blk\.(\d+)\.ffn_[a-z0-9_]*exps\.')
 RE_FFN  = re.compile(r'^blk\.(\d+)\.ffn_(gate|up|down)\.weight')  # dense FFN weights
 
 
+def ot_regex(n_cpu_ffn):
+    """The --override-tensor regex that pins the first N blocks' dense FFN
+    tensors to the CPU - the planner's "KV on GPU, FFN in RAM" mode, made
+    measurable.
+
+    Every block number is spelled out rather than written as a class: a regex
+    like `blk\\.0*` would match the 0 in `blk.10`, and pinning block 10's FFN
+    by accident is exactly the kind of silent difference a measured row then
+    certifies. The trailing `\\.` after the number anchors it either way, but
+    spelling the alternation makes the intent literal instead of relying on
+    the reader to know why the anchor matters. `=CPU` is llama.cpp's buffer
+    type override: the tensor stays on the CPU whatever the device list says.
+
+    Home is here, not sweep.py, because it is vocabulary about tensor NAMES
+    (RE_FFN's) and the planner - above sweep in the import DAG - needs it to
+    print the command a plan describes."""
+    n = max(0, int(n_cpu_ffn or 0))
+    if n == 0:
+        return ""
+    blocks = "|".join(str(i) for i in range(n))
+    return r"blk\.(%s)\.ffn_(gate|up|down)\.weight=CPU" % blocks
+
+
 def _as_int(v, default=None):
     if v is None:
         return default

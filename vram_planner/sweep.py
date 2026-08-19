@@ -23,7 +23,7 @@ never started.
 import contextlib, json, os, re, subprocess, sys, time
 from .const import MiB
 from .gguf import load_gguf, parse_meta_only
-from .model import extract_config
+from .model import extract_config, ot_regex   # re-export: home is model.py
 from .gpu import get_gpu_processes, gpu_list
 from .lmstudio import default_models_dir
 from .paths import _data_dir
@@ -519,18 +519,25 @@ FLOOR_MIN_MIB = -32.0             # a little slack for counter jitter
 FLOOR_MAX_MIB = 4096.0            # a floor larger than this is not a CUDA context
 
 
-def suspect_reason(row):
-    """Why this row should not be fitted, or "" if it looks sound."""
+def unsound_reason(row):
+    """Why this row's NUMBERS should not be believed, or "" if they look sound.
+
+    Purely about the measurement: could the process VRAM be read, is the floor a
+    plausible CUDA context, was there room on the card at measure time. Nothing
+    here is about what the row is a measurement OF.
+
+    Split out of suspect_reason() because the two questions had been sharing an
+    answer, and the difference stopped being academic the moment both dense plan
+    modes started pinning -ot on every row. suspect_reason() adds one clause
+    that means "this cannot enter the ALLOCATION FIT" - a fact about the fit
+    equation, not about the row - and bench.py was reading the combined verdict
+    to decide whether a SPEED row could be trusted. Every row of every dense
+    campaign came back untrustworthy, so no stage could promote anything and
+    best_config() had nothing to pick: the same "a detector that fires on
+    everything reports nothing" failure demoted() documents.
+    """
     if row.get("status") != "ok":
         return ""
-    if (row.get("config") or {}).get("n_cpu_ffn"):
-        # The allocation equation has no term for a tensor split: it prices
-        # whole blocks, and a block whose FFN lives in system RAM does not
-        # cost what the model says. Fitting it would smear the difference
-        # over every other coefficient, so the row stays visible as a probe
-        # and never enters the fit.
-        return ("dense FFN tensors pinned to the CPU (-ot), which the fit "
-                "model cannot price")
     fl = row.get("floor_mib")
     if fl is None:
         return "per-process VRAM could not be read"
@@ -544,6 +551,24 @@ def suspect_reason(row):
     if free is not None and free < 192.0:
         return "only %.0f MiB of VRAM was free at measure time" % free
     return ""
+
+
+def suspect_reason(row):
+    """Why this row should not be FITTED, or "" if it looks sound.
+
+    The allocation fit's gate: everything unsound_reason() rejects, plus tensor
+    splits. Speed rows must NOT be judged by this - see unsound_reason()."""
+    if row.get("status") != "ok":
+        return ""
+    if (row.get("config") or {}).get("n_cpu_ffn"):
+        # The allocation equation has no term for a tensor split: it prices
+        # whole blocks, and a block whose FFN lives in system RAM does not
+        # cost what the model says. Fitting it would smear the difference
+        # over every other coefficient, so the row stays visible as a probe
+        # and never enters the fit.
+        return ("dense FFN tensors pinned to the CPU (-ot), which the fit "
+                "model cannot price")
+    return unsound_reason(row)
 
 
 def _free_mib():
@@ -667,25 +692,6 @@ def _drafter_block_size(drafter_path):
         return 0
     v = meta.get("dflash.block_size")
     return int(v) if isinstance(v, int) and v > 0 else 0
-
-
-def ot_regex(n_cpu_ffn):
-    """The --override-tensor regex that pins the first N blocks' dense FFN
-    tensors to the CPU - the planner's "KV on GPU, FFN in RAM" mode, made
-    measurable.
-
-    Every block number is spelled out rather than written as a class: a regex
-    like `blk\\.0*` would match the 0 in `blk.10`, and pinning block 10's FFN
-    by accident is exactly the kind of silent difference a measured row then
-    certifies. The trailing `\\.` after the number anchors it either way, but
-    spelling the alternation makes the intent literal instead of relying on
-    the reader to know why the anchor matters. `=CPU` is llama.cpp's buffer
-    type override: the tensor stays on the CPU whatever the device list says."""
-    n = max(0, int(n_cpu_ffn or 0))
-    if n == 0:
-        return ""
-    blocks = "|".join(str(i) for i in range(n))
-    return r"blk\.(%s)\.ffn_(gate|up|down)\.weight=CPU" % blocks
 
 
 def classify_drafter(path):

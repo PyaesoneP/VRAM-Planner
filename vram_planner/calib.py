@@ -295,7 +295,8 @@ def _recompute_overheads(data, rows):
                          compute_override_mib=0.001, safety_pct=0,
                          n_seq=r.get("n_seq", 1), gpu_layers_override=r.get("ngl"),
                          include_mmproj=False,
-                         n_cpu_moe_override=(r.get("n_cpu_moe") or None))
+                         n_cpu_moe_override=(r.get("n_cpu_moe") or None),
+                         n_cpu_ffn_override=(r.get("n_cpu_ffn") or None))
         except Exception:
             continue
         p = rr["plan"]
@@ -355,7 +356,8 @@ def _row_flags(row):
     more - it is host memory in every measured load - so those rows are usable now
     whether or not they carry it."""
     n_layers, ngl = row.get("n_layers"), row.get("ngl")
-    split = graph_is_split(n_layers, ngl, row.get("n_cpu_moe"))
+    split = graph_is_split(n_layers, ngl, row.get("n_cpu_moe"),
+                           row.get("n_cpu_ffn"))
     on_gpu = output_head_on_gpu(n_layers, ngl)
     n_vocab = row.get("n_vocab") or 0
     if row.get("unreliable"):
@@ -585,7 +587,8 @@ def calibration_status(gpu=None):
 
 
 def record_calibration(path, ctx, kv_type, n_ubatch, n_seq, flash_attn, ngl,
-                       include_mmproj, measured_mib, gpu="", n_cpu_moe=0):
+                       include_mmproj, measured_mib, gpu="", n_cpu_moe=0,
+                       n_cpu_ffn=0):
     """Turn one measurement into a training row and refit. The exact terms are
     recomputed here rather than trusted from the client, so a stale plan on screen
     cannot poison the store."""
@@ -594,7 +597,8 @@ def record_calibration(path, ctx, kv_type, n_ubatch, n_seq, flash_attn, ngl,
                 vram_budget_mib=1 << 20, ram_budget_mib=1 << 20, gpu_reserve_mib=0,
                 compute_override_mib=0.001, safety_pct=0, n_seq=n_seq,
                 gpu_layers_override=ngl, include_mmproj=include_mmproj,
-                n_cpu_moe_override=(n_cpu_moe or None))
+                n_cpu_moe_override=(n_cpu_moe or None),
+                n_cpu_ffn_override=(n_cpu_ffn or None))
     cfg, p = r["config"], r["plan"]
     exact = (p.get("gpu_weights_mib", 0.0) + p.get("gpu_kv_mib", 0.0)
              + p.get("gpu_recurrent_mib", 0.0) + p.get("mmproj_mib", 0.0))
@@ -614,8 +618,9 @@ def record_calibration(path, ctx, kv_type, n_ubatch, n_seq, flash_attn, ngl,
            "gpu_free_mib": card.get("free_mib"),
            "backend": current_backend(fresh=True),
            "model": os.path.basename(path), "arch": cfg["arch"],
-           "ctx": ctx, "ub": n_ubatch, "n_seq": n_seq, "fa": bool(flash_attn),
-           "ngl": ngl, "n_cpu_moe": n_cpu_moe, "kv_type": kv_type,
+            "ctx": ctx, "ub": n_ubatch, "n_seq": n_seq, "fa": bool(flash_attn),
+            "ngl": ngl, "n_cpu_moe": n_cpu_moe, "n_cpu_ffn": n_cpu_ffn,
+            "kv_type": kv_type,
            "hidden": cfg["hidden"] or 4096, "n_head": cfg["n_head"] or 32,
            "n_layers": cfg["n_layers"] or 0, "n_vocab": cfg.get("n_vocab") or 0,
            # routed-expert width, so _struct_offset can remove the MoE activation

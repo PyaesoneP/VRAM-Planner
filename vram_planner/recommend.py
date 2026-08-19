@@ -13,11 +13,25 @@ So the two disagreeing is not a bug to be papered over - it is the honest state
 of affairs, and the useful thing is to say which one is being recommended and
 name every reason they differ.
 
+"Fastest row measured" is itself only half the story, and which half depends on
+the question being asked. A dense model that does not fit has two plans, and
+each one pins a placement and leaves exactly one knob free - the context in the
+SPEED plan, the -ot exile (then -ngl) in the CONTEXT plan. Along a knob that is
+monotone in VRAM the value worth having is the one at the WALL, not the one that
+read fastest: measured rows move 4.2% of tok/s across a doubling of context, and
+downward, so ranking a speed campaign by tok/s recommends the smallest window in
+the mode whose whole purpose is the largest one. mode_axis() below decides which
+knob a category leaves free and recommend() ranks along it, using the same
+pick_extreme() the campaign promotes stages with - so the card and the sweep
+cannot land on different rows. Off the two-plan regime - an MoE, a model that
+fits whole - nothing is left free and fastest-wins stands unchanged.
+
 Pure: no I/O, no subprocess, no GPU. Same rule as bench.py's findings code, and
 for the same reason - the CLI and the browser reach one conclusion by
 construction rather than by two people remembering to keep them in step.
 """
-from .bench import comparable, rank_rows, trustworthy, _ANY
+from .bench import (axis_direction, comparable, pick_extreme, rank_rows,
+                    trustworthy, _ANY)
 
 # Knobs a measured row can carry that a plan has no field for. The plan's
 # vocabulary is ngl / ncmoe / ctx / kv; a row also records how the batch was
@@ -34,6 +48,69 @@ UNPLANNABLE = (
 NGL_SAME = 0
 
 
+# ---------------------------------------------------------------------------
+# What "best" means, per category
+#
+# A dense model that does not fit has one answer per question, and the two
+# questions do not share an objective. Each mode pins one placement and leaves
+# exactly one knob free, and along that knob the value worth having is the one
+# at the wall - not the one that read fastest. Measured rows move 4.2% of tok/s
+# across a DOUBLING of context, and downward, so ranking a speed campaign by
+# tok/s recommends the SMALLEST window in the one mode whose whole purpose is
+# the largest.
+#
+# So the recommendation ranks the way the campaign PROMOTES: extreme along the
+# mode's own axis, ties broken toward the faster row, with STAGE_EXTREME_SLACK
+# refusing a rung that loaded and then thrashed. Off the two-plan regime -
+# an MoE, or a model that fits whole - nothing is left free and fastest-wins
+# stands, which is what it always was.
+# ---------------------------------------------------------------------------
+
+# The phrase the card puts on the criterion, per axis and direction.
+AXIS_GOAL = {
+    ("ctx", "up"):          "the largest context that loaded",
+    ("ngl", "up"):          "the most layers on the GPU that loaded",
+    ("n_cpu_ffn", "down"):  "the least dense FFN exiled to RAM that loaded",
+    ("ncmoe", "down"):      "the fewest experts exiled to RAM that loaded",
+}
+
+
+def mode_axis(plan_result):
+    """(axis, direction) the selected category leaves free, or (None, None).
+
+    Must agree with bench.ngl_ladder(), which decides the same thing for the
+    campaign - it reads the planner's SEED where this reads the finished plan,
+    but the rule is one rule and a card that ranked by another would recommend a
+    config the sweep would never promote:
+
+      * SPEED pins both placements at maximum - every block on the GPU, every
+        block's dense FFN off it - so the only thing left free is the window.
+      * CONTEXT holds the window and pays for it in the cheapest currency first:
+        while every block still fits, the free knob is the -ot exile and less
+        exiled is better; once a full exile is not enough, whole blocks start
+        leaving and the free knob is -ngl.
+
+    A plan outside the two-plan regime has no mode and nothing left free: an
+    MoE's --n-cpu-moe and a fits-whole plan are single answers, so they get
+    (None, None) and the fastest row wins as before.
+    """
+    mode = (plan_result or {}).get("plan_mode")
+    plan = (plan_result or {}).get("plan") or {}
+    if mode not in ("speed", "context") or plan.get("mode") != mode:
+        return None, None
+    if mode == "speed":
+        return "ctx", axis_direction("ctx")
+    n_layers = ((plan_result or {}).get("config") or {}).get("n_layers") or 0
+    if n_layers and (plan.get("n_gpu_layers") or 0) >= n_layers:
+        return "n_cpu_ffn", axis_direction("n_cpu_ffn")
+    return "ngl", axis_direction("ngl")
+
+
+def axis_goal(axis, direction):
+    """The criterion in words, for the card and the CLI report."""
+    return AXIS_GOAL.get((axis, direction)) or ("the largest %s that loaded" % axis)
+
+
 def _cfg_of(row):
     return dict((row or {}).get("config") or {})
 
@@ -47,9 +124,21 @@ def plan_config(plan_result):
     """
     plan = (plan_result or {}).get("plan") or {}
     inp = (plan_result or {}).get("inputs") or {}
-    c = {"ngl": plan.get("n_gpu_layers"), "ncmoe": plan.get("n_cpu_moe") or 0}
-    if inp.get("context") is not None:
+    c = {"ngl": plan.get("n_gpu_layers"), "ncmoe": plan.get("n_cpu_moe") or 0,
+         # The -ot pin is what DEFINES both dense modes, so it has to survive
+         # into the launch script; without it the script asks for the layers of
+         # a speed plan and none of the tensor split that made them fit.
+         "n_cpu_ffn": plan.get("n_cpu_ffn") or 0}
+    # A speed plan's answer IS its context - the largest that fits at ngl=all with
+    # the FFN exiled - and that is generally not the number the user typed in. Take
+    # the plan's own where it has one, or every speed row is judged against a
+    # context the plan never proposed and rejected as answering another question.
+    if plan.get("max_ctx") is not None:
+        c["ctx"] = int(plan["max_ctx"])
+    elif inp.get("context") is not None:
         c["ctx"] = inp["context"]
+    if inp.get("mmproj_place") in ("vram", "ram"):
+        c["mmproj_offload"] = inp["mmproj_place"] == "vram"
     if inp.get("kv_type"):
         c["kv"] = inp["kv_type"]
     if inp.get("n_ubatch") is not None:
@@ -73,16 +162,26 @@ def plan_config(plan_result):
     return c
 
 
-def _conditions_match(row, planned):
+def _conditions_match(row, planned, free_axis=None):
     """Does this row answer the question currently on screen?
 
     Only the keys a PLAN has an opinion about - context, KV quant, sequences,
     flash attention. Deliberately not fill, n_predict, repeat or the samplers:
     those are properties of how a campaign was run and a plan has no value for
     any of them, so demanding they agree would reject every row.
+
+    `free_axis` is the knob the selected category is free to move, and it is
+    exempted for the same reason comparable() exempts stage A's swept axis: in
+    the SPEED mode the context is not part of what is being asked, it is the
+    answer, and gating it keeps only the rungs that happen to equal the
+    planner's own guess - so the campaign measures a wall and the card then
+    recommends the guess. Only ctx is ever both gated here and free; ngl and
+    n_cpu_ffn are not conditions at all.
     """
     c = row.get("config") or {}
     for key in ("ctx", "kv", "seq", "fa"):
+        if key == free_axis:
+            continue
         if key not in planned or key not in c:
             continue
         a, b = c[key], planned[key]
@@ -91,6 +190,46 @@ def _conditions_match(row, planned):
         if a != b:
             return False
     return True
+
+
+# The placement a category PINS. Each dense mode fixes both of these and then
+# frees exactly one - the mode's own axis - so the other is what makes a row a
+# member of this category at all.
+PIN_KEYS = ("ngl", "n_cpu_ffn")
+
+
+def _pins_match(row, planned, axis):
+    """Was this row measured in the layout the selected category proposes?
+
+    Without this the extreme is trivially won by the wrong regime. "The largest
+    context that loaded" in the SPEED category was answered on a real store by a
+    row at -ngl 28 - a CONTEXT campaign's row, where most of the model is in RAM
+    and a 128k window naturally fits. The speed category is DEFINED by -ngl all
+    plus -ot all; a row at another placement is the other plan's answer wearing
+    this plan's badge.
+
+    The free axis is exempt, because it is the thing being ranked. Only ngl and
+    n_cpu_ffn are gated: --n-cpu-moe belongs to a regime that has no categories,
+    and everything else a row records is either a condition (settled by
+    _conditions_match) or a knob no plan predicts (reported by _axis_deltas).
+    """
+    c = row.get("config") or {}
+    for k in PIN_KEYS:
+        if k == axis or planned.get(k) is None or k not in c:
+            continue
+        if (c.get(k) or 0) != (planned.get(k) or 0):
+            return False
+    return True
+
+
+def _pins_text(planned):
+    """The pinned placement in llama.cpp's own flags, for a delta to name."""
+    bits = []
+    if planned.get("ngl") is not None:
+        bits.append("-ngl %s" % planned["ngl"])
+    if planned.get("n_cpu_ffn"):
+        bits.append("-ot on %s blocks" % planned["n_cpu_ffn"])
+    return ", ".join(bits) or "this split"
 
 
 def _fmt_mib(v):
@@ -193,11 +332,19 @@ def _axis_deltas(won, planned):
                       "prompt processing is compute bound and is not modelled at all."}
 
 
-def _stale_delta(won, planned):
-    """Does the winning row answer the question currently on screen?"""
+def _stale_delta(won, planned, free_axis=None):
+    """Does the winning row answer the question currently on screen?
+
+    `free_axis` is exempt on the same grounds it is exempt from
+    _conditions_match: a speed plan did not ASK for a context, it proposed one,
+    so a row that found a larger window is the answer improving rather than a
+    stale experiment.
+    """
     bad = []
     for key, label in (("ctx", "context"), ("kv", "KV quant"),
                        ("seq", "sequences"), ("fa", "flash attention")):
+        if key == free_axis:
+            continue
         if key not in planned or key not in won:
             continue
         if won[key] != planned[key]:
@@ -228,11 +375,22 @@ def recommend(plan_result, rows, sweep_budget_mib=None, strict=True):
       row      the winning row, or None
       predicted the planner's own config, always
       deltas   [{kind, text}], empty when the two agree
+      mode     "speed" | "context" | None - the category this answers
+      axis     the knob that category leaves free, or None
+      objective "extreme" (at the wall along `axis`) or "fastest"
+      goal     the criterion in words, for the card to print
     """
     planned = plan_config(plan_result)
+    # Which category is on screen, and therefore what "best" means among the
+    # rows. Absent a two-plan regime this is (None, None) and fastest wins.
+    axis, direction = mode_axis(plan_result)
     out = {"source": "predicted", "config": planned, "row": None,
            "predicted": planned, "tok_s": None, "vram_mib": None,
-           "deltas": [], "n_rows": 0, "n_trusted": 0}
+           "deltas": [], "n_rows": 0, "n_trusted": 0,
+           "mode": (plan_result or {}).get("plan_mode"),
+           "axis": axis, "direction": direction,
+           "objective": "extreme" if axis else "fastest",
+           "goal": axis_goal(axis, direction) if axis else "the fastest row measured"}
     plan = (plan_result or {}).get("plan") or {}
     if plan.get("n_gpu_layers") is None and not plan.get("fits_fully"):
         out["source"] = "none"
@@ -245,6 +403,7 @@ def recommend(plan_result, rows, sweep_budget_mib=None, strict=True):
     cand = [r for r in rank_rows(rows) if trustworthy(r)]
     out["n_trusted"] = len(cand)
     depth_note = None
+    regime_note = None
     sampler_fallback = False
     if strict and cand:
         # Two passes, because a plan and a row do not have the same vocabulary.
@@ -256,7 +415,26 @@ def recommend(plan_result, rows, sweep_budget_mib=None, strict=True):
         # rejected every row, strict narrowing silently emptied, and the fastest
         # row at ANY context won - the exact confusion this function exists to
         # prevent, arriving through the one gate meant to prevent it.
-        near = [r for r in cand if _conditions_match(r, planned)]
+        # The category's own PLACEMENT comes first, ahead of the conditions,
+        # because it decides which QUESTION a row was answering rather than
+        # under what settings. Ranking along a free axis only means anything
+        # among rows that pinned everything else the way this category does -
+        # and unlike the conditions it must hold even in the fallback below,
+        # since "the largest context that loaded" over rows from the other
+        # regime is exactly the misreading it was added to stop.
+        if axis:
+            pinned = [r for r in cand if _pins_match(r, planned, axis)]
+            if pinned:
+                cand = pinned
+            else:
+                regime_note = {
+                    "kind": "regime",
+                    "text": "No recorded row was measured in this plan's own layout (%s). "
+                            "The rows there are answer the other question, so they are "
+                            "ranked here for want of better - a row at a different split "
+                            "is not this category's answer, it is the other category's."
+                            % _pins_text(planned)}
+        near = [r for r in cand if _conditions_match(r, planned, axis)]
         if near:
             # Then pick ONE depth and rank inside it. Decode re-reads the KV
             # cache every token, so a 2k row beats a 32k row on nothing but
@@ -278,9 +456,13 @@ def recommend(plan_result, rows, sweep_budget_mib=None, strict=True):
                                          "{:,}".format(fill))}
             base = dict(planned)
             base["fill"] = fill
+            # `swept` un-gates ctx inside comparable() as well, and the pairing
+            # is the point: an axis the category is free to move must be
+            # comparable across its rungs or the winner is never a candidate.
+            # Only ctx is gated there, so any other free axis passes through.
             same = [r for r in fills[fill]
                     if comparable(r, r.get("model"), base, prompt_id=None,
-                                  template_id=_ANY)]
+                                  template_id=_ANY, swept=(axis or ""))]
             # Everything comparable() still gates on here is the samplers - the
             # conditions were settled above and `base` carries the group's own
             # fill. So an empty narrowing means the campaign swept real sampler
@@ -299,25 +481,34 @@ def recommend(plan_result, rows, sweep_budget_mib=None, strict=True):
                         % (len(rows), "" if len(rows) == 1 else "s")})
         return out
 
-    win = cand[0]
+    # rank_rows() left `cand` fastest-first, which is the answer when nothing is
+    # left free. With a category selected the winner is the row at the wall
+    # along its own axis instead - see mode_axis().
+    win = pick_extreme(cand, axis, direction) if axis else cand[0]
     won = _cfg_of(win)
     out.update({"source": "measured", "config": won, "row": win,
                 "tok_s": win.get("tok_s"), "vram_mib": win.get("proc_vram_mib")})
 
     same = (won.get("ngl") == planned.get("ngl")
-            and (won.get("ncmoe") or 0) == (planned.get("ncmoe") or 0))
+            and (won.get("ncmoe") or 0) == (planned.get("ncmoe") or 0)
+            and (axis is None
+                 or (won.get(axis) or 0) == (planned.get(axis) or 0)))
     if not same:
         out["deltas"].append({
             "kind": "objective",
-            "text": "The planner returns the largest split that FITS - it stops at "
-                    "the first config under the budget. This row is the one that "
-                    "was FASTEST. Those are different questions, and only the "
-                    "second one was measured."})
+            "text": ("The planner returns the largest split that FITS - it stops at "
+                     "the first config under the budget. This row is %s. Those are "
+                     "different questions, and only the second one was measured."
+                     % out["goal"]) if axis else
+                    ("The planner returns the largest split that FITS - it stops at "
+                     "the first config under the budget. This row is the one that "
+                     "was FASTEST. Those are different questions, and only the "
+                     "second one was measured.")})
     for d in (_budget_delta(plan_result, sweep_budget_mib),
               _axis_deltas(won, planned),
-              _stale_delta(won, planned),
+              _stale_delta(won, planned, axis),
               _sampler_delta(won) if sampler_fallback else None,
-              depth_note):
+              regime_note, depth_note):
         if d:
             out["deltas"].append(d)
     return out

@@ -63,6 +63,8 @@ so an interrupted sweep resumes where it stopped.
 drives the same harness, so everything in this guide still applies — the differences are
 only in the driving:
 
+![The measurement form: which stages to run, what is frozen, and the estimate before you commit hours](ui-sweep.png)
+
 | | CLI | browser |
 |---|---|---|
 | context / KV quant | `--speed-ctx`, `--speed-kv` | taken from the form and frozen |

@@ -1,36 +1,32 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128">
-  <defs>
-    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
-      <stop offset="0" stop-color="#1c2b3a"/>
-      <stop offset="1" stop-color="#0d141d"/>
-    </linearGradient>
-    <linearGradient id="bar" x1="0" y1="1" x2="0" y2="0">
-      <stop offset="0" stop-color="#14b8a6"/>
-      <stop offset="1" stop-color="#5eead4"/>
-    </linearGradient>
-    <linearGradient id="top" x1="0" y1="1" x2="0" y2="0">
-      <stop offset="0" stop-color="#d97706"/>
-      <stop offset="1" stop-color="#fbbf24"/>
-    </linearGradient>
-  </defs>
-  <rect width="128" height="128" rx="26" fill="url(#bg)"/>
-  <rect x="1.5" y="1.5" width="125" height="125" rx="24.5"
-        fill="none" stroke="#ffffff" stroke-opacity="0.07" stroke-width="3"/>
-  <g>
-    <rect x="42" y="27" width="8" height="9" rx="1.5" fill="#2dd4bf"/>
-    <rect x="52" y="27" width="8" height="9" rx="1.5" fill="#2dd4bf"/>
-    <rect x="62" y="27" width="8" height="9" rx="1.5" fill="#2dd4bf"/>
-    <rect x="72" y="27" width="8" height="9" rx="1.5" fill="#2dd4bf"/>
-    <rect x="42" y="92" width="8" height="9" rx="1.5" fill="#2dd4bf"/>
-    <rect x="52" y="92" width="8" height="9" rx="1.5" fill="#2dd4bf"/>
-    <rect x="62" y="92" width="8" height="9" rx="1.5" fill="#2dd4bf"/>
-    <rect x="72" y="92" width="8" height="9" rx="1.5" fill="#2dd4bf"/>
-  </g>
-  <rect x="36" y="36" width="56" height="56" rx="10"
-        fill="#0b1119" stroke="#2dd4bf" stroke-width="3"/>
-  <rect x="48" y="70" width="9" height="14" rx="2" fill="url(#bar)"/>
-  <rect x="62" y="62" width="9" height="22" rx="2" fill="url(#bar)"/>
-  <rect x="76" y="52" width="9" height="32" rx="2" fill="url(#top)"/>
-  <line x1="43" y1="85.5" x2="85" y2="85.5"
-        stroke="#2dd4bf" stroke-opacity="0.25" stroke-width="1.5"/>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128"
+     role="img" aria-label="VRAM Planner">
+  <title>VRAM Planner</title>
+  <!--
+    The mark is the answer the planner gives: the largest that fits.
+
+    Three columns rising toward a limit, in the roles the app colours everywhere
+    else - weights, KV cache, compute buffer - and one hard rule across the top:
+    the VRAM budget. The tallest column stops exactly at it and does not cross.
+    That is the whole product in one glyph.
+
+    No plate and no gradient, deliberately. A rounded dark tile with a teal
+    gradient is what every generated logo looks like, and the mark also has to
+    survive a README that renders on white AND on near-black. So it is built
+    only from things that read on both: saturated columns, and a cap in a mid
+    neutral that clears 4:1 against white and against #0d1117 alike. Neutral and
+    not a hue, because in this project colour names a memory term - the limit is
+    structure, and structure is never coloured.
+  -->
+
+  <!-- weights - exact, and the floor everything else is measured against -->
+  <rect x="16" y="84" width="28" height="32" fill="#3d8fe0"/>
+  <!-- KV cache - grows with the context you ask for -->
+  <rect x="50" y="58" width="28" height="58" fill="#17a583"/>
+  <!-- compute buffer - the one estimated term, so it is the one that reaches
+       the limit and decides where the split lands -->
+  <rect x="84" y="31" width="28" height="85" fill="#8560e8"/>
+
+  <!-- the budget. Wider than the columns, so it reads as a limit over them
+       rather than as a lid on them. -->
+  <rect x="10" y="16" width="108" height="10" fill="#6e747d"/>
 </svg>

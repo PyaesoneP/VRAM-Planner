@@ -4,7 +4,7 @@ from http.server import BaseHTTPRequestHandler
 from http.server import ThreadingHTTPServer
 from urllib.parse import parse_qs
 from urllib.parse import urlparse
-from .const import __version__
+from .const import MiB, __version__
 from .gguf import load_gguf
 from .model import extract_config
 from .paths import _data_dir
@@ -35,7 +35,8 @@ UI_FILES = {
 # own errors shows nothing when the server says "not found".
 _POSTS = ("/api/analyze", "/api/calibrate", "/api/script", "/api/script/save",
           "/api/speed/plan", "/api/speed/start", "/api/speed/stop",
-          "/api/speed/skip", "/api/speed/delete", "/api/recommend")
+          "/api/speed/skip", "/api/speed/delete", "/api/recommend",
+          "/api/cards/forget")
 
 
 def read_ui(name):
@@ -406,6 +407,76 @@ class Handler(BaseHTTPRequestHandler):
                                file=data.get("file"), prompt_id=pid,
                                template_id=tid)
 
+    def _cards_forget(self, data):
+        """Delete one stored model card by file name.
+
+        A card is a CACHE of the three cheap reads analyze() makes, not data the
+        user typed - so this needs none of _speed_delete's ceremony. Deleting the
+        card of a model still on disk costs a re-read on the next analyze and
+        nothing else; deleting the card of a model that is gone is the only way
+        to get it out of the picker, which is why this endpoint exists at all.
+        """
+        name = (data.get("name") or "").strip()
+        if not name:
+            return {"ok": False, "error": "no card name given"}
+        gone = forget_card(name)
+        return {"ok": bool(gone), "cards": list_cards(),
+                "error": "" if gone else "no card for: %s" % name}
+
+    def _probe(self, path):
+        """What KIND of model this is, without planning it.
+
+        The controls that only some models have - the projector placement, the
+        MTP tick box, --n-cpu-moe against -ot - used to be revealed by render(),
+        which runs only on an analyze RESPONSE. So the settings that change the
+        answer appeared after the answer, and using one meant re-running.
+
+        This is the same three reads analyze() opens with (plan.py:242-257) and
+        nothing else: the GGUF header and tensor table, a few kilobytes, no
+        arithmetic. It writes the card too, so a probe warms exactly the cache a
+        subsequent analyze reads - picking a model is no longer free but the
+        analyze after it is cheaper by the same amount.
+        """
+        if not path:
+            return {"ok": False, "error": "no path given"}
+        from .model import classify_tensors
+        from .plan import find_mmproj
+        from .cards import load_card, remember_card
+        try:
+            if os.path.exists(path):
+                model = load_gguf(path)
+                cfg = extract_config(model)
+                cl = classify_tensors(model, cfg)
+                mmproj = find_mmproj(path)
+                remember_card(path, cfg, cl, mmproj,
+                              model["file_bytes"], len(model["shards"]))
+                from_card = False
+            else:
+                card = load_card(path)
+                if not card:
+                    return {"ok": False,
+                            "error": "file not found and no stored card: %s" % path}
+                cfg, cl, mmproj, _meta = card
+                from_card = True
+        except (OSError, ValueError, KeyError) as e:
+            return {"ok": False, "error": str(e)}
+        mm = None
+        if mmproj:
+            mm = {"name": mmproj.get("name") or "",
+                  "mib": (mmproj.get("tensor_bytes") or mmproj.get("bytes") or 0) / MiB,
+                  # An audio-only projector has no patch grid, so the image
+                  # controls mean nothing for it - the same test render() makes.
+                  "vision": bool(mmproj.get("vision"))}
+        return {"ok": True, "name": os.path.basename(path), "from_card": from_card,
+                "arch": cfg.get("arch") or "?",
+                "n_layers": cfg.get("n_layers") or 0,
+                "n_ctx_train": cfg.get("n_ctx_train") or 0,
+                "n_expert": cfg.get("n_expert") or 0,
+                "n_mtp_layers": cfg.get("n_mtp_layers") or 0,
+                "is_moe": bool(cl.get("is_moe")),
+                "params_total": cl.get("params_total") or 0,
+                "mmproj": mm}
+
     def _recommend(self, data):
         """One config to run, reconciled against whatever has been measured.
 
@@ -635,6 +706,9 @@ class Handler(BaseHTTPRequestHandler):
                                     "n_cards": len(offline)})
         if u.path == "/api/cards":
             return self._send(200, {"cards": list_cards()})
+        if u.path == "/api/probe":
+            return self._send(200, self._probe((parse_qs(u.query).get("path")
+                                                or [""])[0]))
         return self._send(404, {"error": "not found"})
 
     def do_POST(self):
@@ -654,6 +728,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, self._script_save(data))
         if u.path == "/api/speed/delete":
             return self._send(200, self._speed_delete(data))
+        if u.path == "/api/cards/forget":
+            return self._send(200, self._cards_forget(data))
         if u.path == "/api/recommend":
             return self._send(200, self._recommend(data))
         if u.path == "/api/speed/plan":

@@ -169,16 +169,24 @@ class Job(object):
         A hard stop kills the server, which makes the in-flight request fail at
         once rather than at its timeout. The row that was being measured is then
         discarded rather than written - see run_group() - so the campaign resumes
-        from the last COMPLETE row and re-measures the abandoned one."""
+        from the last COMPLETE row and re-measures the abandoned one.
+
+        Every press after the first kills whatever is live, rather than only the
+        second one. The distinction used to matter and no longer does: the
+        second press read `live_proc` once, and if the campaign happened to be
+        between configs at that instant it killed nothing and set a flag that
+        the next load would not consult until it finished. A third press then
+        returned "aborting" and also did nothing. Kill on every press and that
+        whole class of dead press disappears - killing an already-dead process
+        is a no-op, so there is nothing to be careful about."""
         with self._lock:
             if not self.running:
                 return False, "nothing running"
             first = not self._cancel.is_set()
             self._cancel.set()
-            proc = None
             if not first:
                 self._abort.set()
-                proc = self.live_proc
+            proc = None if first else self.live_proc
         if first:
             self._append("stop requested - finishing the config in flight first, so the "
                          "row it is measuring is complete rather than half-written. "

@@ -313,16 +313,16 @@ def _run_suite(require_refs, tmp, skipped_real):
     print("  DRAFTER a plain model file is refused, a missing one too  %s"
           % ("OK" if refused and missing else "FAIL"))
     ok = ok and refused and missing
-    # stage D sweeps the drafter's OWN depth ladder - every depth the block
+    # stage B sweeps the drafter's OWN depth ladder - every depth the block
     # allows, ascending - because the draft cache grows with depth and the
     # monotone wall prunes the deeper half of it once the first depth OOMs
     # (see the wall tests below).
     from .bench import stage_configs
     b0 = {"ctx": 4096, "kv": "f16", "fa": True, "seq": 1, "ub": 512, "ngl": 0}
-    dd = stage_configs("d", dict(b0), 8, False, "ngl", [1], facts={"n_mtp_layers": 0},
+    dd = stage_configs("b", dict(b0), 8, False, "ngl", [1], facts={"n_mtp_layers": 0},
                        drafter={"path": pd, "block_size": 8})
     dmax = sorted({c["spec_n_max"] for c in dd if c["spec"] == "draft-dflash"})
-    nd = [c for c in stage_configs("d", dict(b0), 8, False, "ngl", [1],
+    nd = [c for c in stage_configs("b", dict(b0), 8, False, "ngl", [1],
                                    facts={"n_mtp_layers": 0})
           if c["spec"] == "draft-dflash"]
     av = build_argv("EXE", p3, dict(b0, spec="draft-dflash", spec_n_max=99),
@@ -348,7 +348,7 @@ def _run_suite(require_refs, tmp, skipped_real):
     gb, gnl, gmoe, gaxis, grungs = grid_context(
         {"n_layers": 8}, base=dict(b0), model_path=p3, drafter={"path": pd,
                                                                 "block_size": 8})
-    chained = [c for c in stage_configs("d", gb, gnl, gmoe, gaxis, grungs,
+    chained = [c for c in stage_configs("b", gb, gnl, gmoe, gaxis, grungs,
                                         facts={"n_mtp_layers": 0},
                                         drafter={"path": pd, "block_size": 8})
                if c["spec"] == "draft-dflash"]
@@ -367,27 +367,27 @@ def _run_suite(require_refs, tmp, skipped_real):
     # is a draft RUN LENGTH, not a count of prediction heads: measured rows gave
     # fifteen different results past a one-nextn-layer drafter, peaking at depth
     # 4. The cap used to reduce the ladder to a single rung, which ended stage
-    # D's wall walk the moment it found a config that fitted.
+    # B's wall walk the moment it found a config that fitted.
     from .bench import (_draft_depths, _spec_axis, _spec_ctx_rung,
-                        STAGE_D_SPEC as _SDS)
+                        STAGE_B_SPEC as _SDS)
     # Read from the campaign's own table: a widened ladder is a deliberate
     # change, and restating it here would only ever go stale.
     MTP_DEPTHS = sorted(n for s, n in _SDS if s == "draft-mtp")
-    dm = stage_configs("d", dict(b0), 8, False, "ngl", [1], facts={"n_mtp_layers": 0},
+    dm = stage_configs("b", dict(b0), 8, False, "ngl", [1], facts={"n_mtp_layers": 0},
                        drafter={"path": mtpp, "kind": "mtp", "depth": 2})
     mtp_rows = [c for c in dm if c["spec"] == "draft-mtp"]
     mtp_ok = (sorted({c["spec_n_max"] for c in mtp_rows}) == MTP_DEPTHS
               and all(c["md"] == os.path.abspath(mtpp) for c in mtp_rows)
               and not [c for c in dm if c["spec"] == "draft-dflash"]
               and any(c["spec"] == "ngram-mod" for c in dm))
-    own_rows = [c for c in stage_configs("d", dict(b0), 8, False, "ngl", [1],
+    own_rows = [c for c in stage_configs("b", dict(b0), 8, False, "ngl", [1],
                                          facts={"n_mtp_layers": 2})
                 if c["spec"] == "draft-mtp"]
     own_ok = (sorted({c["spec_n_max"] for c in own_rows}) == MTP_DEPTHS
               and all("md" not in c for c in own_rows))
     capped = (_draft_depths("draft-mtp", {"kind": "mtp", "depth": 2})
               == _draft_depths("draft-mtp") == MTP_DEPTHS)
-    print("  MTP external drafter: stage D carries -md, depths uncapped  %s"
+    print("  MTP external drafter: stage B carries -md, depths uncapped  %s"
           % ("OK" if mtp_ok and own_ok and capped else "FAIL"))
     ok = ok and mtp_ok and own_ok and capped
     # The fit sweep gets the same scheme from the same spelling: classify the
@@ -485,17 +485,29 @@ def _run_suite(require_refs, tmp, skipped_real):
     print("  WALL --speed-axes tagging (monotone only, ncmoe MoE-only)  %s"
           % ("OK" if wall_ok else "FAIL"))
     ok = ok and wall_ok
-    # Stage configs carry their tags out of the grid: A/B dense = ngl up, A/B
-    # MoE = ncmoe down, C = ub up, D = spec_n_max up within the draft family.
-    from .bench import _MONOTONE_AXES, _MONOTONE_MOE
-    sa = [c for c in stage_configs("a", dict(wa, fill=2048), 32, False, "ngl", [20, 24, 28])]
-    sb = [c for c in stage_configs("c", dict(wa), 32, False, "ngl", [1])]
+    # Configs carry their tags out of the grid. Stage A's come from the search
+    # rather than from a list - one place builds them (config_for), so the tag,
+    # the stage letter and the axis value cannot be assembled two ways - and
+    # stage B's from stage_configs, spec_n_max up within the draft family.
+    from .bench import (_MONOTONE_AXES, _MONOTONE_MOE, _MONOTONE_FFN,
+                        _WallSearch, wall_values)
+    wsa = _WallSearch("ngl", [20, 24, 28], dict(wa, fill=2048))
+    sa = [wsa.config_for(v) for v in wsa.values]
+    wsf = _WallSearch("n_cpu_ffn", wall_values("n_cpu_ffn", 32), dict(wa))
+    sb = [c for c in stage_configs("b", dict(wa), 32, False, "ngl", [1])
+          if (c.get("spec") or "none") != "none"]
     wall_ok = (all(c.get("_wall") == [("ngl", "up")] for c in sa)
-               and all(c.get("_wall") == [("ub", "up")] for c in sb)
+               and all(c.get("stage") == "A" for c in sa)
+               and [c["ngl"] for c in sa] == [20, 24, 28]
+               # the FFN search runs the other way, and says so in its own tag
+               and wsf.wall == [("n_cpu_ffn", "down")]
+               and wsf.values[0] == 32 and wsf.values[-1] == 0
+               and all(c.get("_wall") == [("spec_n_max", "up")] for c in sb)
                and _MONOTONE_AXES == {"ngl": "up", "ub": "up",
                                       "ctx": "up", "spec_n_max": "up"}
-               and _MONOTONE_MOE == {"ncmoe": "down"})
-    print("  WALL stage grid tags (dense ngl-up, ub-up, MoE ncmoe-down)  %s"
+               and _MONOTONE_MOE == {"ncmoe": "down"}
+               and _MONOTONE_FFN == {"n_cpu_ffn": "down"})
+    print("  WALL stage tags (search ngl-up / ffn-down, stage B nmax-up)  %s"
           % ("OK" if wall_ok else "FAIL"))
     ok = ok and wall_ok
     # Depth extras: the top three fitting rungs from a stage-A ladder, at each
@@ -672,16 +684,16 @@ def _run_suite(require_refs, tmp, skipped_real):
     bad, badw = best_config([prow(98304, 7.2), sp], "M", pbase, n_predict=128,
                             repeat=3, swept="ctx")
     promo_ok = promo_ok and badw["tok_s"] == 7.2 and bad["ctx"] == 98304
-    print("  PROMO stage D: fastest trustworthy comparable row, by margin  %s"
+    print("  PROMO stage B: fastest trustworthy comparable row, by margin  %s"
           % ("OK" if promo_ok else "FAIL"))
     ok = ok and promo_ok
-    # ...but stage D is the only stage that asks a SPEED question. A and C take
+    # ...but stage B is the ONLY stage that asks a speed question. Stage A takes
     # the value at the wall instead - the largest that loads, or the smallest on
     # an axis where less means more resident. Ranking those by tok/s ranks
     # jitter: measured rows move 4.2% of tok/s across a DOUBLING of context,
     # and downward, so fastest-wins promoted the smallest window on the ladder
     # in the one mode whose whole purpose is the largest.
-    from .bench import stage_objective, STAGE_EXTREME_SLACK
+    from .bench import stage_objective
     def _pick(rws, letter, gaxis, **kw):
         ax, ob = stage_objective(letter, gaxis)
         return best_config(rws, "M", pbase, n_predict=128, repeat=3,
@@ -692,8 +704,8 @@ def _run_suite(require_refs, tmp, skipped_real):
                 "config": dict(pbase, stage=kw.pop("stage", "A"), **kw)}
     obj_ok = (stage_objective("a", "ctx") == ("ctx", "extreme")
               and stage_objective("a", "ncmoe") == ("ncmoe", "extreme")
-              and stage_objective("c", "ctx") == ("ub", "extreme")
-              and stage_objective("d", "ctx") == (None, "fastest"))
+              and stage_objective("a", "n_cpu_ffn") == ("n_cpu_ffn", "extreme")
+              and stage_objective("b", "ctx") == (None, "fastest"))
     # the real shape: tok/s drifts DOWN as the window grows
     lad = [_pr(7.15, ctx=74752), _pr(6.89, ctx=111616), _pr(6.85, ctx=148480)]
     ca, _ = _pick(lad, "a", "ctx")
@@ -704,24 +716,40 @@ def _run_suite(require_refs, tmp, skipped_real):
     cm, _ = _pick([_pr(6.0, ncmoe=33), _pr(6.6, ncmoe=31), _pr(6.5, ncmoe=29)],
                   "a", "ncmoe")
     obj_ok = obj_ok and cn["ngl"] == 65 and cm["ncmoe"] == 29
-    # stage C takes the largest ubatch that loads, not the fastest-looking one
-    cu, _ = _pick([_pr(6.9, ub=256, stage="C"), _pr(6.95, ub=512, stage="C"),
-                   _pr(6.88, ub=2048, stage="C")], "c", "ctx")
-    obj_ok = obj_ok and cu["ub"] == 2048
-    # stage D stays a speed question - no ordering of draft depths implies an
+    # phase 2 promotes the SMALLEST FFN exile that loaded - fewer blocks moved
+    # off the card is more resident, the same direction ncmoe runs
+    cf, _ = _pick([_pr(6.2, n_cpu_ffn=65), _pr(6.9, n_cpu_ffn=40),
+                   _pr(6.85, n_cpu_ffn=31)], "a", "n_cpu_ffn")
+    obj_ok = obj_ok and cf["n_cpu_ffn"] == 31
+    # stage B stays a speed question - no ordering of draft depths implies an
     # answer, only the acceptance rate does
-    cd, wd = _pick([_pr(6.9, spec="none", stage="D"),
-                    _pr(9.4, spec="draft-mtp", spec_n_max=2, stage="D"),
-                    _pr(8.1, spec="draft-mtp", spec_n_max=5, stage="D")], "d", "ctx")
+    cd, wd = _pick([_pr(6.9, spec="none", stage="B"),
+                    _pr(9.4, spec="draft-mtp", spec_n_max=2, stage="B"),
+                    _pr(8.1, spec="draft-mtp", spec_n_max=5, stage="B")], "b", "ctx")
     obj_ok = obj_ok and cd["spec_n_max"] == 2 and wd["tok_s"] == 9.4
-    # the slack guard: a rung that LOADS but then thrashes is not the wall, it
-    # is a different failure, so the extreme is not taken at any price
+    # NO SLACK. The largest value that loaded wins even when it is much slower:
+    # a big window measured slow is still the big window that fits, and that is
+    # what the speed mode exists to find. The 5% slack this replaces could hand
+    # back half the context to buy 6% of a number that moves 4.2% across a
+    # doubling of the window anyway.
     cg, _ = _pick([_pr(7.0, ctx=74752), _pr(3.0, ctx=148480)], "a", "ctx")
-    obj_ok = obj_ok and cg["ctx"] == 74752 and 0 < STAGE_EXTREME_SLACK < 1
-    # ...and within the slack the larger value still wins
-    cw, _ = _pick([_pr(7.0, ctx=74752), _pr(6.8, ctx=148480)], "a", "ctx")
-    obj_ok = obj_ok and cw["ctx"] == 148480
-    print("  PROMO stages A and C take the wall, D takes the fastest  %s"
+    obj_ok = obj_ok and cg["ctx"] == 148480
+    # a spilled row is not trustworthy() and still wins stage A, because stage A
+    # asks whether it LOADED and the answer is yes. Stage B, which reads its
+    # tok/s, still refuses it - see the block above.
+    spl = _pr(6.5, ctx=148480); spl["spilled"] = True
+    cs, _ = _pick([_pr(7.0, ctx=74752), spl], "a", "ctx")
+    obj_ok = obj_ok and cs["ctx"] == 148480
+    # ...but a row that did not load never wins, whatever its status says
+    for bad_status in ("oom", "skipped", "genfail", "timeout", "exit"):
+        br = _pr(9.9, ctx=148480); br["status"] = bad_status
+        cb, _ = _pick([_pr(7.0, ctx=74752), br], "a", "ctx")
+        obj_ok = obj_ok and cb["ctx"] == 74752
+    # tok/s only settles a tie between rows at the SAME value
+    t1, t2 = _pr(6.0, ctx=74752), _pr(8.0, ctx=74752)
+    ct, wt = _pick([t1, t2], "a", "ctx")
+    obj_ok = obj_ok and wt["tok_s"] == 8.0
+    print("  PROMO stage A takes the wall with no slack, B takes the fastest  %s"
           % ("OK" if obj_ok else "FAIL"))
     ok = ok and obj_ok
     # Which baseline a stage's rows are judged against. comparable() gates ctx,
@@ -735,15 +763,18 @@ def _run_suite(require_refs, tmp, skipped_real):
     cfacts = {"n_layers": 65, "n_ctx_train": 262144, "arch": "qwen3"}
     carried = dict(pbase, ctx=148480, stage="A")
     cgb, _n, _m, _ax, _r = grid_context(cfacts, base=dict(pbase), carried=carried)
-    crows = [_pr(7.11, ctx=148480, ub=512, stage="C"),
-             _pr(6.90, ctx=148480, ub=1024, stage="C")]
+    # phase 2's rows sit at the context phase 1 found, not at the opening one
+    crows = [_pr(7.11, ctx=148480, n_cpu_ffn=65, stage="A"),
+             _pr(6.90, ctx=148480, n_cpu_ffn=40, stage="A")]
     opened, _ = best_config(crows, "M", pbase, n_predict=128, repeat=3,
-                            swept="ub", axis="ub", objective="extreme")
+                            swept="n_cpu_ffn", axis="n_cpu_ffn",
+                            objective="extreme")
     stage, _ = best_config(crows, "M", cgb, n_predict=128, repeat=3,
-                           swept="ub", axis="ub", objective="extreme")
+                           swept="n_cpu_ffn", axis="n_cpu_ffn",
+                           objective="extreme")
     base_ok = (cgb["ctx"] == 148480 and pbase["ctx"] != 148480
                and opened is None and stage is not None
-               and stage["ub"] == 1024 and stage["ctx"] == 148480)
+               and stage["n_cpu_ffn"] == 40 and stage["ctx"] == 148480)
     print("  PROMO a stage is judged against the base it RAN at, not the "
           "campaign's opening one  %s" % ("OK" if base_ok else "FAIL"))
     ok = ok and base_ok
@@ -1837,6 +1868,11 @@ def _run_suite(require_refs, tmp, skipped_real):
             ("other fill",   [row(20.0, {"ngl": 31, "fill": 64000})]),
             ("other kv",     [row(20.0, {"ngl": 31, "kv": "f16"})]),
             ("other npred",  [dict(row(20.0, {"ngl": 31}), n_predict=32)]),
+            # ubatch became a frozen setting when stage C was retired, so it
+            # gates like kv and fill do. The store is full of ub 256/1024/2048
+            # rows that stage C measured back when it WAS an axis; ungated they
+            # would set the baseline for a campaign frozen at 512.
+            ("other ub",     [row(20.0, {"ngl": 31, "ub": 2048})]),
             ("inside 2%",    [row(INC * 1.01, {"ngl": 31})]),
         ]
         chain_ok, cwhy = True, []
@@ -1848,13 +1884,20 @@ def _run_suite(require_refs, tmp, skipped_real):
                            incumbent_tok_s=INC)
         if not c or c["ngl"] != 31:
             chain_ok = False; cwhy.append("refused a legitimate +5% challenger")
-        # only the six knobs carry; the campaign's own definition never does
-        c, _ = best_config([row(9.9, {"ngl": 31, "ub": 2048, "spec": "draft-mtp",
-                                      "spec_n_max": 2, "stage": "D"})],
+        # only the placement and speculation knobs carry; the campaign's own
+        # definition never does - and `ub` moved onto that side of the line
+        # with stage C, so a promoted baseline keeps the frozen value rather
+        # than the winning row's.
+        c, _ = best_config([row(9.9, {"ngl": 31, "spec": "draft-mtp",
+                                      "spec_n_max": 2, "stage": "B"})],
                            "M.gguf", B, 128, 3, incumbent_tok_s=INC)
-        if not c or c["ub"] != 2048 or c["spec"] != "draft-mtp" or "stage" in c \
-                or c["ctx"] != B["ctx"] or c["fill"] != B["fill"]:
+        if not c or c["ngl"] != 31 or c["spec"] != "draft-mtp" or "stage" in c \
+                or c["ub"] != B["ub"] or c["ctx"] != B["ctx"] \
+                or c["fill"] != B["fill"]:
             chain_ok = False; cwhy.append("carried the wrong keys")
+        from vram_planner.bench import CARRY_KEYS as _CK
+        if "ub" in _CK:
+            chain_ok = False; cwhy.append("ub is still a carried key")
         # Samplers are a condition of the measurement, not a config knob: greedy
         # is speculation's best case, so a greedy row and a sampled one are two
         # experiments. They must not meet in a baseline OR in an effect size.
@@ -2436,8 +2479,12 @@ def _run_suite(require_refs, tmp, skipped_real):
         b_greedy = {"ctx": 4096, "kv": "q8_0", "fa": True, "seq": 1, "ub": 512,
                     "ngl": 28, "fill": 2048}
         b_real = dict(b_greedy, temp=1.0, top_k=20, top_p=0.95, rep_pen=1.05)
-        c_g = stage_configs("a", b_greedy, 65, False, "ngl", [27, 28])[0]
-        c_r = stage_configs("a", b_real, 65, False, "ngl", [27, 28])[0]
+        # Stage A's configs come from the search, so that is where the campaign
+        # settings have to survive to - a sampler that reached stage_configs but
+        # not config_for would leave every stage-A row measured greedy.
+        from vram_planner.bench import _WallSearch
+        c_g = _WallSearch("ngl", [27, 28], b_greedy).config_for(28)
+        c_r = _WallSearch("ngl", [27, 28], b_real).config_for(28)
         samp_ok = (sampling_of(c_g)["temperature"] == 0.0
                    and sampling_of(c_r)["temperature"] == 1.0
                    and sampling_of(c_r)["top_k"] == 20
@@ -2476,7 +2523,7 @@ def _run_suite(require_refs, tmp, skipped_real):
         from vram_planner.sweep import (ot_regex, _key, build_argv,
                                         parse_overrides, suspect_reason)
         from vram_planner.bench import (stage_configs, build_speed_grid,
-                                        _tag_axes, _prune_queue,
+                                        _tag_axes, _prune_queue, wall_values,
                                         _carry_summary, SPEED_BASE, STAGES,
                                         CARRY_KEYS, _CONFIG_KEYS, _MONOTONE_FFN)
 
@@ -2540,23 +2587,35 @@ def _run_suite(require_refs, tmp, skipped_real):
         ot_ok = ot_ok and suspect_reason(pinned) and not suspect_reason(good)
         print("  OT    key / argv / fit gate  %s" % ("OK" if ot_ok else "FAIL"))
 
-        # 14f) the pin is no longer swept. Both dense plan modes exile EVERY
-        # block's dense FFN, so a ladder over n_cpu_ffn has no question left to
-        # answer - stages B and E are retired and the campaign is A, C, D. The
-        # pin survives as a hand-set override (--speed-ot) and as a config key,
-        # which is what the rest of 14 exercises.
+        # 14f) the pin is no longer SWEPT as a stage. Both dense plan modes
+        # exile every block's dense FFN, so a ladder over n_cpu_ffn from a
+        # planner seed has no question left to answer - what survives of it is
+        # stage A's phase 2, which walks the exile back DOWN once the wall is
+        # known, and the hand-set override (--speed-ot).
+        #
+        # The campaign is A and B. The retired letters - c (ubatch, now a
+        # frozen setting), e (the old -ot ladder), and the old projector stage -
+        # produce nothing at all rather than something surprising.
         fd = {"arch": "test", "n_layers": 32, "n_ctx_train": 0, "is_moe": False}
         fm = {"arch": "test", "n_layers": 32, "n_ctx_train": 0, "is_moe": True}
         gd = build_speed_grid(fd, base=dict(SPEED_BASE, ctx=8192))
         gm = build_speed_grid(fm, base=dict(SPEED_BASE, ctx=8192))
+        blank = dict(SPEED_BASE, ctx=8192, ngl=20)
         ot_ok = ot_ok and (
-            STAGES == "acd"
-            and not any(c.get("stage") in ("B", "E") for c in gd + gm)
-            and stage_configs("e", dict(SPEED_BASE, ctx=8192, ngl=20),
-                              32, False, "ngl", [1]) == []
-            and stage_configs("b", dict(SPEED_BASE, ctx=8192, ngl=20),
-                              32, False, "ngl", [1], mmproj="m.gguf") == [])
-        print("  OT    stages B and E retired; campaign is %s  %s"
+            STAGES == "ab"
+            # no row is stamped with a letter the campaign no longer runs
+            and not any(c.get("stage") in ("C", "E") for c in gd + gm)
+            # stage B is the only one that builds a list, and it builds
+            # speculation rows
+            and all(c.get("stage") == "B" for c in gd + gm)
+            and any((c.get("spec") or "none") != "none" for c in gd)
+            and stage_configs("e", blank, 32, False, "ngl", [1]) == []
+            and stage_configs("c", blank, 32, False, "ngl", [1]) == []
+            # ...and stage A builds none either: it is a search, so returning
+            # the whole domain would misstate its cost by an order of magnitude
+            and stage_configs("a", blank, 32, False, "ngl",
+                              wall_values("ngl", 32)) == [])
+        print("  OT    campaign is %s; the retired letters build nothing  %s"
               % (STAGES, "OK" if ot_ok else "FAIL"))
 
         # 14g) the monotone wall: n_cpu_ffn is dense-only and runs DOWNWARD -
@@ -2815,6 +2874,262 @@ def _run_suite(require_refs, tmp, skipped_real):
         print("  SKIP raised %s: %s  FAIL" % (type(e).__name__, e))
     ok = ok and skip_ok
 
+    # 16.5) STOP: a second press has to end the config in flight, and the
+    #     config in flight spends most of its wall time LOADING. serve() used to
+    #     hand the process to the campaign only after the ready line, so for the
+    #     whole load - 20-120s normally, up to the timeout when something is
+    #     wrong - there was nothing for a hard stop to kill, and the flag it set
+    #     was not looked at again until the config finished on its own.
+    print("\n  Stop the config in flight")
+    try:
+        import tempfile as _tf, threading as _th, time as _t
+        from .bench import SPEED_BASE
+        from .job import Job
+        from .sweep import serve, _Server, KILL_WAIT_S
+        import vram_planner.sweep as _sw
+
+        # 16.5a) the process is published BEFORE the ready line is waited for.
+        #     Faked at the Popen boundary, because the point being pinned is the
+        #     ORDER of two sp_calls, not llama.cpp.
+        sp_seen = []
+
+        class _Proc(object):
+            def __init__(self): self.killed, self.n = False, 0
+            def poll(self):
+                # never exits on its own; the abort has to be what ends it
+                self.n += 1
+                return None
+            def kill(self): self.killed = True
+            def terminate(self): self.killed = True
+            def wait(self, timeout=None): return 0
+
+        sp_proc = _Proc()
+        # A SHIM module object, not a mutation of the real `subprocess`.
+        # subprocess.check_output goes through Popen, so patching the stdlib
+        # module in place leaks a fake process into every later section that
+        # shells out to nvidia-smi - which is most of them.
+        class _FakeSub(object):
+            CREATE_NEW_PROCESS_GROUP = 0x200
+            DEVNULL = -3
+            @staticmethod
+            def Popen(*a, **kw):
+                return sp_proc
+        real_popen, real_free = _sw.subprocess, _sw._free_mib
+        _sw.subprocess = _FakeSub
+        _sw._free_mib = lambda: 1000.0
+        try:
+            sp_flag = _th.Event()
+            with serve({"exe": "x", "dir": ".", "vendor": []}, "m.gguf",
+                       dict(SPEED_BASE, ctx=1024, ngl=1), port=8299, timeout=30.0,
+                       log_dir=_tf.mkdtemp(), on_proc=sp_seen.append,
+                       should_abort=lambda: (sp_seen and sp_flag.set()) or sp_flag.is_set()) as srv:
+                pass
+            hstop_ok = (sp_seen == [sp_proc]              # published, exactly once
+                       and srv.status == "aborted" # the WAIT ended, not the timeout
+                       and sp_proc.killed)            # and the process went with it
+        finally:
+            _sw.subprocess, _sw._free_mib = real_popen, real_free
+        print("  STOP  the server is published during the load, not after  %s"
+              % ("OK" if hstop_ok else "FAIL"))
+
+        # 16.5b) Job.cancel: first press is sp_soft, every press after it kills
+        #     whatever is live. It used to kill only on the exact second press,
+        #     so a second press that landed between configs killed nothing and a
+        #     third returned "aborting" and also did nothing.
+        sp_job = Job()
+        hstop_ok = hstop_ok and sp_job.cancel() == (False, "nothing running")
+        sp_job.status, sp_job.started = "running", _t.time()
+        sp_a = _Proc()
+        sp_job.set_live_proc(sp_a)
+        sp_ok1, sp_m1 = sp_job.cancel()
+        sp_soft = (sp_ok1 and sp_m1 == "stopping" and not sp_a.killed
+                and sp_job.cancelled() and not sp_job.aborting())
+        sp_ok2, sp_m2 = sp_job.cancel()
+        sp_hard = sp_ok2 and sp_m2 == "aborting" and sp_a.killed and sp_job.aborting()
+        # a press landing between configs kills nothing and is not an error;
+        # the NEXT one still kills the server that came up meanwhile
+        sp_job.set_live_proc(None)
+        sp_ok3, _m3 = sp_job.cancel()
+        sp_b = _Proc()
+        sp_job.set_live_proc(sp_b)
+        sp_ok4, _m4 = sp_job.cancel()
+        hstop_ok = hstop_ok and sp_soft and sp_hard and sp_ok3 and sp_ok4 and sp_b.killed
+        print("  STOP  first press soft, every press after it kills  %s"
+              % ("OK" if hstop_ok else "FAIL"))
+
+        # 16.5c) an abandoned row is discarded, so nothing slow is measured for
+        #     it: finish_row skips the two nvidia-smi reads and marks the row
+        #     instead of leaving the gap looking like a failed reading.
+        sp_srv = _Server(8299, os.path.join(_tf.mkdtemp(), "r.log"))
+        sp_srv.status, sp_srv.free_before = "aborted", 900.0
+        sp_calls = [0]
+
+        def _counted():
+            sp_calls[0] += 1
+            return 1234.0
+
+        real_free, real_total = _sw._free_mib, _sw._total_mib
+        _sw._free_mib = _sw._total_mib = _counted
+        try:
+            sp_ra = _sw.finish_row({"status": "error", "config": {}}, sp_srv, aborted=True)
+            sp_rb = _sw.finish_row({"status": "error", "config": {}}, sp_srv)
+        finally:
+            _sw._free_mib, _sw._total_mib = real_free, real_total
+        hstop_ok = hstop_ok and (sp_ra.get("aborted") is True
+                               and "gpu_free_after_mib" not in sp_ra
+                               and sp_calls[0] == 2            # only the second row read
+                               and sp_rb.get("gpu_free_after_mib") == 1234.0
+                               and "aborted" not in sp_rb
+                               # the reading taken BEFORE the run is kept either
+                               # way: it is the one measured while it mattered
+                               and sp_ra["gpu_free_before_mib"] == 900.0)
+        # ...and the kill waits are short enough that a stop feels like one
+        hstop_ok = hstop_ok and 0 < KILL_WAIT_S <= 10
+        print("  STOP  an abandoned row costs no telemetry  %s"
+              % ("OK" if hstop_ok else "FAIL"))
+    except Exception as e:
+        hstop_ok = False
+        print("  STOP raised %s: %s  FAIL" % (type(e).__name__, e))
+    ok = ok and hstop_ok
+
+    # 16.6) STAGE C IS RETIRED: ubatch is a setting, not an axis. It drives
+    #     PREFILL, and the campaign measures decode - this tool's own insights
+    #     put the whole ladder at +1.3% against +37% for speculation - so four
+    #     loads an hour apiece were being spent to re-derive that. It is frozen
+    #     from the form now, like ctx and kv, and the old letters still resolve
+    #     rather than silently meaning nothing.
+    print("\n  Retired stage C")
+    try:
+        from .bench import (resolve_stages, STAGES, CARRY_KEYS, comparable,
+                            speed_sweep)
+        from .web import Handler as _H
+
+        # 16.6a) the letters. `d` IS stage B - the same speculation stage under
+        #     its new name - so it translates and says so; `c` has no stage to
+        #     map to, so it is dropped and says so, naming the flag that still
+        #     does it. Neither is allowed to mean nothing quietly, which is the
+        #     rule resolve_search() and resolve_rounds() already follow.
+        c_ok = (STAGES == "ab"
+                and resolve_stages("ab") == ("ab", [])
+                and resolve_stages("acd")[0] == "ab"
+                and resolve_stages("d")[0] == "b"
+                and resolve_stages("a") == ("a", [])
+                # order is the CAMPAIGN's, not the typing order
+                and resolve_stages("ba")[0] == "ab"
+                # both translations are said out loud
+                and any("stage B now" in n for n in resolve_stages("d")[1])
+                and any("--speed-axes" in n for n in resolve_stages("c")[1])
+                # asking for only the retired stage still runs something, and
+                # says why - answering with zero loads and silence is worse
+                and resolve_stages("c")[0] == "ab"
+                # declining to choose is not an error and needs no note
+                and resolve_stages("") == ("ab", []))
+        print("  NOUB  the old stage letters still resolve, out loud  %s"
+              % ("OK" if c_ok else "FAIL"))
+
+        # 16.6b) ub crossed the line from result to definition, and it had to
+        #     cross in BOTH lists at once - out of CARRY_KEYS and into
+        #     comparable(). Half of it would have let the ub-1024 rows every old
+        #     stage C left on disk set the baseline for a campaign frozen at 512.
+        ub_b = {"ctx": 8192, "kv": "q8_0", "ub": 512, "seq": 1, "fa": True,
+                "fill": 2048, "spec_kv": "f16"}
+        def _ubrow(u):
+            return {"model": "M", "status": "ok", "tok_s": 9.0, "n_predict": 128,
+                    "repeat": 3, "config": dict(ub_b, ub=u)}
+        c_ok = c_ok and ("ub" not in CARRY_KEYS
+                         and comparable(_ubrow(512), "M", ub_b, 128, 3)
+                         and not comparable(_ubrow(1024), "M", ub_b, 128, 3)
+                         and not comparable(_ubrow(2048), "M", ub_b, 128, 3))
+
+        # 16.6c) the value reaches the campaign. The plan form has always had
+        #     the field and plan.analyze() has always taken it; what was missing
+        #     was the wire between them, so every row was measured at 512
+        #     whatever the plan above it said.
+        args = _H._speed_args(_H, {"path": "", "n_ubatch": 1024})
+        c_ok = c_ok and args["ub"] == 1024 and args["stages"] == "ab"
+        # ...and its default matches the form's, so a body that predates the
+        # field does not silently change what gets measured
+        c_ok = c_ok and _H._speed_args(_H, {"path": ""})["ub"] == 512
+        # the CLI spells it --speed-ub and speed_sweep takes it by that name
+        import inspect as _insp
+        c_ok = c_ok and "ub" in _insp.signature(speed_sweep).parameters
+        print("  NOUB  ubatch is frozen: gated, not carried, and wired  %s"
+              % ("OK" if c_ok else "FAIL"))
+    except Exception as e:
+        c_ok = False
+        print("  NOUB raised %s: %s  FAIL" % (type(e).__name__, e))
+    ok = ok and c_ok
+
+    # 16.7) SPILL GATES: a row wrongly called spilled is a row stage B cannot
+    #     rank and the recommendation card will not show. Three of the four
+    #     clauses were firing on healthy rows.
+    print("\n  Spill gates")
+    try:
+        from .sweep import unsound_reason, suspect_reason, FLOOR_MAX_MIB, \
+            FLOOR_MIN_MIB
+
+        gb0 = {"status": "ok", "floor_mib": 220.0, "gpu_free_after_mib": 4000.0,
+               "config": {"ctx": 8192, "ub": 512, "ngl": 20}}
+
+        # 16.7a) an unreadable floor is a fact about the TELEMETRY, not about
+        #     the run. get_gpu_processes() failing, or the process being gone by
+        #     the time it was sampled, used to read as a spill and cost stage B
+        #     a candidate every time nvidia-smi hiccupped. demoted() already
+        #     states the rule: unmeasured is not evidence of absence.
+        sp_ok = (unsound_reason(dict(gb0, floor_mib=None)) == ""
+                 # a genuinely negative floor is still the WDDM signature and
+                 # still fires: the allocator asked for more than the process
+                 # holds, so the reading is the cap and not the need
+                 and unsound_reason(dict(gb0, floor_mib=-2000.0))
+                 and unsound_reason(dict(gb0, floor_mib=FLOOR_MIN_MIB + 1.0)) == "")
+
+        # 16.7b) FLOOR_MAX_MIB says "a floor this large is not a CUDA context",
+        #     and on a row carrying a draft cache or an in-VRAM projector that
+        #     premise is false - llama.cpp reports neither in its buffer lines,
+        #     so both land in floor. A draft-mtp row measured 1050 MiB where its
+        #     plain twin sat at 230, and a deep depth at a large context clears
+        #     4096 legitimately: exactly the rows stage B exists to measure.
+        big = dict(gb0, floor_mib=FLOOR_MAX_MIB + 500.0)
+        sp_ok = sp_ok and (
+            unsound_reason(big)                       # plain row: still flagged
+            and unsound_reason(dict(big, config=dict(big["config"],
+                                                     spec="draft-mtp",
+                                                     spec_n_max=4))) == ""
+            and unsound_reason(dict(big, config=dict(big["config"],
+                                                     mmproj="m.gguf"))) == ""
+            # ...but a projector deliberately left in RAM allocates nothing on
+            # the card, so it earns no exemption
+            and unsound_reason(dict(big, config=dict(big["config"],
+                                                     mmproj="m.gguf",
+                                                     mmproj_offload=False)))
+            and unsound_reason(dict(big, config=dict(big["config"],
+                                                     spec="none"))))
+
+        # 16.7c) "the card had almost nothing left" is not a defect in a SPEED
+        #     row - it is the definition of the row stage A is looking for, so
+        #     every winner at the wall read that way and was gated out. It is
+        #     also measured after teardown, when a low reading is the driver not
+        #     having released yet. It belongs to the allocation FIT, which does
+        #     want headroom around the point it is pricing.
+        tight = dict(gb0, gpu_free_after_mib=100.0)
+        sp_ok = sp_ok and (unsound_reason(tight) == ""
+                           and suspect_reason(tight)
+                           and suspect_reason(gb0) == "")
+        # the fit gate still rejects everything unsound_reason does, plus the
+        # tensor split it has no term for
+        sp_ok = sp_ok and (suspect_reason(dict(gb0, floor_mib=-2000.0))
+                           and suspect_reason(dict(gb0, config=dict(
+                               gb0["config"], n_cpu_ffn=8))))
+        # and nothing judges a row that never loaded
+        sp_ok = sp_ok and (unsound_reason(dict(gb0, status="oom")) == ""
+                           and suspect_reason(dict(gb0, status="oom")) == "")
+        print("  SPILL unmeasured is not a verdict; the wall is not a defect  %s"
+              % ("OK" if sp_ok else "FAIL"))
+    except Exception as e:
+        sp_ok = False
+        print("  SPILL raised %s: %s  FAIL" % (type(e).__name__, e))
+    ok = ok and sp_ok
+
     # 17) MODE-AWARE STAGE A: which knob the wall is made of. A dense model that
     #     does not fit has one answer per question, and stage A has to ladder the
     #     axis belonging to the question being asked - laddering -ngl for a speed
@@ -2823,39 +3138,52 @@ def _run_suite(require_refs, tmp, skipped_real):
     #     applies: the axis is --n-cpu-moe and always was.
     print("\n  Mode-aware stage A")
     try:
-        from .bench import (stage_configs, ctx_ladder, _AXIS_DIRECTION,
-                            CTX_LADDER_STEP, _MONOTONE_AXES, _prune_queue)
+        from .bench import (_WallSearch, wall_values, wall_probes,
+                            ctx_values, ctx_search_step, axis_direction,
+                            CTX_STEP, CTX_SEARCH_DIVISIONS,
+                            _MONOTONE_AXES, _prune_queue)
         from .sweep import _key
 
         b17 = dict(b0, spec="draft-mtp", spec_n_max=3, ub=256, n_cpu_ffn=32)
 
         # 17a) the axis reaches the rows: each stage-A config varies exactly the
-        #     named knob and carries that axis's own wall direction, so the first
-        #     OOM prunes the right half of the ladder.
-        sa_ngl = stage_configs("a", dict(b17, ngl=20), 32, False, "ngl", [18, 20, 22])
-        sa_ctx = stage_configs("a", dict(b17, ngl=32), 32, False, "ctx",
-                               [16384, 32768, 65536])
-        sa_moe = stage_configs("a", dict(b17, ngl=32), 32, True, "ncmoe", [4, 5, 6])
+        #     named knob and carries that axis's own wall direction, so the
+        #     first OOM prunes the right half of an explicit ladder and the
+        #     search reads the same fact when it bisects.
+        w_ngl = _WallSearch("ngl", [18, 20, 22], dict(b17, ngl=20))
+        w_ctx = _WallSearch("ctx", [16384, 32768, 65536], dict(b17, ngl=32))
+        w_moe = _WallSearch("ncmoe", [6, 5, 4], dict(b17, ngl=32))
+        sa_ngl = [w_ngl.config_for(v) for v in w_ngl.values]
+        sa_ctx = [w_ctx.config_for(v) for v in w_ctx.values]
+        sa_moe = [w_moe.config_for(v) for v in w_moe.values]
         m_ok = ([c["ngl"] for c in sa_ngl] == [18, 20, 22]
                 and all(c["_wall"] == [("ngl", "up")] for c in sa_ngl)
                 and [c["ctx"] for c in sa_ctx] == [16384, 32768, 65536]
                 # the layers stay put while the window moves - that IS the mode
                 and all(c["ngl"] == 32 and c["n_cpu_ffn"] == 32 for c in sa_ctx)
                 and all(c["_wall"] == [("ctx", "up")] for c in sa_ctx)
-                and [c["ncmoe"] for c in sa_moe] == [4, 5, 6]
+                and [c["ncmoe"] for c in sa_moe] == [6, 5, 4]
                 and all(c["_wall"] == [("ncmoe", "down")] for c in sa_moe)
                 and all(c["stage"] == "A"
                         for c in sa_ngl + sa_ctx + sa_moe))
         print("  MODEA each axis varies its own knob, tagged its own way  %s"
               % ("OK" if m_ok else "FAIL"))
 
-        # 17b) the direction table agrees with the pruning table - they are the
-        #     same facts, and a disagreement would prune the wrong half in
-        #     silence. ctx and ngl run out of VRAM upward, ncmoe downward.
+        # 17b) there is now ONE direction table, read through axis_direction().
+        #     There used to be two (_AXIS_DIRECTION beside _MONOTONE_*) that
+        #     agreed "by construction", which is a guarantee that lasts until
+        #     somebody edits one of them - a disagreement would have pruned the
+        #     wrong half of a ladder in silence.
         m_ok = (m_ok
-                and _AXIS_DIRECTION["ngl"] == _MONOTONE_AXES["ngl"] == "up"
-                and _AXIS_DIRECTION["ctx"] == _MONOTONE_AXES["ctx"] == "up"
-                and _AXIS_DIRECTION["ncmoe"] == "down")
+                and axis_direction("ngl") == _MONOTONE_AXES["ngl"] == "up"
+                and axis_direction("ctx") == _MONOTONE_AXES["ctx"] == "up"
+                and axis_direction("ncmoe") == "down"
+                and axis_direction("n_cpu_ffn") == "down"
+                # ...and wall_values() reads it, so the domain of every search
+                # is ordered ascending in VRAM COST whichever way its axis runs
+                and wall_values("ngl", 4) == [0, 1, 2, 3, 4]
+                and wall_values("ncmoe", 4) == [4, 3, 2, 1, 0]
+                and wall_values("n_cpu_ffn", 4) == [4, 3, 2, 1, 0])
         # ...and it prunes: an OOM at 32768 in an ascending ctx ladder proves
         # 65536 fails the same way, while a sibling at another ubatch survives
         # because it is a different family.
@@ -2869,21 +3197,87 @@ def _run_suite(require_refs, tmp, skipped_real):
         print("  MODEA one ctx OOM prunes the larger windows only  %s"
               % ("OK" if m_ok else "FAIL"))
 
-        # 17c) the ctx ladder itself: multiplicative around the planner's max_ctx
-        #     (context spans orders of magnitude where layers do not), snapped so
-        #     the rungs read as sizes a person would type, clamped to what the
-        #     model was trained on, deduped and sorted. No seed means no ladder -
-        #     the caller keeps the baseline's own context rather than inventing.
-        lad = ctx_ladder(32768)
+        # 17c) the ctx domain: the WHOLE trained range, in steps of
+        #     n_ctx_train/64 and never finer than CTX_STEP, so the rungs read as
+        #     sizes a person would type and the search costs the same handful of
+        #     probes on any model. The trained maximum is always in it, because
+        #     "the whole window fits" is the answer that starts phase 2.
+        dom = ctx_values(262144)
         m_ok = (m_ok
-                and lad == sorted(set(lad)) and len(lad) == 6
-                and lad[0] == 16384 and lad[-1] == 65536
-                and all(v % CTX_LADDER_STEP == 0 for v in lad)
-                # clamped, and the clamp collapses the top rungs into one
-                and max(ctx_ladder(32768, 40960)) == 40960
-                and ctx_ladder(None) == [] and ctx_ladder(0) == [])
-        print("  MODEA ctx ladder: snapped, clamped, deduped  %s"
+                and dom == sorted(set(dom))
+                and dom[-1] == 262144 and dom[0] == ctx_search_step(262144)
+                and ctx_search_step(262144) == 4096
+                and all(v % CTX_STEP == 0 for v in dom)
+                and len(dom) == CTX_SEARCH_DIVISIONS
+                # the floor takes over on a small window: 1024-token rungs
+                and ctx_search_step(32768) == CTX_STEP
+                and ctx_values(32768)[-1] == 32768
+                # a context the step does not divide still ends AT the maximum
+                and ctx_values(100000)[-1] == 100000
+                and ctx_values(0) == [] and ctx_values(None) == [])
+        # ...and the cost is log2, not linear. That is the whole reason the
+        # domain can afford to be the whole range instead of a bracket around
+        # a planner seed that might be centred anywhere.
+        m_ok = m_ok and (wall_probes(dom) <= 7 and wall_probes(range(66)) <= 7
+                         and wall_probes([]) == 0 and wall_probes([1]) == 1)
+        print("  MODEA ctx domain is the whole range, at log2 cost  %s"
               % ("OK" if m_ok else "FAIL"))
+
+        # 17d) the search converges on the exact wall, from anywhere in the
+        #     domain, within its own advertised budget - and it is DETERMINISTIC:
+        #     the same statuses give the same probes, so a resumed campaign
+        #     retraces its own path instead of exploring a different one.
+        def _converge(axis, values, fits, known=None):
+            w = _WallSearch(axis, values, dict(b17), known_fits=known)
+            cap, taken = w.budget, []
+            while True:
+                c = w.next()
+                if c is None:
+                    break
+                taken.append(c[axis])
+                w.feed({"status": "ok" if fits(c[axis]) else "oom"})
+            return w, cap, taken
+
+        conv_ok = True
+        for nl in (1, 7, 32, 65):
+            vals = wall_values("ngl", nl)
+            for wall in range(0, nl + 1):
+                w, cap, taken = _converge("ngl", vals, lambda v, x=wall: v <= x)
+                w2, _c2, taken2 = _converge("ngl", vals, lambda v, x=wall: v <= x)
+                conv_ok = conv_ok and (w.winner == wall and len(taken) <= cap
+                                       and taken == taken2
+                                       and w.topped_out == (wall == nl))
+        # the FFN walk runs the other way and is seeded with the value phase 1
+        # already proved, so it never spends a probe re-measuring it
+        fv = wall_values("n_cpu_ffn", 32)
+        wf, capf, takenf = _converge("n_cpu_ffn", fv,
+                                     lambda v: v >= 12, known=32)
+        conv_ok = conv_ok and (wf.winner == 12 and 32 not in takenf
+                               and len(takenf) <= capf)
+        # nothing loading is not a winner, and --limit can cut a search short
+        wn, _cn, _tn = _converge("ngl", wall_values("ngl", 8), lambda v: False)
+        wl = _WallSearch("ngl", wall_values("ngl", 65), dict(b17), max_probes=2)
+        nl_taken = 0
+        while wl.next() is not None:
+            nl_taken += 1
+            wl.feed({"status": "ok"})
+        conv_ok = conv_ok and (wn.winner is None and not wn.topped_out
+                               and nl_taken == 2)
+        # a status that is not `ok` never counts as fitting - not oom, and not
+        # the four ways a run can be interrupted either. The predicate has to be
+        # total for a bisection, and this is the direction that cannot promote
+        # something the user skipped.
+        for st in ("oom", "skipped", "genfail", "timeout", "exit", "aborted"):
+            wq = _WallSearch("ngl", [1, 2], dict(b17))
+            while True:
+                c = wq.next()
+                if c is None:
+                    break
+                wq.feed({"status": "ok" if c["ngl"] == 1 else st})
+            conv_ok = conv_ok and wq.winner == 1
+        m_ok = m_ok and conv_ok
+        print("  MODEA the search converges on the wall, deterministically  %s"
+              % ("OK" if conv_ok else "FAIL"))
     except Exception as e:
         m_ok = False
         print("  MODEA raised %s: %s  FAIL" % (type(e).__name__, e))
@@ -2913,20 +3307,39 @@ def _run_suite(require_refs, tmp, skipped_real):
             r.update(kw)
             return r
 
-        # 18a) the abort floor is 15% of the median of the healthy rows for this
-        #     model; None until there is something to judge against. A spilled,
-        #     looping or copying row is not a healthy row - it must not drag the
-        #     floor down onto the configs that follow it.
-        af = _abort_floor([hrow(5.6), hrow(5.8), hrow(5.58)], dict(ngl=28), "M.gguf")
+        # 18a) the abort floor is 15% of the median of the healthy rows measured
+        #     under the SAME CONDITIONS; None until there is something to judge
+        #     against. A spilled, looping or copying row is not a healthy row -
+        #     it must not drag the floor down onto the configs that follow it.
+        c18 = {"ctx": 131072, "kv": "q8_0", "ub": 512, "seq": 1, "fa": True,
+               "ngl": 28, "fill": 2048}
+        af = _abort_floor([hrow(5.6), hrow(5.8), hrow(5.58)], c18, "M.gguf")
         sr_ok = (af is not None and abs(af - 0.15 * 5.6) < 0.001
-                 and _abort_floor([hrow(5.6)], dict(ngl=28), "M.gguf") is None
-                 and _abort_floor([], dict(ngl=28), "M.gguf") is None
-                 and _abort_floor([hrow(5.6)], dict(ngl=28), "Other.gguf") is None
+                 and _abort_floor([hrow(5.6)], c18, "M.gguf") is None
+                 and _abort_floor([], c18, "M.gguf") is None
+                 and _abort_floor([hrow(5.6)], c18, "Other.gguf") is None
                  and _abort_floor([hrow(5.6, spilled=True), hrow(5.8)],
-                                  dict(ngl=28), "M.gguf") is None
+                                  c18, "M.gguf") is None
                  and _abort_floor([hrow(5.6, distinct_ratio=0.2), hrow(5.8)],
-                                  dict(ngl=28), "M.gguf") is None)
-        print("  SLOWRUN abort floor: 15%% of the healthy median, else None  %s"
+                                  c18, "M.gguf") is None)
+        # ...and it groups the way _infer_demotion() groups, which is the whole
+        # point: the two make the same judgement, so they must make it from the
+        # same rows. Decode falls ~6x from 2k to 120k of fill on one config, so
+        # a floor drawn from shallow rows aborts a legitimate deep one at 15% of
+        # a number it could never reach - and records it `spilled`.
+        deep = dict(c18, fill=120000)
+        shallow = [hrow(9.45), hrow(9.40), hrow(9.50)]
+        sr_ok = sr_ok and _abort_floor(shallow, deep, "M.gguf") is None
+        # the deep rows judge each other, and the shallow ones stay out of it
+        deep_rows = [dict(hrow(t), config=dict(deep)) for t in (1.49, 1.51, 1.47)]
+        afd = _abort_floor(deep_rows + shallow, deep, "M.gguf")
+        sr_ok = sr_ok and afd is not None and abs(afd - 0.15 * 1.49) < 0.001
+        # speculation is the same story pointing the other way: a draft row runs
+        # far faster, so it must not raise the floor under the plain baseline
+        spec_c = dict(c18, spec="draft-mtp", spec_n_max=2)
+        spec_rows = [dict(hrow(t), config=dict(spec_c)) for t in (13.0, 13.2)]
+        sr_ok = sr_ok and _abort_floor(spec_rows, c18, "M.gguf") is None
+        print("  SLOWRUN abort floor: 15%% of the healthy median, grouped  %s"
               % ("OK" if sr_ok else "FAIL"))
 
         # 18b) resume: a judged row is never re-measured. `ok`/`oom` are
@@ -3233,7 +3646,7 @@ def _run_suite(require_refs, tmp, skipped_real):
                             "gpu_reserve_mib": 512, "safety_pct": 5}}
         s_base = {"kv": "f16", "fa": True, "seq": 1, "fill": 2048}
         # The trap, exactly as measured: the SMALLEST window is the fastest row,
-        # by a margin far inside the noise the slack is sized for.
+        # by a margin far inside the noise a context ladder produces anyway.
         s_rows = [{"model": "m.gguf", "status": "ok", "tok_s": t, "proc_vram_mib": 15000,
                    "config": dict(s_base, ctx=c, ngl=nL, n_cpu_ffn=nL, ub=512)}
                   for c, t in ((32768, 9.10), (65536, 8.95), (131072, 8.80))]
@@ -3244,11 +3657,23 @@ def _run_suite(require_refs, tmp, skipped_real):
                    # the largest window that loaded, not the fastest row
                    and s_got["config"]["ctx"] == 131072
                    and "context" in s_got["goal"])
-        # ...and the slack is not blind: a window that loaded and then ran off a
-        # cliff is a different failure, not "the largest that fits".
+        # ...and it stays the largest that loaded even when it is much slower.
+        # There used to be a 5% slack here that dropped a rung running below its
+        # neighbours before the extreme was taken; it is gone, because it was a
+        # speed judgement inside a question that is not about speed, and it
+        # could hand back half the window to buy a difference the same ladder
+        # produces as jitter.
         s_thrash = s_rows[:2] + [dict(s_rows[2], tok_s=2.0,
                                       config=dict(s_rows[2]["config"]))]
         mode_ok = mode_ok and recommend(sp_pr, s_thrash,
+                                        sweep_budget_mib=sweep_eff)["config"]["ctx"] == 131072
+        # What DOES remove such a row is a spill detector answering from the
+        # memory counters, not an inference from the ranking - and the card
+        # gates on those through trustworthy(), so the slow row drops out and
+        # the next-largest window is recommended instead.
+        s_spill = s_rows[:2] + [dict(s_rows[2], tok_s=2.0, spilled=True,
+                                     config=dict(s_rows[2]["config"]))]
+        mode_ok = mode_ok and recommend(sp_pr, s_spill,
                                         sweep_budget_mib=sweep_eff)["config"]["ctx"] == 65536
 
         # CONTEXT holds the window and pays in the cheapest currency first: while
@@ -3311,8 +3736,11 @@ def _run_suite(require_refs, tmp, skipped_real):
         mode_ok = mode_ok and (only_other["source"] == "measured"
                                and "regime" in {d["kind"] for d in only_other["deltas"]})
         # pick_extreme() is the same function the campaign promotes with, so the
-        # card and the sweep cannot land on different rows.
-        mode_ok = mode_ok and pick_extreme(s_rows, "ctx")["config"]["ctx"] == 131072             and pick_extreme([], "ctx") is None
+        # card and the sweep cannot land on different rows - including when the
+        # largest is the slowest, which is the case that used to split them.
+        mode_ok = mode_ok and (pick_extreme(s_rows, "ctx")["config"]["ctx"] == 131072
+                               and pick_extreme(s_thrash, "ctx")["config"]["ctx"] == 131072
+                               and pick_extreme([], "ctx") is None)
         print("  RECMODE speed takes the widest window, context the least exiled  %s"
               % ("OK" if mode_ok else "FAIL"))
         rec_all = rec_all and mode_ok

@@ -67,8 +67,8 @@ only in the driving:
 
 | | CLI | browser |
 |---|---|---|
-| context / KV quant | `--speed-ctx`, `--speed-kv` | taken from the form and frozen |
-| stages | `--speed-stages acd` | tick boxes |
+| context / KV quant / ubatch | `--speed-ctx`, `--speed-kv`, `--speed-ub` | taken from the form and frozen |
+| stages | `--speed-stages ab` | tick boxes |
 | preview | `--dry-run` | **Preview grid** |
 | progress | printed rows | live table, ordered as measured |
 | stopping | Ctrl-C | **Stop**, which lands between configs |
@@ -95,45 +95,89 @@ a launch script without a model being loaded or a GPU being touched.
 
 ---
 
-## 3. The staged design
+## 3. Two stages
 
-The grid is **one knob at a time from a baseline**, not a cross product — a cross product
-of these axes is hundreds of loads at roughly two minutes each. Stages run in order, and
-each is meant to be re-run at the previous stage's winner — which `--speed-chain` now does
-for you (§3.1).
-
-| stage | what it varies | why it is first/last |
+| stage | what it answers | how |
 |---|---|---|
-| **A** | the wall — see below for which knob it is made of | Finds the wall. Every later comparison is meaningless at a config that spills. |
-| **C** | `-ub` (physical batch) | Mostly a *prefill* knob; costs VRAM, so it interacts with the wall. |
-| **D** | `--spec-type` and draft depth | Needs the winner of A and C to be settled first. |
+| **A** | the wall, and then what the wall left over | two **bisections**, phase 1 then phase 2 |
+| **B** | which draft scheme and depth is fastest at what A found | the full spec list, ranked by tok/s |
 
-Stage A's axis is not fixed — it is whichever knob the wall is made of for the question
-being asked (`--speed-mode`, §5):
+Stage A comes first because every later comparison is meaningless at a config that
+spills, and stage B needs A's answer settled before it can measure anything at it.
 
-| model / mode | pinned | stage A ladders | the wall is |
+### Stage A, phase 1: the mode's own axis
+
+Which knob the wall is made of depends on the question being asked (`--speed-mode`, §5):
+
+| model / mode | pinned | phase 1 searches | the wall is |
 |---|---|---|---|
 | dense, `--speed-mode speed` | `-ngl` all, `-ot` all blocks | **context** | the largest window that loads |
-| dense, `--speed-mode context` | context | **`-ot`**, or `-ngl` — see below | the smallest FFN exile, or the largest layer count |
-| MoE | `-ngl` all | **`--n-cpu-moe`** | the smallest expert offload that fits |
+| dense, `--speed-mode context` | context, `-ot` all blocks | **`-ngl`** | the most blocks that load |
+| MoE | `-ngl` all | **`--n-cpu-moe`** | the smallest expert offload that loads |
 
-Stage A's ladder is **seeded from the planner** — `plan.analyze()` is asked where the
-split falls for this model, this card and this context, and the ladder brackets that.
-You do not hand-pick rungs.
+**"Loads" means `status: ok` and nothing else.** Not fastest, not "fast enough", not
+"loaded and did not look suspicious" — it came up and produced a measurement. An `oom`
+did not fit; neither, for the search's purposes, did a `genfail`, a `timeout`, or a
+config you **skipped**. A bisection needs an answer for every rung, and that is the safe
+one: it keeps more exiled and less allocated, and it is the reason a config you judged
+once can never come back as the winner.
 
-The context mode has **two shapes**, and stage A takes whichever one the plan
-landed in. Context is paid for in the cheapest currency first: exiling dense FFN
-(`-ot`) frees VRAM without costing any KV, so while every block still fits on the GPU
-the axis is `n_cpu_ffn` and the wall is the **smallest** exile that loads — the most FFN
-kept in VRAM. That is the same shape as an MoE's `--n-cpu-moe` ladder and for the same
-reason. Only when a *full* exile still is not enough does the axis become `-ngl`, and
-whole blocks start leaving with their KV.
+### Stage A, phase 2: spend what is left
 
-**Stages B and E were retired.** B swept the projector's placement, which is a decision
-rather than a measurement: say where it goes on the plan form and both the plan and the
-campaign use that. E swept the dense-FFN `-ot` pin, which both plan modes now fix at
-every block — that pin is what *makes* them the modes they are, so there was no question
-left for a ladder to answer. `--speed-ot N` still pins some other count by hand.
+If phase 1 **topped out** — the largest value in the whole range loaded, so the axis ran
+out of room to spend VRAM on before the card ran out of VRAM — then there is VRAM left
+over, and on a dense model it buys FFN blocks back onto the card. Phase 2 bisects
+`n_cpu_ffn` downward from a full exile and promotes the **smallest exile that still
+loads**: the most FFN kept in VRAM.
+
+A winner in the *middle* of phase 1's range means the wall is real and nothing is spare,
+so phase 2 does not run — walking the FFN back on there would only re-prove the same wall
+one knob over. There is no phase 2 on an MoE either: `--n-cpu-moe` *is* its dense-FFN
+knob, and phase 1 has just searched it.
+
+### Why a bisection, and not a ladder
+
+Finding a wall on an axis that is monotone in VRAM is a search problem, and the ladder
+was the wrong algorithm for it. Two things change:
+
+- **Cost.** A ladder pays one load — about two minutes — per rung. A bisection pays
+  `ceil(log2(n))`: 66 layer counts cost **seven** loads, where the old nine-rung bracket
+  cost nine and covered a seventh as much.
+- **Correctness**, which matters more. Because a bisection can *afford* the whole range,
+  it no longer matters whether the planner centred a bracket well. A wall more than a few
+  rungs above the seed used to sit outside the ladder entirely, and the campaign would
+  then report the top of its own bracket as the wall, with nothing in the output to say it
+  had never looked further up.
+
+`plan.analyze()` is still asked where the split falls, but only for the **pins** — which
+axis is free and what the others are held at. Where the wall *is*, is now measured.
+
+Context is the one axis with no natural unit, so its domain is multiples of
+`n_ctx_train / 64`, never finer than 1024 tokens. That is 4096-token rungs on a
+262144-trained model and 1024-token rungs on a 32768-trained one — far finer than anyone
+tunes at, and seven probes either way.
+
+**A probe already on disk costs nothing.** Before issuing one, the search looks the config
+up in the campaign's recorded rows; a hit feeds the stored status straight in without
+loading anything. So a resumed campaign, and a second `--speed-rounds` pass, replay the
+whole search for free and reach the same winner — which is also what keeps the search
+reproducible across restarts.
+
+**Stages C, E and the old B were retired.** The old B swept the projector's placement,
+which is a decision rather than a measurement: say where it goes on the plan form and both
+the plan and the campaign use that. **C** swept `-ub`, which is a *prefill* knob — this
+tool's own insights put the whole ladder at **+1.3%** against +37% for speculation (§8.1),
+so it was spending four loads an hour apiece to re-derive that. It is frozen from the form
+now, like context and KV quant, and `--speed-ub N` sets it from the CLI; sweep it by hand
+with `--speed-axes "ub=256,512,1024,2048"` if you want the number again. **E** swept the
+dense-FFN `-ot` pin from a planner seed; phase 2 answers the part of that which was a real
+question. `--speed-ot N` still pins some other count by hand.
+
+**D was renamed B.** With C gone the campaign is A-then-speed, and a letter that skips two
+places reads as two stages that failed to run. `--speed-stages d` still works and says so;
+rows already on disk keep the letter they were measured under, because the resume key
+never included the stage and rewriting history to tidy a label is not a trade worth
+making.
 
 **Depth is not a stage.** It is the `--speed-fill` axis, and it matters more than any
 single setting (see §8). Run the top two or three configs again at a realistic fill:
@@ -161,8 +205,12 @@ that fit. The rows are keyed on fill, so they never compete for the chained base
 
 A hard `oom` is monotone evidence: the config that hit it and the queued configs that
 are *worse* on the same axis, with every other knob equal, fail the same way — loading
-them would re-prove the wall instead of measuring anything. So the grid prunes them
-before they load:
+them would re-prove the wall instead of measuring anything.
+
+That is the same fact stage A's bisection is built on — if a value loads, every cheaper
+value loads — used to *choose the next probe* rather than to discard queued ones. A
+search has no queue to prune, so the pruning below is what stage B's depth ladder and an
+explicit `--speed-axes` ladder get instead:
 
 ```
 wall    : ngl 42 ncmoe 0 ub 512 spec none OOMs; 5 later configs provably worse, skipped
@@ -185,111 +233,134 @@ wall    : ngl 42 ncmoe 0 ub 512 spec none OOMs; 5 later configs provably worse, 
 
 ## 3.1 Chaining: stop measuring at a baseline nothing confirmed
 
-Without chaining, stages C and D are pinned at **the planner's** `-ngl`, not at the one
-stage A found. That is not an oversight — nothing can know stage A's result before stage A
-has run — but it means ubatch and speculation get measured at a split you have no evidence
-for. The historical fix was to re-run by hand with `--speed-axes` at the previous winner.
+Without chaining, stage B is pinned at **the planner's** split, not at the one stage A
+found. That is not an oversight — nothing can know stage A's result before stage A has
+run — but it means speculation gets measured at a split you have no evidence for. The
+historical fix was to re-run by hand with `--speed-axes` at the previous winner.
 
 ```
 python -m vram_planner --speed-sweep --models MODEL --speed-chain
 python -m vram_planner --speed-sweep --models MODEL --speed-chain --speed-rounds 2
 ```
 
-Each stage is built *after* the previous one finishes, from the fastest trustworthy row so
-far. **The number of loads does not change**, so neither do the hours: this is the same
-search with the baseline kept honest, not a wider one.
+Stage B is built *after* stage A finishes, from the winner stage A actually measured.
+**The number of loads does not change**, so neither do the hours: this is the same search
+with the baseline kept honest, not a wider one.
 
-Between stages the log says what it decided, including when it decided nothing:
+Stage A's own two phases are chained whether or not you ask for it. That is not chaining —
+it is stage A knowing its own answer, and phase 2 has to run *at* that answer or it
+measures a config the mode never proposed. What `--speed-chain` decides is whether stage
+A's result escapes to stage B.
+
+The log says what each phase decided, including when it decided nothing:
 
 ```
-stage C round 1: 4 configs at ngl 31 ncmoe 0 ub 512 spec none
-  baseline -> ngl 31 ncmoe 0 ub 1024 spec none   (largest ub that loads: 1024, 8.42 tok/s, stage C)
-stage D round 1: 8 configs at ngl 31 ncmoe 0 ub 1024 spec none
-  baseline unchanged: nothing beat 8.42 tok/s by more than 2%
+stage A: bisecting ctx over 64 values, 7 probes at most, at ngl 52 ncmoe 0 ub 512 spec none ffn-cpu 52
+  wall    : ctx: 7 probes, 65536=ok 98304=ok 114688=ok 122880=ok 126976=ok 129024=ok 131072=ok -> 131072
+  baseline -> ngl 52 ncmoe 0 ub 512 spec none ffn-cpu 52   (largest ctx that loads: 131072, 9.35 tok/s, stage A)
+stage A: ctx fits whole, so there is VRAM left - bisecting n_cpu_ffn over 53 values, 6 probes at most
+  wall    : n_cpu_ffn: 6 probes, 26=oom 39=ok 33=ok 30=ok 28=oom 29=oom -> 30
+  baseline -> ngl 52 ncmoe 0 ub 512 spec none ffn-cpu 30   (smallest n_cpu_ffn that loads: 30, 9.35 tok/s, stage A)
+stage B: 19 configs at ngl 52 ncmoe 0 ub 512 spec none ffn-cpu 30
+  baseline unchanged: nothing beat 9.35 tok/s by more than 2%
 ```
 
-The parenthesis names the criterion that chose the row, because it is no longer the same
-one at every stage.
+The `wall :` line is the whole search: every value probed, what it did, and what that
+converged on. The parenthesis names the criterion that chose the row, because it is not the
+same one at both stages.
 
 **What "best" means is the stage's own question**, not one rule for the whole campaign:
 
 | stage | promotes | why |
 |---|---|---|
-| **A** | the value at the **wall** — largest `ctx` (speed mode); smallest `-ot` exile, or largest `-ngl`, (context mode); smallest `--n-cpu-moe` on an MoE | the axis is monotone in VRAM, so the value at the wall is the one worth having |
-| **C** | the **largest `-ub`** that loads | ubatch is a prefill knob; decode barely moves with it |
-| **D** | the **fastest** row, by more than 2% | a draft scheme's worth is its acceptance rate, and no ordering of depths implies it |
+| **A** phase 1 | the value at the **wall** — largest `ctx` (speed mode), largest `-ngl` (context mode), smallest `--n-cpu-moe` (MoE) | the axis is monotone in VRAM, so the value at the wall is the one worth having |
+| **A** phase 2 | the **smallest `-ot` exile** that loads | fewer FFN blocks in RAM is more resident, and phase 1 proved there was room |
+| **B** | the **fastest** row, by more than 2% | a draft scheme's worth is its acceptance rate, and no ordering of depths implies it |
 
-Stages A and C used to rank by tok/s like stage D, and on the speed mode that was
-actively wrong. Decode re-reads the KV for the tokens actually **present** (`fill`), not
-for the window that was *allocated*, so tok/s across a context ladder is nearly flat —
-measured rows on a 27B dense model move **4.2% across a doubling of context**, and
-downward. Fastest-wins therefore promoted the *smallest* window on the ladder, giving up
-half the context for 4% of speed, in the one mode whose entire headline is "the largest
-context that still fits".
+Stage A used to rank by tok/s like stage B, and on the speed mode that was actively wrong.
+Decode re-reads the KV for the tokens actually **present** (`fill`), not for the window
+that was *allocated*, so tok/s across a context ladder is nearly flat — measured rows on a
+27B dense model move **4.2% across a doubling of context**, and downward. Fastest-wins
+therefore promoted the *smallest* window on the ladder, giving up half the context for 4%
+of speed, in the one mode whose entire headline is "the largest context that still fits".
 
-The wall is still only taken from rows that **loaded cleanly**: an `oom` is not a
-candidate, and neither is a row that loaded and then spilled, looped or copied. A rung
-that loads but runs more than 5% below the fastest row on its ladder is refused too —
-that is not the wall, it is a different failure wearing the costume of a result.
+**Stage A has no slack.** There used to be a 5% one: a rung running below the fastest rung
+on its ladder was dropped before the extreme was taken. It is gone, and stage A now means
+exactly what it says — the largest value that **loaded**, even when that value is the
+slowest row measured. A big window measured a little slow is still the big window that
+fits; refusing it because a smaller rung read 6% faster hands back the window to buy a
+difference the same ladder produces as jitter.
 
-Which end of an axis is the good end comes from one lookup, `bench.axis_direction()`,
-over the same tables the OOM pruning walks — so the ladder, the promotion, the draft
-retry walk and the recommendation card cannot disagree about it. `-ot` and
-`--n-cpu-moe` are the two that run **downward**: they measure how much has been
-*exiled*, so fewer blocks moved off the card is more resident and the wall is the
-minimum.
+What the slack was really guarding against — a rung that loads and then thrashes because
+WDDM spilled it into shared memory — is a **spill**, and there are three detectors for it
+(§8, Statuses) that answer from the memory counters instead of inferring it from a speed
+ranking. Stage B still gates on them, because stage B reads tok/s. Stage A deliberately
+does not: "did it load" is a question a spilled row answers yes to, and truthfully.
 
-**The recommendation card ranks the same way.** `recommend.recommend()` asks
-`mode_axis()` which knob the category on screen leaves free and hands the surviving rows
-to the same `bench.pick_extreme()` the stages promote with — so "the best measured
-config" on the plan page and the config a campaign would carry forward are the same row
-by construction, not by two places agreeing to rank the same way. Outside the two-plan
-regime the card falls back to fastest-wins, because nothing has been left free.
+Which end of an axis is the good end comes from one lookup, `bench.axis_direction()`, over
+the same tables the OOM pruning walks — so the search domain, the promotion, the draft
+retry walk and the recommendation card cannot disagree about it. `-ot` and `--n-cpu-moe`
+are the two that run **downward**: they measure how much has been *exiled*, so fewer blocks
+moved off the card is more resident and the wall is the minimum. The search expresses that
+by ordering its domain **ascending in VRAM cost** and always looking for the highest index
+that loads, so all four axes are one question and cannot be answered inconsistently.
+
+**The recommendation card ranks the same way.** `recommend.recommend()` asks `mode_axis()`
+which knob the category on screen leaves free and hands the surviving rows to the same
+`bench.pick_extreme()` the stages promote with — so "the best measured config" on the plan
+page and the config a campaign would carry forward are the same row by construction, not by
+two places agreeing to rank the same way. Outside the two-plan regime the card falls back
+to fastest-wins, because nothing has been left free.
 
 Three rules make it safe:
 
 - **Only what was measured under the same conditions competes.** Same model, GPU, backend
-  build, context, KV quant, draft-cache quant, fill depth, sequences, flash attention,
-  samplers, chat template, prompt corpus, `n_predict` and `repeat`. A 2k-fill row must
-  never set the baseline for a 32k campaign — that is not a slower config, it is a
+  build, context, KV quant, ubatch, draft-cache quant, fill depth, sequences, flash
+  attention, samplers, chat template, prompt corpus, `n_predict` and `repeat`. A 2k-fill
+  row must never set the baseline for a 32k campaign — that is not a slower config, it is a
   different experiment.
-  *One exception*: in the dense **speed** mode, context is the axis stage A sweeps, so it
+  *One exception*: in the dense **speed** mode, context is the axis stage A searches, so it
   stops being part of what the campaign IS and becomes what it found. There — and only
   there — rows at different contexts compete, and the winner's context is carried forward.
-- **Spilled and looping rows never carry forward.** They stay in the table, because they
-  are evidence about where the wall is; they just cannot be the thing a baseline is drawn
-  from, since a bad baseline bends every stage after it in one direction, silently.
+- **Spilled and looping rows never carry forward from stage B.** They stay in the table,
+  because they are evidence about where the wall is; they just cannot be the thing a speed
+  baseline is drawn from, since a bad baseline bends everything after it in one direction,
+  silently.
 - **A challenger must win by more than 2%.** `tok_s` is a median of `repeat` passes, so a
   1% lead is jitter — and rebasing on jitter would make the campaign explore different
-  configs on two runs of the same machine. This applies to stage D, the stage that ranks
-  by speed; "which value loaded" is not a speed measurement, so the margin does not gate
-  stages A and C.
+  configs on two runs of the same machine. This applies to stage B, the stage that ranks by
+  speed; "which value loaded" is not a speed measurement, so the margin does not gate stage
+  A.
 
-What actually carries forward is a fixed set of knobs — `ngl`, `ncmoe`, `n_cpu_ffn`, `ub`,
-the projector's placement and the speculation triple (`spec`, `spec_n_max`, `md`) — plus
-`ctx` in the speed mode. Everything else a row carries is the campaign's *definition*
-rather than its result, and a stage that changed one of those would be answering a
-different question than the one being asked. The two lists move together on purpose: an
-axis that competes must also be carried, or the winner is found and then thrown away.
+What actually carries forward is a fixed set of knobs — `ngl`, `ncmoe`, `n_cpu_ffn`, the
+projector's placement and the speculation triple (`spec`, `spec_n_max`, `md`) — plus `ctx`
+in the speed mode. Everything else a row carries is the campaign's *definition* rather than
+its result, and a stage that changed one of those would be answering a different question
+than the one being asked. **`ub` moved across that line when stage C was retired**, and it
+had to move in both lists at once: out of what carries, and into what a comparison gates
+on. Doing half of it would have let the ub-1024 rows every old stage C left on disk set the
+baseline for a campaign frozen at 512.
 
 The baseline is re-read **from disk**, not from memory, so a campaign stopped after stage A
 and restarted tomorrow recovers stage A's winner instead of falling back to the planner.
 
-`--speed-rounds N` re-runs the stages from the winner; it is cheap because the resume key
-does not include the stage letter, so anything a later round revisits unchanged is already
-recorded and skipped. A second round is worth it mainly when speculation wins in stage D:
-the draft cache costs VRAM the planner priced under different assumptions, so the wall
-genuinely moves and stage A's ladder is rebuilt around the new split.
+`--speed-rounds N` re-runs the stages from the winner. It is close to free: the resume key
+does not include the stage letter, and a search probe whose config is already recorded is
+answered from disk without loading anything — so a second round replays stage A's entire
+bisection at zero cost and only pays for combinations round 1 never tried. A second round
+is worth it mainly when speculation wins in stage B: the draft cache costs VRAM the planner
+priced under different assumptions, so the wall genuinely moves.
 
-A chained dry-run can only list the **first** stage. The stages after it are built from a
-baseline that does not yet exist, and printing values for them would be a guess dressed up
-as a plan — the guess being exactly the frozen one this mode exists to escape. The
-*counts* are still exact (a ladder's length does not depend on where it is centred), so the
-hour estimate is not a guess.
+A dry-run can only list **stage B's** configs, and only when nothing is chained. Stage A is
+a search, so its values are decided as it goes and printing any of them would be a guess
+dressed up as a plan. Its *count* is exact — `ceil(log2(n))` does not depend on where the
+wall turns out to be — so the hour estimate is not a guess. It is an upper bound in one
+place: phase 2 is counted as though it will run, because whether it runs cannot be known
+until phase 1 has.
 
 ## 3.2 The verify row: measure what you will launch
 
-The sweep's winner is one point on a ladder, and its knobs are rarely what you actually
+The sweep's winner is one point in a search, and its knobs are rarely what you actually
 run — production usually adds MTP draft depth, different ubatch, a sampler. Those change
 the allocation the sweep never saw (MTP's draft cache alone moved the OOM wall one `ngl`
 rung in on one model). `--speed-verify` closes that: after the sweep finishes it loads the
@@ -378,9 +449,10 @@ The harness detects this from the file; you do not pass a flag. But know what ch
 
 |  | dense | MoE |
 |---|---|---|
-| stage A axis | context or `-ngl`, by `--speed-mode` | `--n-cpu-moe`, at `-ngl` = all blocks |
+| phase 1 axis | context or `-ngl`, by `--speed-mode` | `--n-cpu-moe`, at `-ngl` = all blocks |
 | better direction | **higher** | **lower** |
 | the wall is | the largest value that fits | the smallest value that fits |
+| phase 2 | `-ot`, if phase 1 topped out | none — phase 1 already searched the expert split |
 
 `-ngl N` puts the last N blocks on the GPU — attention, **KV** and experts together.
 `--n-cpu-moe M` moves only the *routed experts* of the first M blocks to the CPU, leaving
@@ -390,10 +462,10 @@ token — while whole-block offload drags KV to the CPU with it, which is the ex
 thing to lose. **Laddering `-ngl` on an MoE measures the fallback strategy and never
 finds the good configuration at all.**
 
-Stage D also skips `draft-mtp` automatically when the file has no `nextn` blocks — there
+Stage B also skips `draft-mtp` automatically when the file has no `nextn` blocks — there
 is nothing to draft from, so those rows would be identical failures. `draft-dflash` gets
 the same gate a different way: the scheme lives in a SEPARATE file (`dflash-*.gguf`, whose
-architecture is `dflash`) next to the model, so stage D only adds those rows when that
+architecture is `dflash`) next to the model, so stage B only adds those rows when that
 file is present — and it sweeps the drafter's **whole trained block size**, ascending
 (from depth 1 to the block), because llama.cpp clamps `--spec-draft-n-max` to it and the
 monotone wall (§3.0) prunes the deeper half of the ladder at the first OOM — the draft
@@ -404,7 +476,7 @@ cache grows with depth, so depth 8 failing at a split proves depths 9–16 do to
 The draft cache is **not** the target's KV cache. llama.cpp keeps it at f16 whatever
 `-ctk/-ctv` say — it is moved by its own pair, `-ctkd/-ctvd` (`--cache-type-k-draft` /
 `--cache-type-v-draft`) — and it is the speculative allocation that grows with draft
-depth, so its size is part of what stage D measures. The sweep's knob is `spec_kv`,
+depth, so its size is part of what stage B measures. The sweep's knob is `spec_kv`,
 frozen like `kv` is and defaulting to f16:
 
 ```
@@ -436,9 +508,11 @@ to lose, so exiling the FFN is what buys either the window (speed mode) or the l
 (context mode). The modes then differ only in which of those two is held and which is
 solved for.
 
-Because the pin is fixed, it is no longer swept — stage E is gone. The wall along it is
-still monotone **downward** (an OOM at 16 blocks pinned proves 8 fails too), which matters
-for an explicit `--speed-axes` ladder over it.
+Because the pin is fixed for phase 1, the old stage E that swept it from a planner seed is
+gone. What was a real question in it — how much FFN can come back once the wall is known —
+is stage A's phase 2 (§3). The wall along the axis is monotone **downward** (an OOM at 16
+blocks pinned proves 8 fails too), which is what lets phase 2 bisect it and what tags an
+explicit `--speed-axes` ladder over it.
 
 This is a **tensor** split, so it is also the one knob no layer count can describe — the
 speed model prices it the same way the plan does (`n_cpu_ffn`), and the launch script
@@ -473,9 +547,9 @@ present), and they are worth far less.
 | `--speed-sweep` | run the staged grid |
 | `--dry-run` | print the configs and estimate, run nothing |
 | `--models NAME` | substring match on the file name |
-| `--speed-stages acd` | which stages to run |
+| `--speed-stages ab` | which stages to run (`a` the wall, `b` speculation). The old letters still work: `d` is stage B, `c` was the ubatch sweep and is now `--speed-ub` |
 | `--speed-mode auto\|speed\|context` | dense only: which question stage A answers (§5) |
-| `--speed-ctx N` / `--speed-kv TYPE` | freeze context / KV quant |
+| `--speed-ctx N` / `--speed-kv TYPE` / `--speed-ub N` | freeze context / KV quant / physical batch |
 | `--speed-fill N` | prompt length to measure at |
 | `--speed-fills N N …` | first value = campaign fill; the rest re-measure the top stage-A rungs at deeper fills (§3). Refuses to combine with `--speed-fill` |
 | `--speed-axes "k=v,v …"` | explicit ladder **instead of** the staged grid |
@@ -483,7 +557,7 @@ present), and they are worth far less.
 | `--limit N` | stop after N configs |
 | `--backend BUILD` | pick a specific llama.cpp build |
 | `--sweep-timeout SECONDS` | per-load timeout (raise it for deep fills) |
-| `--speed-chain` | build each stage from the fastest row so far (§3.1) |
+| `--speed-chain` | build stage B against what stage A measured (§3.1) |
 | `--speed-rounds N` | with `--speed-chain`: re-run the stages from the winner |
 | `--speed-ot N` | pin the first N blocks' dense FFN tensors to the CPU (`-ot`) for the campaign, instead of the plan mode's every-block pin (§5.2). Dense models only |
 | `--speed-spec-kv TYPE` | freeze the DRAFT cache's quant (`-ctkd/-ctvd`) for the campaign; f16 by default (§5.1). Halves what speculation costs at `q8_0`, at whatever the acceptance rate turns out to be |
@@ -619,14 +693,15 @@ with each other.
 ## 8. Reading the results
 
 ```
-st ngl  ncmoe ot   ub    fill     spec          nmax mmproj |    tok/s   prefill    VRAM accept
-A  28   0     0    512   2048     draft-mtp     2    ram    |     9.45     296.9   11410    80%
-E  32   0     8    512   2048     none          0    vram   |     8.10     288.4   10120    -
+st ctx     ngl  ncmoe ot   ub    fill     spec          nmax mmproj |    tok/s   prefill    VRAM accept
+B  131072  28   0     0    512   2048     draft-mtp     2    ram    |     9.45     296.9   11410    80%
+A  131072  32   0     8    512   2048     none          0    vram   |     8.10     288.4   10120    -
 ```
 
 | column | meaning |
 |---|---|
-| `ot` | blocks whose dense FFN tensors are pinned to the CPU (`-ot`) — every block under either dense plan mode |
+| `ctx` | the window the row was loaded with — stage A's own axis in the dense speed mode, so a search over it reads as a column rather than as one config measured seven times |
+| `ot` | blocks whose dense FFN tensors are pinned to the CPU (`-ot`) — every block in phase 1 of either dense plan mode, and whatever phase 2 walked it back to |
 | `tok/s` | **median of `--repeat` cache-warm passes** — pure decode |
 | `prefill` | from one cold pass, `cache_prompt` off |
 | `VRAM` | per-process dedicated VRAM, from the OS counter |
@@ -694,11 +769,11 @@ the depth you actually work at. Speculation's advantage decays the same way — 
 cache displaced start to cost more than speculation saves.
 
 `--speed-fills` collects this slope inside the campaign (see §3): the rows land as stage-A
-rows at the extra fills, next to the ladder that chose their rungs, so a dry-run count of
-stage A is the count of the ladder *and* the depth rows on top of it — and because the
-deep rows are keyed on fill, a rerun at a single fill never pays for them again.
+rows at the extra fills, next to the search that chose their rungs, so a dry-run count of
+stage A is its probe budget *and* the depth rows on top of it — and because the deep rows
+are keyed on fill, a rerun at a single fill never pays for them again.
 
-Stage D's draft-depth ladder is measured the same way a hand-run `--speed-axes` ladder
+Stage B's draft-depth ladder is measured the same way a hand-run `--speed-axes` ladder
 used to be, and the grid's own monotone rule prunes the redundant half of it: on a
 dflash drafter the depths run **the full trained block, ascending**, and the first depth
 that OOMs at a split proves every deeper one does too (the draft cache grows with depth),
@@ -724,7 +799,7 @@ never proposed:
 | model / mode | the walk gives back | a rung is |
 |---|---|---|
 | MoE | `--n-cpu-moe` | one more block's experts on the CPU |
-| dense, `--speed-mode context` | `-ot`, or `-ngl` | one more block's FFN on the CPU, or one fewer block on the GPU — whichever axis stage A used |
+| dense, `--speed-mode context` | `-ngl` | one fewer block on the GPU |
 | dense, `--speed-mode speed` | **context** | a tenth of the window, snapped down to a multiple of 1024 |
 
 In the speed mode `-ngl` is pinned at every block and the `-ot` pin with it — that pair
@@ -732,8 +807,8 @@ In the speed mode `-ngl` is pinned at every block and the `-ot` pin with it — 
 draft cache and then report the result as speculation working. It gives back context
 instead, granularly: a tenth per rung is enough that two or three rungs cover a draft
 cache of a few hundred MiB against a KV cache of a few thousand, and coarser steps would
-hand back gigabytes of window to buy back megabytes. Five rungs is the limit either way,
-so the speed walk reaches roughly 60% of the starting window before it gives up.
+hand back gigabytes of window to buy back megabytes. **Seven** rungs is the limit either
+way, so the speed walk reaches roughly half the starting window before it gives up.
 
 ---
 
@@ -891,7 +966,7 @@ row was measured with `none`; the row's `ngl` was safe *without* MTP's draft cac
 script says so out loud:
 
 ```
-# based on M.gguf 9.45 tok/s @ ngl 28 ctx 131072 q8_0 (stage D, 2026-08-10)
+# based on M.gguf 9.45 tok/s @ ngl 28 ctx 131072 q8_0 (stage B, 2026-08-10)
 # !! this config DIFFERS from the measured row: spec none->draft-mtp
 ```
 

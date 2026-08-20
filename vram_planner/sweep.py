@@ -392,7 +392,7 @@ class _Server:
 
 @contextlib.contextmanager
 def serve(backend, model_path, c, port=8231, timeout=420.0, settle=2.0,
-          log_dir=None, log_name="run.log"):
+          log_dir=None, log_name="run.log", on_proc=None, should_abort=None):
     """Launch one config and hold it up for as long as the caller wants it.
 
     Two callers want different things from the same startup: run_one() reads the
@@ -403,6 +403,18 @@ def serve(backend, model_path, c, port=8231, timeout=420.0, settle=2.0,
     stderr goes to a file rather than a pipe: llama.cpp emits thousands of lines
     under -v and a pipe nobody drains fills its buffer and deadlocks the child
     somewhere in the middle of loading.
+
+    `on_proc` is handed the child the INSTANT Popen returns, before the ready
+    line is waited for. That timing is the whole point of the callback. A
+    campaign's hard stop works by killing the server it is blocked on, and it
+    can only kill what it has been told about - so publishing after the yield
+    (which is where bench_one used to do it) left the process invisible for the
+    entire load, which is 20-120s normally and up to `timeout` when something is
+    wrong. Pressing Stop twice during a load then killed nothing at all.
+
+    `should_abort` is checked while waiting for the ready line, so a stop lands
+    DURING the load rather than after it. The status is "aborted", which no
+    caller records: an abandoned load is not evidence about the config.
 
     The process is killed on the way out, on every path."""
     log_dir = log_dir or os.path.join(_data_dir(), "sweep-logs")
@@ -428,8 +440,16 @@ def serve(backend, model_path, c, port=8231, timeout=420.0, settle=2.0,
             return
 
         p = srv.proc
+        # Published before the ready line is waited for, not after - see the
+        # docstring. This is the only window a hard stop cannot otherwise reach.
+        if on_proc:
+            on_proc(p)
         try:
             while True:
+                if should_abort and should_abort():
+                    srv.status = "aborted"
+                    srv.error = "abandoned during load"
+                    break
                 if time.time() - t0 > timeout:
                     srv.status = "timeout"
                     srv.error = "no ready line in %.0fs" % timeout
@@ -446,17 +466,27 @@ def serve(backend, model_path, c, port=8231, timeout=420.0, settle=2.0,
                     srv.status = "oom" if srv.parsed["oom"] else "exit"
                     srv.exit_code = rc
                     break
-                time.sleep(0.5)
+                # Short: this is also how often an abort is noticed, and a stop
+                # that lands half a second late is a stop button people press
+                # twice more.
+                time.sleep(0.25)
             srv.load_s = round(time.time() - t0, 1)
             yield srv
         finally:
             _kill(p)
 
 
-def finish_row(row, srv, log_dir=None):
+def finish_row(row, srv, log_dir=None, aborted=False):
     """Fold a finished _Server into a result row: the VRAM split, the floor, and
     whether the measurement is trustworthy. Shared by run_one() and bench.py so
-    both produce rows suspect_reason() and fit.py can read the same way."""
+    both produce rows suspect_reason() and fit.py can read the same way.
+
+    `aborted` says the run was ABANDONED on request, so its row is going to be
+    discarded rather than written (see run_group). Everything here that costs
+    real time - two nvidia-smi calls behind gpu_list(fresh=True), 8s of timeout
+    each - is then measuring something nobody will read, while the person who
+    pressed Stop waits for it. Skipped, and the row is marked so nothing later
+    mistakes the missing numbers for a failed reading."""
     if srv.error:
         row["error"] = srv.error
     if srv.exit_code is not None:
@@ -469,6 +499,12 @@ def finish_row(row, srv, log_dir=None):
         row["alloc_gpu_mib"] = gpu_alloc
         row["alloc_host_mib"] = host_alloc
         row["proc_vram_mib"] = srv.proc_vram
+        # Said out loud rather than inferred from a None floor further down.
+        # unsound_reason() used to read the missing floor as a spill; it does
+        # not any more, so the fact that nothing could be read has to be
+        # recorded as its own thing or it stops being visible at all.
+        if srv.proc_vram is None:
+            row["floor_unread"] = True
         # The floor: what the process holds that the allocator never reports.
         # Negative would mean the counter read low, which happens if we sampled
         # before allocation settled - keep it, do not clamp, so it shows up as bad
@@ -476,8 +512,11 @@ def finish_row(row, srv, log_dir=None):
         row["floor_mib"] = (round(srv.proc_vram - gpu_alloc, 1)
                             if srv.proc_vram is not None else None)
     row["gpu_free_before_mib"] = srv.free_before
-    row["gpu_free_after_mib"] = _free_mib()
-    row["gpu_total_mib"] = _total_mib()
+    if aborted:
+        row["aborted"] = True
+    else:
+        row["gpu_free_after_mib"] = _free_mib()
+        row["gpu_total_mib"] = _total_mib()
     row["suspect"] = suspect_reason(row)
     if log_dir and row["status"] != "ok":
         # keep the evidence for anything that did not work
@@ -540,24 +579,48 @@ def unsound_reason(row):
         return ""
     fl = row.get("floor_mib")
     if fl is None:
-        return "per-process VRAM could not be read"
+        # NOT a verdict. The floor is missing because the per-process VRAM
+        # counter could not be read - get_gpu_processes() failed, or the process
+        # had already gone by the time it was sampled - which is a fact about
+        # the telemetry, not about the run. Calling it unsound put the row
+        # outside trustworthy() and cost stage B a candidate every time
+        # nvidia-smi hiccupped. demoted() already states the rule this follows:
+        # unmeasured is not evidence of absence.
+        return ""
     if fl < FLOOR_MIN_MIB:
         return ("allocator asked for %.0f MiB more than the process holds - the card "
                 "was at the wall and spilled to shared memory, so this reads the cap, "
                 "not the need" % -fl)
-    if fl > FLOOR_MAX_MIB:
+    if fl > FLOOR_MAX_MIB and not _unreported_alloc(row):
         return "floor of %.0f MiB is too large to be a CUDA context" % fl
-    free = row.get("gpu_free_after_mib")
-    if free is not None and free < 192.0:
-        return "only %.0f MiB of VRAM was free at measure time" % free
     return ""
+
+
+# The two things llama.cpp allocates in VRAM and does NOT report in its buffer
+# lines, so they land in `floor` instead - see _infer_demotion(), which has to
+# group around the same fact.
+#
+#   * a draft KV cache. Measured at ~1050 MiB on a draft-mtp row whose
+#     non-speculative twin sat at 230, and it grows with draft depth.
+#   * the projector, when it is in VRAM: another ~1100 MiB.
+#
+# FLOOR_MAX_MIB says "a floor this large is not a CUDA context", and on those
+# rows that premise is simply false - it is a CUDA context PLUS several GiB of
+# real allocation nobody printed. A deep draft depth at a large context clears
+# 4096 MiB legitimately, and every such row was being called spilled: exactly
+# the rows stage B exists to measure.
+def _unreported_alloc(row):
+    c = row.get("config") or {}
+    return bool((c.get("spec") or "none") != "none"
+                or (c.get("mmproj") and c.get("mmproj_offload") is not False))
 
 
 def suspect_reason(row):
     """Why this row should not be FITTED, or "" if it looks sound.
 
     The allocation fit's gate: everything unsound_reason() rejects, plus tensor
-    splits. Speed rows must NOT be judged by this - see unsound_reason()."""
+    splits, plus a card that had no room left at measure time. Speed rows must
+    NOT be judged by this - see unsound_reason()."""
     if row.get("status") != "ok":
         return ""
     if (row.get("config") or {}).get("n_cpu_ffn"):
@@ -568,6 +631,22 @@ def suspect_reason(row):
         # and never enters the fit.
         return ("dense FFN tensors pinned to the CPU (-ot), which the fit "
                 "model cannot price")
+    free = row.get("gpu_free_after_mib")
+    if free is not None and free < 192.0:
+        # This clause lives HERE and not in unsound_reason(), for two reasons
+        # that point the same way.
+        #
+        # It is measured at the wrong moment. finish_row() reads it after the
+        # `with serve(...)` block has already killed the process, so a low
+        # reading is the driver not having released the memory yet - the run is
+        # long over. `gpu_free_before_mib` is the one taken while it mattered.
+        #
+        # And "the card had almost nothing left" is not a defect in a SPEED row,
+        # it is the definition of the row stage A is looking for. Every winner
+        # at the wall reads this way, so gating on it removed the answer. For
+        # the allocation FIT it is still a fair objection: a fit wants headroom
+        # around the point it is pricing.
+        return "only %.0f MiB of VRAM was free at measure time" % free
     return unsound_reason(row)
 
 
@@ -594,16 +673,24 @@ def _proc_vram(pid):
     return None
 
 
+# A llama-server that has been asked to go away and has not gone away in five
+# seconds is not going to. The wait used to be 20s on each of the two attempts,
+# which put 40 seconds between a hard stop and the card coming back - long
+# enough that the stop button looked broken even once it was killing the right
+# process.
+KILL_WAIT_S = 5
+
+
 def _kill(p):
     if p.poll() is not None:
         return
     try:
         p.terminate()
-        p.wait(timeout=20)
+        p.wait(timeout=KILL_WAIT_S)
     except Exception:
         try:
             p.kill()
-            p.wait(timeout=20)
+            p.wait(timeout=KILL_WAIT_S)
         except Exception:
             pass
 

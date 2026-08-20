@@ -42,12 +42,12 @@ is the one worth running after a change.
 | flag | |
 |---|---|
 | `--speed-sweep` | drive `llama-server` across a grid, recording how fast it generates |
-| `--speed-stages LETTERS` | which stages run, default `acd` — A the wall, C ubatch, D speculation |
-| `--speed-mode auto\|speed\|context` | dense only: which question stage A answers — `speed` sweeps context at `-ngl` all, `context` sweeps `-ngl` at a fixed context |
+| `--speed-stages LETTERS` | which stages run, default `ab` — A the wall (a bisection, then the dense-FFN walk), B speculation. The old letters still work: `d` is stage B, `c` was the ubatch sweep and is now `--speed-ub` |
+| `--speed-mode auto\|speed\|context` | dense only: which question stage A answers — `speed` searches context at `-ngl` all, `context` searches `-ngl` at a fixed context. Either way it then walks the dense FFN back onto the card if the wall left room |
 | `--speed-axes AXIS=V,V` | sweep exact values as a cross product instead of the stages |
-| `--speed-ctx N` / `--speed-kv TYPE` | freeze context and KV quant for the campaign |
+| `--speed-ctx N` / `--speed-kv TYPE` / `--speed-ub N` | freeze context, KV quant and physical batch for the campaign |
 | `--speed-fill TOKENS` | prompt depth to measure at — decode slows as context fills, so this conditions every row |
-| `--speed-chain` | build each stage from the previous stage's winner rather than one fixed baseline |
+| `--speed-chain` | build stage B from what stage A measured rather than from the planner's guess |
 | `--speed-rounds N` | with `--speed-chain`: re-run the stages from the winner |
 | `--speed-ot N` | pin the first N blocks' dense FFN tensors to the CPU (`-ot`) instead of the plan mode's every-block pin — dense models only |
 | `--speed-spec-kv TYPE` | freeze the draft cache's quant for the campaign (`-ctkd/-ctvd`); f16 by default — q8_0 halves what speculation costs, at whatever the acceptance rate turns out to be |

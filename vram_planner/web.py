@@ -110,9 +110,10 @@ class Handler(BaseHTTPRequestHandler):
     def _speed_args(self, data):
         """The subset of --speed-sweep's arguments the UI exposes.
 
-        ctx and kv come straight off the main form, because the settings you are
-        planning for are the ones worth measuring - they are --speed-ctx and
-        --speed-kv, which freeze those axes instead of sweeping them."""
+        ctx, kv and ub come straight off the main form, because the settings you
+        are planning for are the ones worth measuring - they are --speed-ctx,
+        --speed-kv and --speed-ub, which freeze those axes instead of sweeping
+        them."""
         from .sweep import parse_overrides
         def as_int(k, default=None):
             v = data.get(k)
@@ -120,7 +121,7 @@ class Handler(BaseHTTPRequestHandler):
         path = data.get("path") or ""
         return {
             "models": [path] if path and os.path.exists(path) else None,
-            "stages": (data.get("stages") or "acd").lower(),
+            "stages": (data.get("stages") or "ab").lower(),
             # Which question stage A answers on a dense model. The browser sends
             # whichever plan the fit card's toggle is showing, so the campaign
             # optimises the plan the user is actually looking at.
@@ -133,6 +134,11 @@ class Handler(BaseHTTPRequestHandler):
             "ctx": (None if (data.get("plan_mode") == "speed" and not data.get("axes"))
                     else as_int("context")),
             "kv": data.get("kv_type") or None,
+            # The physical batch, frozen like ctx and kv rather than swept. It
+            # was stage C's axis until stage C was retired for measuring +1.3%
+            # at four loads an hour apiece; the plan form has always had the
+            # field, it just never reached the campaign.
+            "ub": as_int("n_ubatch", 512),
             # The draft cache's quant, frozen like the target's: stage D measures
             # speculation at the cache it will actually run with. Absent means
             # llama.cpp's f16 default.

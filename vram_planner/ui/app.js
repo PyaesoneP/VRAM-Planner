@@ -1190,7 +1190,7 @@ function render(r){
   if(r.drafter){
     // The drafter's cost is derived (weights exact; cache and graph from
     // geometry and the calibration), and the plan says so rather than passing
-    // it off as measured - the speed sweep's stage D exists to replace it with
+    // it off as measured - the speed sweep's stage B exists to replace it with
     // a number. The picker lands on the file the plan used, so a re-run prices
     // the same pair; anything else the dropdown holds stays as it was.
     if(r.drafter.kind === "mtp"){
@@ -1202,7 +1202,7 @@ function render(r){
       $("dflashhint").innerHTML = h`${esc(r.drafter.name)} drafts blocks for this model &mdash;
         ${fmt(r.drafter.mib)} of VRAM (weights ${fmt(r.drafter.weights_mib)} + KV ${fmt(
         r.drafter.cache_mib)}), block ${r.drafter.depth
-        }. <b>Derived, not measured</b>: the speed sweep&rsquo;s stage D measures the real cost.`;
+        }. <b>Derived, not measured</b>: the speed sweep&rsquo;s stage B measures the real cost.`;
     }
     const sel = $("draftpick");
     if(sel && r.drafter.path && Array.from(sel.options).some(o => o.value === r.drafter.path))
@@ -1739,7 +1739,7 @@ async function loadTemplates(){
 }
 
 /** The sweep form's drafter options: every .gguf next to the model, classified
- *  by what stage D would do with it. Runs when the form renders (it does not
+ *  by what stage B would do with it. Runs when the form renders (it does not
  *  exist on the page before that), and the plan's own drafter choice rides
  *  along: a candidate file lands in the select, a file from another folder
  *  lands in the path box. */
@@ -1847,9 +1847,10 @@ function sweepFormDisabled(){
 function sweptNote(){
   const mode = (LAST && LAST.plan_mode) || PLAN_MODE;
   if(LAST && !LAST.is_moe && mode === "speed")
-    return h`KV quant is taken from the form above and frozen; <b>context is the axis</b>
-      &mdash; stage A sweeps it to find the largest window that loads`;
-  return h`context and KV quant are taken from the form above and frozen, not swept`;
+    return h`KV quant and ubatch are taken from the form above and frozen;
+      <b>context is the axis</b> &mdash; stage A sweeps it to find the largest window
+      that loads, then spends what is left on FFN blocks`;
+  return h`context, KV quant and ubatch are taken from the form above and frozen, not swept`;
 }
 
 function sweepForm(pf){
@@ -1861,14 +1862,14 @@ function sweepForm(pf){
       ${raw(sweepStage("a", "A &middot; the wall", (LAST && LAST.is_moe)
         ? "How few experts can sit on the CPU before it spills (--n-cpu-moe)"
         : (LAST && LAST.plan_mode === "context")
-          // Named the way ngl_ladder() picks it: the context plan pays in the
-          // cheapest currency first, so the axis is -ot while every block still
-          // fits and only becomes -ngl once a full exile is not enough.
-          ? "How little has to leave the card at this context before it spills "
-            + "(-ot, then -ngl)"
-          : "How large a context fits with every block on the GPU (-c)"))}
-      ${raw(sweepStage("c", "C &middot; ubatch", "Physical batch size"))}
-      ${raw(sweepStage("d", "D &middot; speculation", "MTP and DFlash draft depths, plus the n-gram types"))}
+          // Both phases, in the order stage A runs them: whole blocks first,
+          // then - if every block already fits - how much dense FFN can come
+          // back onto the card with the VRAM that is left.
+          ? "How many blocks fit at this context (-ngl), then how little of "
+            + "their FFN has to stay in RAM (-ot)"
+          : "How large a context fits with every block on the GPU (-c), then "
+            + "how little FFN has to stay in RAM (-ot)"))}
+      ${raw(sweepStage("b", "B &middot; speculation", "MTP and DFlash draft depths, plus the n-gram types"))}
     </div>
     <div class="row" style="margin-top:10px">
       <div class="field"><label for="swfill">Context filled (tokens)</label>
@@ -1909,7 +1910,7 @@ function sweepForm(pf){
         <option value="q5_1">q5_1</option>
         <option value="q4_1">q4_1</option>
       </select>
-      <p class="hint">Stage D measures speculation with the draft cache at this quant
+      <p class="hint">Stage B measures speculation with the draft cache at this quant
         (<span class="mono">-ctkd/-ctvd</span>). f16 is what llama.cpp defaults to;
         q8_0 halves what speculation costs in VRAM &mdash; at whatever the acceptance
         rate turns out to be, which is exactly why it is measured and not priced.</p>
@@ -1920,7 +1921,7 @@ function sweepForm(pf){
         <option value="">auto &mdash; the DFlash drafter (dflash-*.gguf) next to the model</option>
         <option value="__none__">none &mdash; the model&rsquo;s own MTP blocks, or n-gram</option>
       </select>
-      <p class="hint">Stage D measures the draft scheme you plan to run. A
+      <p class="hint">Stage B measures the draft scheme you plan to run. A
         <span class="mono">dflash-*.gguf</span> drafts as DFlash; a model file with MTP
         blocks (a <span class="mono">*-MTP-*.gguf</span>) drafts as draft-mtp with its own
         blocks; anything else is refused rather than measured.
@@ -1974,7 +1975,7 @@ function sweepForm(pf){
     </div>
     <details class="adv" id="swaxesbox"><summary>Sweep exact values instead of the stages</summary>
       <p class="hint">The staged grid moves one knob at a time from a baseline, which cannot
-        answer a question about an <b>interaction</b>. Stage D only ever tries speculation at the
+        answer a question about an <b>interaction</b>. Stage B only ever tries speculation at the
         split stage A settled on &mdash; so if that split is already at the memory ceiling, every
         speculative row OOMs and the campaign reads as &ldquo;speculation does not work here&rdquo;
         when the truth is &ldquo;speculation needs one more rung of offload&rdquo;.</p>
@@ -2153,6 +2154,13 @@ function sweepBody(){
   const swdp = $("swdraftpath") ? $("swdraftpath").value.trim() : "";
   return { path: SWEEP.path, stages: sweepStages(), context: parseInt($("ctx").value),
            kv_type: $("kv").value,
+           /* Frozen from the plan form, like context and KV quant. It was stage
+              C's axis until stage C was retired - ubatch drives prefill and the
+              campaign measures decode, which moved 1.3% across the whole
+              ladder. The field has always been on the form; it just never
+              reached the campaign, so every row was measured at 512 whatever
+              the plan above it said. */
+           n_ubatch: parseInt($("ubatch").value) || 512,
            spec_kv_type: ($("swspec_kv") ? $("swspec_kv").value : null) || "f16",
            fill: $("swfills") && $("swfills").value.trim()
              ? null : v("swfill"),
@@ -2210,11 +2218,17 @@ async function sweepPlan(){
         ? h`. ${d.skipped} already measured and will be skipped &mdash; rows are keyed by
             config <i>and</i> by how they were measured, so this resumes rather than repeats.`
         : ".")}</p>` +
-    (d.provisional ? h`<p class="note">Chained, so only the <b>first stage</b> can be listed:
-        the ones after it are built from a baseline that does not exist yet, and printing
-        values for them would be a guess dressed up as a plan. The <i>counts</i> are exact
-        &mdash; a ladder&rsquo;s length does not depend on where it is centred &mdash; so the
-        estimate above is not a guess. Stages: ${raw(later)}.</p>` : "") +
+    (d.wall_probes ? h`<p class="note"><b>Stage A is a search, not a list.</b> It bisects
+        <b>${d.wall_axis}</b> over ${String(d.wall_domain)} values for the last one that
+        loads &mdash; at most <b>${String(d.wall_probes)}</b> loads${raw(d.wall_phase2
+          ? ", then walks the dense FFN back onto the card if the wall left room"
+          : "")}. Which values it lands on depends on what the one before it did, so they
+        cannot be listed in advance; the <i>count</i> is exact.</p>` : "") +
+    (d.provisional ? h`<p class="note">The stages after A are built from a baseline that does
+        not exist yet, and printing values for them would be a guess dressed up as a plan.
+        The <i>counts</i> are exact &mdash; the spec list does not depend on the baseline,
+        only its columns do &mdash; so the estimate above is not a guess.${raw(later
+          ? h` Stages: ${raw(later)}.` : "")}</p>` : "") +
     /* The estimate covers round 1 only, and said nothing about it - the preview
        was byte-identical for rounds 1 and rounds 4, so the control changed
        nothing anyone could inspect before committing the hours. */

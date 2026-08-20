@@ -60,10 +60,14 @@ NGL_SAME = 0
 # the largest.
 #
 # So the recommendation ranks the way the campaign PROMOTES: extreme along the
-# mode's own axis, ties broken toward the faster row, with STAGE_EXTREME_SLACK
-# refusing a rung that loaded and then thrashed. Off the two-plan regime -
-# an MoE, or a model that fits whole - nothing is left free and fastest-wins
-# stands, which is what it always was.
+# mode's own axis, with tok/s only settling a tie between rows at the SAME
+# value. No slack, no threshold - the largest that loaded wins even when it is
+# the slowest row on the ladder, because that is what the speed mode is FOR and
+# because decode moves 4.2% across a doubling of the window anyway. A row whose
+# numbers cannot be believed is removed by the spill gates (trustworthy()),
+# which read the memory counters, rather than by inferring a spill from a speed
+# ranking. Off the two-plan regime - an MoE, or a model that fits whole -
+# nothing is left free and fastest-wins stands, which is what it always was.
 # ---------------------------------------------------------------------------
 
 # The phrase the card puts on the criterion, per axis and direction.
@@ -88,7 +92,10 @@ def mode_axis(plan_result):
       * CONTEXT holds the window and pays for it in the cheapest currency first:
         while every block still fits, the free knob is the -ot exile and less
         exiled is better; once a full exile is not enough, whole blocks start
-        leaving and the free knob is -ngl.
+        leaving and the free knob is -ngl. The campaign reaches the same two
+        answers in the other order - it searches -ngl first and only walks the
+        -ot exile back when every block turned out to fit - because it can
+        MEASURE which case it is in, where this has to read it off the plan.
 
     A plan outside the two-plan regime has no mode and nothing left free: an
     MoE's --n-cpu-moe and a fits-whole plan are single answers, so they get

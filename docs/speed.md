@@ -101,7 +101,7 @@ throughput rises monotonically with offload. It does not:
 
 On top of that, the two used to be handed **different budgets**. The browser
 prefilled its VRAM budget from *free VRAM at page load* with a zero reserve,
-while `bench.planner_split()` seeded the sweep's ladder from *card total* minus
+while `bench.planner_split()` seeded the sweep's search from *card total* minus
 512 MiB. On a 12 GB card with something already loaded that is the difference
 between 299 MiB and 11,715 MiB — several rungs, for a reason nothing on the page
 mentioned.
@@ -165,12 +165,13 @@ Run it **from the web UI** — step 2, *Measure real speed* — or from the comm
 ```
 python -m vram_planner --speed-sweep --dry-run     # the grid and the estimate
 python -m vram_planner --speed-sweep               # hours; resumable
-python -m vram_planner --speed-sweep --speed-chain # each stage built from what won
+python -m vram_planner --speed-sweep --speed-chain # stage B built from what stage A found
 python -m vram_planner --speed-report              # every row, fastest first
 python -m vram_planner --speed-report --insights   # what the campaigns FOUND
 python -m vram_planner --speed-sweep --speed-axes "ngl=28,30 spec=draft-mtp spec_n_max=1,2,3"
-python -m vram_planner --speed-sweep --speed-mode speed    # sweep context at -ngl all
-python -m vram_planner --speed-sweep --speed-mode context  # sweep -ngl at a fixed context
+python -m vram_planner --speed-sweep --speed-mode speed    # search context at -ngl all
+python -m vram_planner --speed-sweep --speed-mode context  # search -ngl at a fixed context
+python -m vram_planner --speed-sweep --speed-ub 1024 # freeze the physical batch, like ctx and kv
 python -m vram_planner --speed-sweep --speed-ot 8   # pin FFN of the first 8 blocks to CPU
 ```
 
@@ -193,30 +194,48 @@ so the measurement is **aborted** and the row recorded as `spilled` — keyed an
 re-measured, like `skipped`, instead of crawling to the end and landing as a
 plausible-looking number that has to be explained away later.
 
-### Chaining the stages
+### Two stages
 
-By default the grid is staged one knob at a time from **one fixed baseline**, so ubatch
-and speculation are measured at a layer split that stage A has not confirmed. `--speed-chain`
-(ticked by default in the browser) builds each stage *after* the previous one finishes,
-from the fastest trustworthy row so far. **Same number of loads, so the same hours** — it
-is not a wider search, it is the same search with the baseline kept honest.
+**A** finds the wall, **B** finds the fastest draft scheme at it. That is the whole
+campaign.
 
-Two rules keep it from being worse than the fixed version. A row that **spilled** into
-shared memory or that caught the model **looping** is never carried forward: it would bend
-every later stage in the same direction, silently. And a challenger has to win by more
-than **2%**, because `tok_s` is a median of a few passes — rebasing on jitter would make
-the campaign's path depend on noise rather than on anything it measured.
+Stage A is a **bisection**, not a ladder, and it searches the whole range rather than a
+bracket around the planner's guess. `ceil(log2(n))` loads instead of `n`: 66 layer counts
+cost seven, where the old nine-rung bracket cost nine and covered a seventh as much — and
+because it can afford the whole range, a wall the planner mis-centred is no longer simply
+invisible. It promotes **the largest value that loaded**, full stop: no slack, no tok/s,
+no tie-break that can overturn the axis. If the whole range loaded there is VRAM left
+over, and a second bisection spends it walking the dense FFN back onto the card.
 
-`--speed-rounds N` re-runs the stages from the winner. It is cheap by construction: the
-resume key does not include the stage letter, so a config a later round revisits unchanged
-is already recorded and is skipped, and only genuinely new combinations cost time.
+Stage B is the one that ranks by speed, because a draft scheme's worth is its acceptance
+rate and no ordering of depths implies it.
+
+`--speed-chain` (ticked by default in the browser) builds stage B from what stage A
+measured rather than from the planner's guess. **Same number of loads, so the same
+hours** — not a wider search, the same search with the baseline kept honest.
+
+Two rules keep stage B honest. A row that **spilled** into shared memory or that caught
+the model **looping** is never carried forward: it would bend everything after it in the
+same direction, silently. And a challenger has to win by more than **2%**, because
+`tok_s` is a median of a few passes — rebasing on jitter would make the campaign's path
+depend on noise rather than on anything it measured. Neither applies to stage A, which is
+not asking a speed question: there, a row counts if it **loaded**, and nothing else.
+
+`--speed-rounds N` re-runs the stages from the winner. It is close to free: the resume key
+does not include the stage letter, and a search probe whose config is already recorded is
+answered from disk without loading anything — so a second round replays stage A's whole
+bisection at zero cost and only pays for combinations round 1 never tried.
+
+**Stage C is gone.** It swept `-ub`, which drives prefill while the campaign measures
+decode; the insights below put the whole ladder at +1.3%. It is a frozen setting now
+(`--speed-ub`, or the ubatch field on the plan form), like context and KV quant.
 
 ### Reading a campaign back
 
 A ranking says which config won. It does not say what the campaign *learned*, and those
-are different — "1024 is the fastest ubatch" is worth much less than "ubatch is worth 6%
+are different — "1024 is the fastest ubatch" is worth much less than "ubatch is worth 1.3%
 and speculation is worth 41%", because only the second tells you where the next two hours
-should go. `--speed-report --insights`, and the **Past sweeps** card in the browser, give:
+should go. That particular pair is why ubatch stopped being a stage. `--speed-report --insights`, and the **Past sweeps** card in the browser, give:
 
 | | |
 |---|---|

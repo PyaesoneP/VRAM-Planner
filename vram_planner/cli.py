@@ -166,11 +166,14 @@ def main():
     # Kept a literal rather than bench.STAGES: cli.py imports bench lazily, and
     # an argparse default would drag the whole subprocess-heavy module into
     # every --help. selftest asserts the two agree.
-    ap.add_argument("--speed-stages", default="acd", metavar="LETTERS",
+    ap.add_argument("--speed-stages", default="ab", metavar="LETTERS",
                     help="with --speed-sweep: which stages to run (a=the wall, "
-                         "c=ubatch, d=speculation). Stage A's axis follows "
-                         "--speed-mode: context for a speed plan, -ngl for a "
-                         "context plan, --n-cpu-moe on an MoE")
+                         "b=speculation). Stage A's axis follows --speed-mode: "
+                         "context for a speed plan, -ngl for a context plan, "
+                         "--n-cpu-moe on an MoE; it then walks the dense FFN back "
+                         "onto the card if the wall left room. The old letters "
+                         "still work - d is stage B, and c was the ubatch sweep, "
+                         "now a frozen setting (--speed-ub)")
     ap.add_argument("--speed-mode", default="auto", metavar="MODE",
                     choices=("auto", "speed", "context"),
                     help="with --speed-sweep, dense models: which question stage A "
@@ -193,17 +196,23 @@ def main():
                          "model's trained context)")
     ap.add_argument("--speed-kv", default=None, metavar="TYPE",
                     help="with --speed-sweep: freeze KV cache quant, e.g. q8_0")
+    ap.add_argument("--speed-ub", type=int, default=None, metavar="N",
+                    help="with --speed-sweep: freeze the physical batch (-ub) for "
+                         "the campaign. It used to be stage C's axis and is a "
+                         "setting now: it drives prefill, and decode - which is "
+                         "what the campaign measures - barely moves with it. "
+                         'Sweep it anyway with --speed-axes "ub=256,512,1024"')
     ap.add_argument("--speed-spec-kv", default=None, metavar="TYPE",
                     help="with --speed-sweep: freeze the DRAFT model's KV cache "
                          "quant (-ctkd/-ctvd), e.g. q8_0 - f16 by default, the "
                          "way llama.cpp keeps it. Halves what speculation costs "
                          "in VRAM, at whatever the acceptance rate turns out to "
-                         "be - which is why stage D measures it")
+                         "be - which is why stage B measures it")
     ap.add_argument("--speed-chain", action="store_true",
                     help="with --speed-sweep: build each stage against the fastest "
                          "row measured so far instead of against the planner's "
                          "guess. Same number of loads, so the same hours - but "
-                         "ubatch is then measured at the layer split that actually "
+                         "speculation is then measured at the split that actually "
                          "won rather than at one nothing has confirmed")
     ap.add_argument("--speed-rounds", type=int, default=1, metavar="N",
                     help="with --speed-chain: re-run the stages from the winner N "
@@ -378,7 +387,8 @@ def main():
                             dry_run=args.dry_run, timeout=args.sweep_timeout,
                             limit=args.limit, axes=axes, stages=args.speed_stages,
                             fill=args.speed_fill, fills=args.speed_fills,
-                            ctx=args.speed_ctx, kv=args.speed_kv, spec_kv=args.speed_spec_kv,
+                            ctx=args.speed_ctx, kv=args.speed_kv, ub=args.speed_ub,
+                            spec_kv=args.speed_spec_kv,
                             n_predict=args.n_predict, repeat=args.repeat,
                             chain=args.speed_chain, rounds=args.speed_rounds,
                             verify=args.speed_verify, verify_overrides=overrides,

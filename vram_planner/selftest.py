@@ -3442,6 +3442,114 @@ def _run_suite(require_refs, tmp, skipped_real):
         print("  FORGET raised %s: %s  FAIL" % (type(e).__name__, e))
     ok = ok and del_ok
 
+    # ---------------------------------------------------------------- 22 ----
+    # The controls a model actually has, and getting a card back out.
+    #
+    # Two failures this pins, both of which were invisible rather than loud:
+    #
+    #  * every optional control - the projector placement, the MTP tick box,
+    #    --n-cpu-moe against -ot - was revealed by render(), which runs only on
+    #    an analyze RESPONSE. So a setting that changes the answer first appeared
+    #    underneath the answer. /api/probe answers the same question from the
+    #    header alone, and ONE function in the page acts on it.
+    #  * #mtprow was nested inside #mmprojfield, so its own test could never fire
+    #    for a model without a projector: a text-only model shipping MTP blocks
+    #    could not show the box, while run() sent its checked value anyway.
+    print("\n  Model probe and the card library")
+    try:
+        import inspect as _insp
+        import vram_planner.web as _w2
+        from vram_planner import cards as _cards_mod
+        ui = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ui")
+        js = open(os.path.join(ui, "app.js"), encoding="utf-8").read()
+        html = open(os.path.join(ui, "index.html"), encoding="utf-8").read()
+
+        # both routes reachable: a handler without its allow-list entry 404s
+        probe_ok = (hasattr(_w2.Handler, "_probe")
+                    and hasattr(_w2.Handler, "_cards_forget")
+                    and '"/api/probe"' in _insp.getsource(_w2.Handler.do_GET)
+                    and "/api/cards/forget" in _w2._POSTS
+                    and '"/api/cards/forget"' in _insp.getsource(_w2.Handler.do_POST))
+
+        # the probe reads a card when the file is gone - that is what makes a
+        # deleted model still selectable, and it must not raise on junk
+        probe_ok = (probe_ok
+                    and _w2.Handler._probe(None, "")["ok"] is False
+                    and _w2.Handler._probe(None, "no-such-model.gguf")["ok"] is False)
+
+        # ONE writer for the optional fields. Seven inline assignments in
+        # render() is how they came to be analyze-only in the first place.
+        # Only ASSIGNMENTS count. The field has to be on the LEFT of the `=`,
+        # or reading one field's .hidden to derive another's (which is what the
+        # speculation sublabel does) reads as a second writer.
+        fields = ("mmprojfield", "visionrow", "mtprow", "ncpumoefield",
+                  "ncpuffnfield", "dflashfield")
+        writes = {}
+        for f in fields:
+            n = 0
+            for ln in js.splitlines():
+                if ".hidden = " not in ln:
+                    continue
+                lhs = ln.split(".hidden = ")[0]
+                if lhs.lstrip().startswith("//"):
+                    continue
+                if lhs.rstrip().endswith('$("%s")' % f):
+                    n += 1
+            writes[f] = n
+        # dflashfield is written by loadDrafters() too - the manual path input
+        # lives inside it, so the picker has to stay reachable on its own
+        probe_ok = (probe_ok and "function applyFieldVisibility(" in js
+                    and all(writes[f] == 1 for f in fields if f != "dflashfield"))
+
+        # ...and the MTP row is not a child of the projector field, or its test
+        # is dead again the moment a model has no mmproj.
+        after_mm = html.split('id="mmprojfield"', 1)[1]
+        mm_block = after_mm.split("</div>", 1)[0]
+        probe_ok = (probe_ok and 'id="mtprow"' not in mm_block
+                    and 'id="visionrow"' not in mm_block
+                    and 'id="mtprow"' in html and 'id="visionrow"' in html)
+        print("  PROBE controls revealed on selection, MTP row is its own field  %s"
+              % ("OK" if probe_ok else "FAIL"))
+
+        # forgetting a card: real, reversible by re-reading the file, and it
+        # refuses a name it does not have rather than reporting success
+        from vram_planner.cards import (forget_card, list_cards, load_cards,
+                                        make_card, save_cards)
+        _real_store = _cards_mod._cards_store
+        _cards_mod._cards_store = lambda: os.path.join(tmp, "cards_test.json")
+        try:
+            d = {"cards": {}}
+            d["cards"]["A.gguf"] = make_card(
+                "A.gguf", {"arch": "llama", "n_layers": 4}, {"params_total": 1}, None, 10, 1)
+            d["cards"]["B.gguf"] = make_card(
+                "B.gguf", {"arch": "llama", "n_layers": 4}, {"params_total": 1}, None, 10, 1)
+            save_cards(d)
+            card_ok = len(list_cards()) == 2
+            r = _w2.Handler._cards_forget(None, {"name": "A.gguf"})
+            card_ok = (card_ok and r["ok"] and len(r["cards"]) == 1
+                       and r["cards"][0]["name"] == "B.gguf")
+            # the other one is untouched - deleting is per name, never a wipe
+            card_ok = card_ok and [c["name"] for c in list_cards()] == ["B.gguf"]
+            # a name with no card is refused, and says so
+            r2 = _w2.Handler._cards_forget(None, {"name": "A.gguf"})
+            card_ok = card_ok and r2["ok"] is False and "no card" in r2["error"]
+            r3 = _w2.Handler._cards_forget(None, {})
+            card_ok = card_ok and r3["ok"] is False
+            # the UI has a way in, and asks twice before doing it
+            card_ok = (card_ok and '"card-forget"' in js
+                       and '"card-forget-yes"' in js
+                       and "/api/cards/forget" in js
+                       and 'id="cardlist"' in html)
+        finally:
+            _cards_mod._cards_store = _real_store
+        print("  CARDS  one card forgotten by name, the rest kept, UI can ask   %s"
+              % ("OK" if card_ok else "FAIL"))
+        probe_ok = probe_ok and card_ok
+    except Exception as e:
+        probe_ok = False
+        print("  PROBE raised %s: %s  FAIL" % (type(e).__name__, e))
+    ok = ok and probe_ok
+
     if skipped_real:
         print("\n  %d real-measurement section(s) did not run: %s"
               % (len(skipped_real), ", ".join(skipped_real)))

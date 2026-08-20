@@ -16,6 +16,22 @@
 const $ = id => document.getElementById(id);
 let SYS = null, MODELS = [], LAST = null, CTX_MAX = null;
 
+// What KIND of model is selected, from /api/probe - the same header read
+// analyze() opens with, and nothing after it.
+//
+// This exists because the controls that only SOME models have (the projector
+// placement, the MTP tick, --n-cpu-moe against -ot) used to be revealed by
+// render(), which runs only on an analyze RESPONSE. So a setting that changes
+// the answer first appeared underneath the answer, and using it meant running
+// the whole thing again. PROBE is set the moment a model is picked.
+let PROBE = null;
+
+// The stored model-card library: {cards, delKey, delBusy, note}. Cards are a
+// cache of the three cheap reads above, keyed by file name, and they accumulate
+// as a side effect of every analyze - so without a way to drop one, the picker
+// fills up with models the user deleted months ago.
+let CARDS = { cards: null, delKey: null, delBusy: false, note: "" };
+
 // Which of the two dense plans is being asked for. Null is "auto" - let the
 // planner decide - and it is what the form opens on; anything else is the
 // user's pick, set either from the chips above Analyze or from the toggle over
@@ -98,6 +114,7 @@ async function boot(){
   buildCtxChips();
   drawPlanModeChips();
   loadBandwidth();
+  loadCards();
   showPastSweeps();
 }
 
@@ -130,7 +147,8 @@ function renderIdle(){
   const step = stepNow();
   let panel;
   if(step === "fit"){
-    panel = h`<section class="card lead">
+    panel = h`<section class="card">
+      <h2>Does it fit</h2>
       <p class="placeholder">Pick a model on the left and press <b>Analyze fit</b>.</p>
       <p class="note">Steps 2 and 3 work without this: a recorded campaign can be read and a
         launch script built from any of its rows with nothing analyzed and the GPU untouched.</p>
@@ -140,7 +158,10 @@ function renderIdle(){
   }else{
     panel = renderScriptStep();
   }
-  $("out").innerHTML = renderStepper(null) + renderGlossary() + panel;
+  // Same rule as render(): the glossary defines the row tables' column names,
+  // so it goes where those tables are.
+  $("out").innerHTML = renderStepper(null) + panel +
+                       (step === "fit" ? "" : renderGlossary());
   drawSweep({ grid: busy, results: busy, script: true, history: true });
 }
 
@@ -375,16 +396,22 @@ function onPick(){
   $("draftpath").value = "";
   $("dflashfield").hidden = true;
   loadDrafters();
+  // Ask what this model IS, so the controls it has appear now rather than
+  // inside the answer to a question they were supposed to shape.
+  probe();
 }
 
 /** The drafter picker's options: every .gguf next to the model, classified by
  *  what the plan would do with it. The server does the reading; the dropdown
  *  only shapes the choice, and the plan refuses a file it cannot draft with. */
-async function loadDrafters(){
-  const path = currentPath();
-  if(!path) return;
-  const sel = $("draftpick");
-  const keep = sel.value;
+/** Fetch the candidates and rebuild one picker's options.
+ *
+ *  Shared by the plan's drafter field and the sweep form's, which had two
+ *  copies of this: the same fetch, the same three-way kind label, the same
+ *  `while(options.length > 2) remove(2)`. Only what to RESTORE afterwards
+ *  genuinely differs between them, so only that stayed at the call sites. */
+async function fillDrafterPicker(sel, path){
+  if(!sel || !path) return null;
   while(sel.options.length > 2) sel.remove(2);
   let cand = [];
   try{
@@ -399,6 +426,15 @@ async function loadDrafters(){
     opt.textContent = c.name + " — " + tag;
     sel.appendChild(opt);
   }
+  return cand;
+}
+
+async function loadDrafters(){
+  const path = currentPath();
+  if(!path) return;
+  const sel = $("draftpick");
+  const keep = sel.value;
+  const cand = await fillDrafterPicker(sel, path) || [];
   sel.value = cand.some(c => c.path === keep) ? keep : "__none__";
   $("dflashhint").textContent = cand.length
     ? cand.length + " candidate drafter file(s) next to the model"
@@ -407,6 +443,141 @@ async function loadDrafters(){
   // input lives INSIDE it, so a field that hides on "no candidates" or after a
   // plan without a drafter is one the user can never open again.
   $("dflashfield").hidden = !currentPath();
+}
+
+/* ------------------------------------------------------------------ probe
+ *
+ * Which of the optional controls this model actually has, asked BEFORE the
+ * analyze rather than discovered inside its answer.
+ *
+ * There is exactly one function that decides whether an optional field is on
+ * screen - applyFieldVisibility - and it is fed either a probe or a full plan,
+ * whichever is newer. Two writers is what produced the old behaviour where the
+ * drafter picker appeared on selection and the other six appeared only after
+ * Analyze, which reads as arbitrary rather than as a rule. */
+
+/** Normalise a plan result to the same shape the probe returns, so
+ *  applyFieldVisibility has one input format and not two. */
+function probeOfPlan(r){
+  const c = r.config || {};
+  return { ok: true, arch: c.arch, n_layers: c.n_layers, n_ctx_train: c.n_ctx_train,
+           n_expert: c.n_expert, n_mtp_layers: c.n_mtp_layers,
+           is_moe: !!r.is_moe, params_total: r.params_total,
+           mmproj: r.mmproj ? { name: r.mmproj.name, mib: r.mmproj.mib,
+                                // A plan reports the tower's geometry only when
+                                // there IS one; an audio-only projector has no
+                                // patch grid and no image controls to show.
+                                vision: !!(r.vision && r.vision.config) } : null };
+}
+
+/** The single owner of every optional field's visibility. */
+function applyFieldVisibility(p){
+  const has = !!(p && p.ok !== false);
+  const mm = has ? p.mmproj : null;
+  $("mmprojfield").hidden = !mm;
+  // The image controls need a patch grid to size. An audio-only mmproj has none.
+  $("visionrow").hidden = !(mm && mm.vision);
+  $("visioninputs").hidden = !$("visionplan").checked;
+  // MTP is a property of the LANGUAGE model. This row used to live inside
+  // #mmprojfield, so this line was dead for every model without a projector -
+  // a text-only model shipping MTP blocks could never show the box, while run()
+  // sent its (checked) value anyway.
+  $("mtprow").hidden = !(has && p.n_mtp_layers);
+  // The two override fields are each other's opposite: an MoE has experts to
+  // pin and no dense FFN, a dense model the other way round.
+  $("ncpumoefield").hidden = !(has && p.is_moe);
+  $("ncpuffnfield").hidden = !(has && !p.is_moe);
+  // Never hidden on a model without a drafter: the picker is how the user ASKS
+  // for one, and its manual path input cannot be reached while hidden.
+  $("dflashfield").hidden = !currentPath();
+  const spec = $("speclabel");
+  if(spec) spec.hidden = $("mtprow").hidden && $("dflashfield").hidden;
+  flagTiers(p);
+}
+
+/** Say what a collapsed tier is holding.
+ *
+ *  Both tiers are shut by default, so a decision this model has to make would
+ *  otherwise have no sign of it at all. The alternative - springing the tier
+ *  open - undoes whatever the user had already set in it. */
+function flagTiers(p){
+  const mm = p && p.ok !== false ? p.mmproj : null;
+  const tn = $("tuneNote"), en = $("expertNote");
+  if(tn){
+    const extra = [];
+    if(mm) extra.push("vision projector");
+    if(p && p.n_mtp_layers) extra.push("MTP");
+    tn.textContent = ["batch", "sequences"].concat(extra).join(", ");
+    tn.classList.toggle("flagged", extra.length > 0);
+  }
+  if(en){
+    const knob = !p || p.ok === false ? "" : (p.is_moe ? "CPU experts" : "CPU FFN blocks");
+    en.textContent = knob ? "budgets, " + knob + ", calibration"
+                          : "budgets, overrides, calibration";
+    en.classList.toggle("flagged", !!knob);
+  }
+}
+
+/** One line saying what the probe found, under the picker.
+ *
+ *  The fields below it appear and disappear per model. Without this the form
+ *  looks like it is rearranging itself for no reason. */
+function drawModelId(){
+  const el = $("modelid");
+  if(!el) return;
+  const p = PROBE;
+  if(!p){ el.innerHTML = ""; return; }
+  if(p.ok === false){
+    el.innerHTML = h`<span class="err">${p.error || "could not read this file"}</span>`;
+    return;
+  }
+  const bits = [
+    p.is_moe ? "MoE" : "dense",
+    p.n_layers + " layers",
+    p.params_total ? B(p.params_total) : "",
+    p.mmproj ? (p.mmproj.vision ? "vision projector" : "audio projector") : "",
+    p.n_mtp_layers ? p.n_mtp_layers + " MTP block" + (p.n_mtp_layers === 1 ? "" : "s") : "",
+    p.n_ctx_train ? ctxLabel(p.n_ctx_train) + " native ctx" : "",
+    p.from_card ? "from a stored card" : ""
+  ].filter(Boolean);
+  el.innerHTML = h`<b>${p.arch}</b> &middot; ` + bits.map(esc).join(" &middot; ");
+}
+
+/** Probe the selected model and show the controls it has.
+ *
+ *  Sequenced: switching models quickly must not let an earlier answer land on
+ *  top of a later one and offer the wrong fields. */
+let PROBE_SEQ = 0;
+async function probe(){
+  const path = currentPath();
+  const seq = ++PROBE_SEQ;
+  if(!path){
+    PROBE = null;
+    drawModelId();
+    applyFieldVisibility(null);
+    return;
+  }
+  let out;
+  try{
+    out = await (await fetch("/api/probe?path=" + encodeURIComponent(path))).json();
+  }catch(e){ out = { ok: false, error: String(e) }; }
+  if(seq !== PROBE_SEQ) return;            // superseded while in flight
+  PROBE = out;
+  drawModelId();
+  if(out.ok){
+    if(out.n_ctx_train) setCtxMax(out.n_ctx_train);
+    // Speculation is per-model, so the box lands on this model's default rather
+    // than carrying the last one's answer across - the same reason onPick()
+    // resets the drafter picker. LM Studio turns MTP on for every model that
+    // ships the blocks, so that is the default here too.
+    //
+    // The server ignores the flag for a model without them anyway
+    // (plan.analyze: `if mtp_spec and cfg["mtp_kv_per_token"]`), but a box
+    // reading "on" for a model that has no MTP is a lie whether or not it is
+    // load-bearing - and until now it was ticked, invisible, and unreachable.
+    $("mtpspec").checked = !!out.n_mtp_layers;
+  }
+  applyFieldVisibility(out);
 }
 
 /* -------------------------------------------------------------- analysis */
@@ -478,9 +649,13 @@ async function run(){
       // Pressing Analyze is a question about FIT, so answer that one - even if
       // the last thing looked at was a script. Without this the step stuck
       // wherever it was left and Analyze appeared to do nothing at all.
-      STEP = null;
-      render(r);
-    }
+       STEP = null;
+       render(r);
+       // analyze() remembers a card for whatever it just read, so the stored
+       // list changes on exactly this round trip - refresh it here rather than
+       // waiting for a Scan that has nothing to do with it.
+       loadCards();
+     }
   }catch(e){
     $("out").innerHTML = h`<div class="card warns"><b>Request failed:</b> ${e}</div>`;
   }
@@ -597,67 +772,140 @@ function drawRecommendation(){
 }
 
 function renderRecommendation(){
-  if(!LAST) return "";
-  const v = (LAST.plan && LAST.plan.verdict) || {};
-  if(!REC) return h`<section class="card rec"><p class="muted small">reconciling against
-    recorded measurements&hellip;</p></section>`;
-  if(REC.ok === false) return "";
+  if(!LAST || !LAST.plan) return "";
+  const r = LAST, p = r.plan, v = p.verdict || {};
+  const c = r.config || {}, s = r.sizes_mib || {}, inp = r.inputs || {};
+  if(REC && REC.ok === false) return "";
 
-  const measured = REC.source === "measured";
-  const cfg = REC.config || {};
+  const measured = !!(REC && REC.source === "measured");
+  // The state colours the headline word the same way the old verdict card did.
+  const vcls = { fits:"ok", tight:"warn", spills:"bad", no_fit:"bad" }[v.state] || "warn";
+
   // Two pills in one flex child: .rec-head is space-between, so loose siblings
   // would spread the badges across the header instead of grouping them right.
-  const badge = '<span class="pills">'
-    + (REC.mode ? h`<span class="pill">for ${REC.mode}</span>` : "")
-    + (measured ? '<span class="pill ok">● measured</span>'
-                : '<span class="pill">estimated</span>')
+  // They only exist once the reconciliation has answered, so the card opens
+  // as the plan alone.
+  // The fit state appears exactly ONCE, and which slot it lands in depends on
+  // what else is in the block. With a measured row the hero figure is a real
+  // tok/s, so the state rides in the header as a pill; without one the state IS
+  // the answer and takes the hero slot below. It went missing entirely for a
+  // while here - the measured branch showed tok/s and VRAM and never said
+  // whether the thing fits, which is step 1's entire question.
+  const statePill = measured && v.word
+    ? h`<span class="pill ${vcls}">${v.word}</span>` : "";
+  const badge = '<span class="pills">' + statePill
+    + (REC ? (REC.mode ? h`<span class="pill">for ${REC.mode}</span>` : "")
+             + (measured ? '<span class="pill ok">● measured</span>'
+                         : '<span class="pill">estimated</span>')
+           : "")
     + '</span>';
 
   // The headline number differs by source on purpose: a measured row has a real
   // tok/s and a real process VRAM reading, and an estimate has neither - showing
   // the planner's arithmetic in the same slot would dress one up as the other.
+  // Until the reconciliation lands the estimate is exactly what the plan says.
   const figures = measured
     ? h`<span class="rec-big">${(REC.tok_s || 0).toFixed(2)}</span><span class="rec-unit">tok/s</span>
         <span class="rec-sep"></span>
         <span class="rec-num">${fmt(REC.vram_mib)}</span><span class="rec-unit">VRAM, measured</span>`
-    : h`<span class="rec-big ${v.state === "fits" ? "" : "warn"}">${v.word || "—"}</span>
+    : h`<span class="rec-big ${vcls}">${v.word || "—"}</span>
         <span class="rec-sep"></span>
         <span class="rec-num">${fmt(v.vram_mib)}</span><span class="rec-unit">of ${
           fmt(v.vram_budget_mib)} VRAM, estimated</span>`;
 
-  const deltas = (REC.deltas || []).map(d =>
-    h`<div class="delta"><span class="dk">${REC_KIND[d.kind] || d.kind}</span><span>${d.text}</span></div>`
-  ).join("");
+  // The memory bars answer the question the page is for - does it fit - and they
+  // come from the plan, known the moment Analyze returns. They do not wait on the
+  // reconciliation below, which is why the old separate "Does it fit" card is gone:
+  // the bars and the recommendation are one answer, drawn from one plan.
+  const drafterLabel = r.drafter
+    ? (r.drafter.kind === "mtp" ? "MTP draft model" : "DFlash drafter")
+    : "MTP draft cache";
+  const vramSegs = [
+    { cls:"s-wt",  color:"var(--wt)",   label:"weights (GPU)",    mib:p.gpu_weights_mib || 0 },
+    { cls:"s-kv",  color:"var(--kv)",   label:"KV cache (GPU)",   mib:p.gpu_kv_mib || 0 },
+    { cls:"s-rec", color:"var(--rec)",  label:"recurrent state",  mib:p.gpu_recurrent_mib || 0 },
+    { cls:"s-prj", color:"var(--proj)", label:"vision projector", mib:p.mmproj_mib || 0 },
+    { cls:"s-spc", color:"var(--spec)", label:drafterLabel,       mib:p.spec_mib || 0 },
+    { cls:"s-cmp", color:"var(--cmp)",  label:"compute buffer",   mib:p.compute_mib || 0 },
+    { cls:"s-rsv", color:"",            label:"driver reserve",   mib:inp.gpu_reserve_mib || 0 }
+  ];
+  const ramSegs = [
+    { cls:"s-wt",  color:"var(--wt)",  label:"weights (CPU/RAM)",      mib:p.cpu_weights_mib || 0 },
+    { cls:"s-kv",  color:"var(--kv)",  label:"KV cache (RAM)",         mib:p.cpu_kv_mib || 0 },
+    { cls:"s-rec", color:"var(--rec)", label:"recurrent state (RAM)",  mib:p.cpu_recurrent_mib || 0 },
+    { cls:"s-cmp", color:"var(--cmp)", label:"compute buffer (CPU)",   mib:p.cpu_compute_mib || 0 }
+  ];
+  const vramUsed = vramSegs.reduce((a, x) => a + x.mib, 0);
+  const ramUsed = ramSegs.reduce((a, x) => a + x.mib, 0);
+
+  const cal = r.calibration && r.calibration.calibrated
+    ? h`The compute buffer is <b style="color:var(--kv)">calibrated for your GPU</b> from ${
+        r.calibration.n} measurement${r.calibration.n == 1 ? "" : "s"} (${
+        r.calibration.free.join(", ")} fitted, in-sample ${r.calibration.residual_pct}%)${
+        r.calibration.when ? ", fitted " + new Date(r.calibration.when * 1000)
+          .toLocaleDateString(undefined, {year:"numeric", month:"short", day:"numeric"}) : ""
+        }. These coefficients are frozen until you press <b>Measure running model</b> again, so
+        the same plan always gives the same numbers. ` +
+      (r.calibration.outdated
+        ? h`<b style="color:var(--warn)">The stored fit may not match this machine:</b> ${
+            r.calibration.outdated}. ` : "")
+    : "The compute buffer uses shipped defaults, fitted to 146 measured llama.cpp loads over 5 " +
+      "models. Held out by architecture it scores 22.5% mean / 85.6% worst on the buffer alone, " +
+      "and the whole plan lands at 7.6% mean / 39.6% worst against the process counter. It is " +
+      "the only term that depends on your hardware rather than the model &mdash; press " +
+      "<b>Measure running model</b> with a model loaded to calibrate it for yours. ";
+
+  const split = (p.cpu_compute_mib || 0) > 0.5
+    ? h`Split across backends here: ${fmt(p.compute_mib)} on the GPU, ${fmt(p.cpu_compute_mib)
+        } in RAM. llama.cpp gives every backend running part of the graph its own scratch pool. The ${
+        fmt(s.compute_output)} output tensor (4 bytes &times; ${num(c.n_vocab || 0)} vocab) is host
+        memory wherever the layers run.`
+    : h`All of it (${fmt(p.compute_mib)}) is on the GPU at this split.`;
+
+  // The reconciliation: what "best" meant among the recorded rows, and whether it
+  // and the planner's arithmetic disagree. Only this part needs the round trip;
+  // the card above it already answers the plan while it is in flight.
+  const deltas = REC ? (REC.deltas || []).map(d =>
+      h`<div class="delta"><span class="dk">${REC_KIND[d.kind] || d.kind}</span><span>${d.text}</span></div>`
+    ).join("") : "";
 
   const other = measured && REC.predicted
     ? h`<p class="note rec-alt">The estimate on its own says <b class="mono">${
         cfgLine(REC.predicted)}</b>.</p>`
     : "";
 
-  // What "best" meant here. The two categories do not share an objective, and a
-  // card that showed the fastest row under a CONTEXT plan would be recommending
-  // the smallest window in the mode whose whole purpose is the largest one.
-  const foot = measured
-    ? h`<p class="note">The best recorded row for <b>${REC.mode || "this plan"}</b>: ${
-        REC.goal || "the fastest row measured"}, among the rows this campaign can stand behind —
-        rows that spilled, looped or copied the prompt back are never eligible, however fast
-        they read. ${REC.n_trusted} of ${REC.n_rows} recorded row${
-        REC.n_rows === 1 ? "" : "s"} qualified.${
-        REC.objective === "extreme"
-          ? " Not the fastest row: decode re-reads the KV for the tokens present rather than"
-            + " the window allocated, so tok/s barely moves along this axis and ranking by it"
-            + " ranks noise."
-          : ""}</p>`
-    : h`<p class="note">Nothing measured for this model yet, so this is the planner's arithmetic:
-        the <b>largest split that fits</b>, which is not the same question as ${
-        REC.goal || "the fastest"}. Step 2 measures the difference.</p>`;
+  const foot = REC
+    ? (measured
+      ? h`<p class="note">The best recorded row for <b>${REC.mode || "this plan"}</b>: ${
+          REC.goal || "the fastest row measured"}, among the rows this campaign can stand behind —
+          rows that spilled, looped or copied the prompt back are never eligible, however fast
+          they read. ${REC.n_trusted} of ${REC.n_rows} recorded row${
+          REC.n_rows === 1 ? "" : "s"} qualified.${
+          REC.objective === "extreme"
+            ? " Not the fastest row: decode re-reads the KV for the tokens present rather than"
+              + " the window allocated, so tok/s barely moves along this axis and ranking by it"
+              + " ranks noise."
+            : ""}</p>`
+      : h`<p class="note">Nothing measured for this model yet, so this is the planner's arithmetic:
+          the <b>largest split that fits</b>, which is not the same question as ${
+          REC.goal || "the fastest"}. Step 2 measures the difference.</p>`)
+    : h`<p class="note">&hellip;reconciling against the recorded measurements.</p>`;
 
-  return h`<section class="card rec ${measured ? "is-measured" : ""}">
+  return h`<section class="card rec">
     <div class="rec-head"><h2>Run this</h2>${raw(badge)}</div>
-    <p class="rec-cfg mono">${cfgLine(cfg)}</p>
+    <p class="rec-cfg mono">${cfgLine((REC && REC.config) || c)}</p>
     <p class="rec-figs">${raw(figures)}</p>
-    <p class="rec-cond mono">${num(LAST.inputs.context)} ctx · ${LAST.inputs.kv_type}${
-      LAST.inputs.n_seq > 1 ? " · " + LAST.inputs.n_seq + " seqs" : ""}</p>
+    <p class="rec-cond mono">${num(inp.context)} ctx &middot; ${inp.kv_type}${
+      inp.n_seq > 1 ? " &middot; " + inp.n_seq + " seqs" : ""}</p>
+    ${raw(p.headline ? h`<p class="rec-headline">${p.headline}</p>` : "")}
+    ${raw(bar("VRAM", inp.vram_budget_mib, vramUsed, vramSegs))}
+    ${raw(ramUsed > 0.5 ? bar("System RAM", inp.ram_budget_mib, ramUsed, ramSegs) : "")}
+    <p class="note">This is the <b>largest split that fits</b> &mdash; the planner stops at the
+      first config under the budget. It is not a claim about speed, and on a model with recorded
+      measurements it is usually not the fastest config either. Weights and KV are computed
+      exactly from the GGUF tensor table.
+      <details class="why"><summary>how the compute buffer is arrived at</summary>
+        ${raw(cal)}${raw(split)}</details></p>
     ${raw(deltas ? h`<div class="deltas"><p class="sublabel">WHY THE TWO ANSWERS DIFFER</p>${
       raw(deltas)}</div>` : "")}
     ${raw(other)}
@@ -705,98 +953,31 @@ function renderModes(r){
                : "it fits at the context you asked for"}. The choice applies to a dense model
       that does not fit.</p></section>`;
   }
+  // Not a control. The chips above Analyze are the control, and this used to be
+  // a second segmented pair writing the same PLAN_MODE - two renderings of one
+  // variable, on screen at once, three inches apart. What the chips cannot carry
+  // is the NUMBERS, so that is what is left here: what this mode bought, and
+  // what the other one would have.
   const mode = r.plan_mode || "speed";
-  const btn = (id, title, sub) => h`<button type="button" class="modebtn${
-    mode === id ? " on" : ""}" data-action="plan-mode" data-mode="${id}"
-    aria-pressed="${mode === id ? "true" : "false"}">
-    <b>${title}</b><span>${sub}</span></button>`;
   const sp = r.plans.speed, cx = r.plans.context;
+  const fig = pl => num(pl.max_ctx || r.inputs.context) + " ctx · "
+                    + (pl.n_gpu_layers || 0) + " layers";
+  const otherName = mode === "speed" ? "Context" : "Speed";
+  const other = mode === "speed" ? cx : sp;
   return h`<section class="card modes">
-    <p class="sublabel">PLAN FOR</p>
-    <div class="moderow">
-      ${raw(btn("speed", "Speed",
-                num(sp.max_ctx || 0) + " ctx · all " + (sp.n_gpu_layers || 0) + " layers"))}
-      ${raw(btn("context", "Context",
-                num(cx.max_ctx || r.inputs.context) + " ctx · "
-                + (cx.n_gpu_layers || 0) + " layers"))}
-    </div>
-    <p class="note">Both exile every block&rsquo;s dense FFN to RAM (<b>-ot</b>); they differ in
-      what is left free. <b>Speed</b> pins every layer on the GPU so all the KV stays in VRAM
-      and the window is whatever still fits. <b>Context</b> holds the window you asked for and
-      gives up layers to pay for it. The same choice sits above <b>Analyze fit</b>, and it also
-      decides which recorded row <b>Run this</b> calls the best one.</p>
+    <h2>Plan for ${mode}</h2>
+    <p class="note" style="margin-top:0">This split gives <b class="mono">${
+      raw(fig(mode === "speed" ? sp : cx))}</b>. <b>${otherName}</b> would give <b class="mono">${
+      raw(fig(other))}</b> &mdash; switch with the chips above <b>Analyze fit</b>.
+      <details class="why"><summary>what the two trade</summary>
+        Both exile every block&rsquo;s dense FFN to RAM (<b>-ot</b>); they differ in what is
+        left free. <b>Speed</b> pins every layer on the GPU so all the KV stays in VRAM and
+        the window becomes whatever still fits. <b>Context</b> holds the window you asked for
+        and gives up layers to pay for it. The choice also decides which recorded row
+        <b>Run this</b> calls the best one.</details></p>
   </section>`;
 }
 
-function renderVerdict(r){
-  const c = r.config, p = r.plan, s = r.sizes_mib, inp = r.inputs;
-  // The state comes from the server now. The browser used to re-derive its own
-  // reading of the same fields, and the step tab's copy of that logic read two
-  // keys this API has never returned - so it announced "fits" for every plan,
-  // including the ones that did not.
-  const vd = p.verdict || {};
-  const vcls = { fits: "ok", tight: "warn", spills: "bad", no_fit: "bad" }[vd.state] || "warn";
-
-  const vramSegs = [
-    { cls:"s-wt",  color:"var(--wt)",   label:"weights (GPU)",     mib:p.gpu_weights_mib || 0 },
-    { cls:"s-kv",  color:"var(--kv)",   label:"KV cache (GPU)",    mib:p.gpu_kv_mib || 0 },
-    { cls:"s-rec", color:"var(--rec)",  label:"recurrent state",   mib:p.gpu_recurrent_mib || 0 },
-    { cls:"s-prj", color:"var(--proj)", label:"vision projector",  mib:p.mmproj_mib || 0 },
-    { cls:"s-spc", color:"var(--spec)", label: r.drafter
-    ? (r.drafter.kind === "mtp" ? "MTP draft model" : "DFlash drafter")
-    : "MTP draft cache", mib:p.spec_mib || 0 },
-    { cls:"s-cmp", color:"var(--cmp)",  label:"compute buffer",    mib:p.compute_mib || 0 },
-    { cls:"s-rsv", color:"",            label:"driver reserve",    mib:inp.gpu_reserve_mib || 0 }
-  ];
-  const ramSegs = [
-    { cls:"s-wt",  color:"var(--wt)",  label:"weights (CPU/RAM)",      mib:p.cpu_weights_mib || 0 },
-    { cls:"s-kv",  color:"var(--kv)",  label:"KV cache (RAM)",         mib:p.cpu_kv_mib || 0 },
-    { cls:"s-rec", color:"var(--rec)", label:"recurrent state (RAM)",  mib:p.cpu_recurrent_mib || 0 },
-    { cls:"s-cmp", color:"var(--cmp)", label:"compute buffer (CPU)",   mib:p.cpu_compute_mib || 0 }
-  ];
-  const vramUsed = vramSegs.reduce((a, x) => a + x.mib, 0);
-  const ramUsed = ramSegs.reduce((a, x) => a + x.mib, 0);
-
-  const cal = r.calibration && r.calibration.calibrated
-    ? h`The compute buffer is <b style="color:var(--kv)">calibrated for your GPU</b> from ${
-        r.calibration.n} measurement${r.calibration.n == 1 ? "" : "s"} (${
-        r.calibration.free.join(", ")} fitted, in-sample ${r.calibration.residual_pct}%)${
-        r.calibration.when ? ", fitted " + new Date(r.calibration.when * 1000)
-          .toLocaleDateString(undefined, {year:"numeric", month:"short", day:"numeric"}) : ""
-        }. These coefficients are frozen until you press <b>Measure running model</b> again, so
-        the same plan always gives the same numbers. ` +
-      (r.calibration.outdated
-        ? h`<b style="color:var(--warn)">The stored fit may not match this machine:</b> ${
-            r.calibration.outdated}. ` : "")
-    : "The compute buffer uses shipped defaults, fitted to 146 measured llama.cpp loads over 5 " +
-      "models. Held out by architecture it scores 22.5% mean / 85.6% worst on the buffer alone, " +
-      "and the whole plan lands at 7.6% mean / 39.6% worst against the process counter. It is " +
-      "the only term that depends on your hardware rather than the model &mdash; press " +
-      "<b>Measure running model</b> with a model loaded to calibrate it for yours. ";
-
-  const split = p.cpu_compute_mib > 0.5
-    ? h`Split across backends here: ${fmt(p.compute_mib)} on the GPU, ${fmt(p.cpu_compute_mib)
-        } in RAM. llama.cpp gives every backend running part of the graph its own scratch pool. The ${
-        fmt(s.compute_output)} output tensor (4 bytes × ${num(c.n_vocab || 0)
-        } vocab) is host memory wherever the layers run.`
-    : h`All of it (${fmt(p.compute_mib)}) is on the GPU at this split.`;
-
-  return h`<section class="card lead">
-    <h2>Does it fit</h2>
-    <div class="verdict ${vcls}">
-      <p class="vword">${vd.word || "—"}</p>
-      <p class="h">${p.headline}</p>
-    </div>
-    ${raw(bar("VRAM", inp.vram_budget_mib, vramUsed, vramSegs))}
-    ${raw(ramUsed > 0.5 ? bar("System RAM", inp.ram_budget_mib, ramUsed, ramSegs) : "")}
-    <p class="note">This is the <b>largest split that fits</b> — the planner stops at the first
-      config under the budget. It is not a claim about speed, and on a model with recorded
-      measurements it is usually not the fastest config either. Weights and KV are computed
-      exactly from the GGUF tensor table.
-      <details class="why"><summary>how the compute buffer is arrived at</summary>
-        ${raw(cal)}${raw(split)}</details></p>
-  </section>`;
-}
 
 function renderWarnings(r){
   if(!r.warnings || !r.warnings.length) return "";
@@ -864,7 +1045,7 @@ function renderSpeed(r){
 }
 
 function renderSummary(r){
-  const c = r.config, s = r.sizes_mib, inp = r.inputs;
+  const c = r.config, inp = r.inputs;
   return h`<section class="card">
     <h2>Model</h2>
     <div style="display:flex;justify-content:space-between;flex-wrap:wrap;gap:8px;align-items:center;margin-bottom:12px">
@@ -898,7 +1079,6 @@ function renderSummary(r){
         ((r.swa && r.swa.enabled && r.swa.head_dim !== r.swa.head_dim_global)
           ? '  <span class="muted">/ ' + esc(r.swa.head_dim) + ' swa</span>' : "")))}
       ${raw(kvItem("native ctx", c.n_ctx_train ? num(c.n_ctx_train) : "-"))}
-      ${raw(kvItem("weights", fmtG(s.weights)))}
     </div></section>`;
 }
 
@@ -934,8 +1114,17 @@ function renderKvTable(r){
 
 function renderBreakdown(r){
   const c = r.config, p = r.plan, s = r.sizes_mib, inp = r.inputs;
+  // Deliberately NOT the same decomposition as the bar at the top of the page.
+  // The bar splits the plan BY DEVICE - what lands on the GPU against what
+  // lands in RAM at this split. This is the TOTAL for each term with its
+  // sub-terms under it, which is the figure that does not move when the split
+  // does. Both are wanted, and the two were read as one duplicated table only
+  // because neither said which question it was answering.
   return h`<section class="card">
     <h2>Memory breakdown</h2>
+    <p class="note" style="margin:0 0 12px">Totals and their sub-terms &mdash; what each part
+      costs regardless of where it ends up. The bar above splits the same plan by
+      <b>device</b> instead.</p>
     <div class="tablewrap"><table><tbody>
       ${raw(brow("Model weights (exact)", fmt(s.weights) + "  (" + fmtG(s.weights) + ")"))}
       ${raw(brow("&nbsp;&nbsp;token embeddings", fmt(s.embed)))}
@@ -991,16 +1180,13 @@ function renderBreakdown(r){
  *  measurements supersede once you have. */
 function render(r){
   LAST = r;
-  const c = r.config;
-  $("mmprojfield").hidden = !r.mmproj;
-  $("ncpumoefield").hidden = !r.is_moe;
-  // The two override fields are each other's opposite: an MoE has experts to
-  // pin and no dense FFN, a dense model the other way round.
-  $("ncpuffnfield").hidden = !!r.is_moe;
-  $("mtprow").hidden = !c.n_mtp_layers;
-  // Never hide the drafter field on a plan without one - the picker is how the
-  // user asks for one, and its manual path input cannot be reached while hidden.
-  $("dflashfield").hidden = !currentPath();
+  // The plan is the newer, richer reading of the same question the probe
+  // answered on selection, so it re-runs the ONE function that owns this. It
+  // used to be seven assignments inline here, which is why every optional
+  // control was invisible until an analyze had already been run without it.
+  PROBE = probeOfPlan(r);
+  drawModelId();
+  applyFieldVisibility(PROBE);
   if(r.drafter){
     // The drafter's cost is derived (weights exact; cache and graph from
     // geometry and the calibration), and the plan says so rather than passing
@@ -1026,26 +1212,12 @@ function render(r){
     $("mmprojhint").innerHTML = h`${r.mmproj.name} &middot; ${fmt(r.mmproj.mib)
       } of VRAM. LM Studio loads it with the model and includes it in the size it shows.`;
   }
-  // The image controls only mean anything for a projector with a VISION tower -
-  // an audio-only mmproj has no patch grid to size.
-  $("visionrow").hidden = !(r.vision && r.vision.config);
-  $("visioninputs").hidden = !$("visionplan").checked;
-  // The projector controls live in Tune, which is closed by default. A model
-  // that ships one has a real decision to make there and would otherwise have
-  // no sign of it, so the tier says what it is holding rather than springing
-  // open and undoing whatever the user had set.
-  const tn = $("tuneNote");
-  if(tn){
-    tn.textContent = r.mmproj ? "batch, sequences, vision projector"
-                              : "batch, sequences";
-    tn.classList.toggle("flagged", !!r.mmproj);
-  }
   const step = stepNow();
   let panel;
   if(step === "fit"){
     // The gate, and then everything the planner DERIVED - which is reference
     // material, not a next action, so it opens closed.
-    panel = renderModes(r) + renderVerdict(r) + renderWarnings(r) +
+    panel = renderModes(r) + renderWarnings(r) +
       tier("PREDICTED", "calculated from the model's own metadata — step 2 supersedes it") +
       h`<details class="adv derived"><summary>Settings the planner suggests, its speed
         estimate, and where the memory goes</summary>` +
@@ -1057,8 +1229,15 @@ function render(r){
   }else{
     panel = renderScriptStep();
   }
-  $("out").innerHTML = h`<div id="rec"></div>` + renderStepper(r) +
-                       renderGlossary() + panel;
+  // The glossary defines the column abbreviations of the ROW tables, which live
+  // on steps 2 and 3. It used to be emitted under all three, including the one
+  // that has no columns.
+  // Stepper FIRST. It used to sit under the recommendation, which was survivable
+  // while that card was six lines; now that the card carries the verdict and both
+  // memory bars it is most of a screen, and the tabs ended up below the fold with
+  // the navigation under the thing you navigate away from.
+  $("out").innerHTML = renderStepper(r) + h`<div id="rec"></div>` + panel +
+                       (step === "fit" ? "" : renderGlossary());
   drawPlanModeChips();
   drawRecommendation();
   // Needs the recorded rows and a round trip, and the plan is what the button
@@ -1458,9 +1637,14 @@ function renderStepper(r){
     const on = id === now;
     const busy = id === "measure" && SWEEP && SWEEP.status
                  && SWEEP.status.status === "running";
+    // The OPEN tab does not repeat its own answer. That answer is rendered
+    // directly beneath it, and printing it in both places inside one viewport is
+    // how the verdict came to appear three times on the fit step - here, in the
+    // recommendation, and again in the card below it. A tab that is CLOSED still
+    // carries its answer, which is the whole reason collapsing it is acceptable.
     return h`<button class="step ${on ? "on" : ""} ${busy ? "busy" : ""}" type="button"
       data-action="set-step" data-step="${id}" aria-pressed="${on ? "true" : "false"}">
-      <b>${String(i + 1)}</b><span>${label}</span><i>${stepSummary(id, r)}</i></button>`;
+      <b>${String(i + 1)}</b><span>${label}</span><i>${on ? "" : stepSummary(id, r)}</i></button>`;
   }).join("");
   return h`<nav class="steps" id="stepper" aria-label="What do you want to do">${raw(tabs)}</nav>`;
 }
@@ -1563,21 +1747,7 @@ async function loadSweepDrafters(){
   const sel = $("swdrafter");
   if(!sel || !SWEEP.path) return;
   const keep = sel.value;
-  while(sel.options.length > 2) sel.remove(2);
-  let cand = [];
-  try{
-    const d = await (await fetch("/api/drafters?path=" +
-                                encodeURIComponent(SWEEP.path))).json();
-    cand = (d && d.drafters) || [];
-  }catch(e){}
-  for(const c of cand){
-    const tag = c.kind === "dflash" ? "DFlash drafter"
-             : c.kind === "mtp" ? "MTP draft model" : "model file";
-    const opt = document.createElement("option");
-    opt.value = c.path;
-    opt.textContent = c.name + " — " + tag;
-    sel.appendChild(opt);
-  }
+  const cand = await fillDrafterPicker(sel, SWEEP.path) || [];
   if(SWEEP.drafterPick){
     if(cand.some(c => c.path === SWEEP.drafterPick)){
       sel.value = SWEEP.drafterPick;
@@ -1704,10 +1874,7 @@ function sweepForm(pf){
       <div class="field"><label for="swfill">Context filled (tokens)</label>
         <input type="number" id="swfill" value="2048" step="1024" min="0"></div>
       <div class="field"><label for="swfills">Depth fills (blank = none)</label>
-        <input type="text" id="swfills" placeholder="e.g. 32768, 65536">
-        <p class="hint">Deeper fills that re-measure the top stage-A rungs once the wall
-          is known &mdash; the depth slope, part of the campaign instead of a second run.
-          The first one listed replaces "Context filled".</p></div>
+        <input type="text" id="swfills" placeholder="e.g. 32768, 65536"></div>
       <div class="field"><label for="swpred">Tokens per pass</label>
         <input type="number" id="swpred" value="128" step="32" min="16"></div>
       <div class="field"><label for="swrep">Passes (median)</label>
@@ -1715,7 +1882,15 @@ function sweepForm(pf){
       <div class="field"><label for="swlimit">Stop after (blank = all)</label>
         <input type="number" id="swlimit" step="1" min="1" placeholder="all"></div>
     </div>
-    <div class="field" style="max-width:24em">
+    <p class="hint" style="margin-top:0"><b>Depth fills</b> re-measure the top stage-A rungs
+      once the wall is known &mdash; the depth slope, part of the campaign instead of a
+      second run. The first one listed replaces &ldquo;Context filled&rdquo;.</p>
+    <!-- Three self-contained questions, side by side. They used to carry an
+         inline max-width:24em each and stack, which was right when the results
+         column was 790px wide and looks like a ribbon down one edge now that it
+         is a full-width pane. -->
+    <div class="row fieldgrid">
+    <div class="field">
       <label for="swot">Dense FFN blocks on CPU (-ot)</label>
       <input type="number" id="swot" min="0" step="1" placeholder="blank = the plan mode's split">
       <p class="hint">Blank measures the split the plan mode proposes, which is every
@@ -1723,7 +1898,7 @@ function sweepForm(pf){
         Dense models only; an MoE&rsquo;s experts are stage A&rsquo;s
         <span class="mono">--n-cpu-moe</span> ladder.</p>
     </div>
-    <div class="field" style="max-width:24em">
+    <div class="field">
       <label for="swspec_kv">Draft model KV cache</label>
       <select id="swspec_kv">
         <option value="f16">f16 (llama.cpp default)</option>
@@ -1739,7 +1914,7 @@ function sweepForm(pf){
         q8_0 halves what speculation costs in VRAM &mdash; at whatever the acceptance
         rate turns out to be, which is exactly why it is measured and not priced.</p>
     </div>
-    <div class="field" style="max-width:24em">
+    <div class="field">
       <label for="swdrafter">Draft model</label>
       <select id="swdrafter">
         <option value="">auto &mdash; the DFlash drafter (dflash-*.gguf) next to the model</option>
@@ -1751,6 +1926,7 @@ function sweepForm(pf){
         blocks; anything else is refused rather than measured.
         <input type="text" id="swdraftpath" placeholder="or type a path to a drafter .gguf"
                style="margin-top:6px"></p>
+    </div>
     </div>
     <p class="hint">Measure where you actually work: decode slows as the context fills, so a
       number taken at 2k is not the speed you feel at 40k. A deeper fill costs real time
@@ -1767,7 +1943,7 @@ function sweepForm(pf){
           &mdash; it would bend every later stage the same way, silently. A new baseline also has
           to win by more than 2%, because tok/s is a median of a few passes and rebasing on
           jitter would make the campaign&rsquo;s path depend on noise.</details></p>
-      <div class="field" id="swroundsfield" style="max-width:22em">
+      <div class="field narrowinput" id="swroundsfield">
         <label for="swrounds">Rounds</label>
         <input type="number" id="swrounds" value="1" min="1" max="4" step="1">
         <p class="hint">Runs A&ndash;D again from the winner. Cheap: anything unchanged is skipped.
@@ -1791,7 +1967,7 @@ function sweepForm(pf){
           measures what you would actually launch, e.g.
           <span class="mono">spec=draft-mtp spec_n_max=2</span>, and says if it is
           trustworthy.</details></p>
-      <div class="field" id="swverifyfield" style="max-width:28em">
+      <div class="field narrowinput" id="swverifyfield">
         <label for="swverifyoverrides">Overrides (same grammar as axes)</label>
         <input type="text" id="swverifyoverrides" placeholder="spec=draft-mtp spec_n_max=2">
       </div>
@@ -1835,10 +2011,92 @@ function sweepForm(pf){
  *  The generated script now warns when it is launching a config that differs
  *  from the row it cites. This is the other half: the way to make it not
  *  differ. */
+/* -- the "how is it asked" fields ----------------------------------------
+ *
+ * Two panes ask the same ten questions - the chat template, its kwargs,
+ * thinking, preserve-thinking and six samplers - because "how it is measured"
+ * and "how it is launched" have to agree or the measurement does not describe
+ * the launch. They kept two full copies: two field sets, two <datalist>s over
+ * the same file list, and two readers, with the sampler ids spelled
+ * irregularly on one side (swtopk) and regularly on the other (sm_top_k).
+ *
+ * The PROSE differs between them and deliberately stays where it is - the
+ * launcher's explanations are about flags, the campaign's are about resuming.
+ * What is shared here is the mechanical part: the id scheme, the widgets and
+ * the reader. One id rule, `prefix + name`, spans both.
+ */
+// The sampler set, in the order both panes show it. Declared here rather than
+// beside the launcher because the campaign pane builds from it too.
+const SAMPLERS = ["temp", "top_k", "top_p", "min_p", "repeat_penalty",
+                  "presence_penalty"];
+
+const SAMPLER_PH = { temp:"0 (greedy)", top_k:"0", top_p:"1.0", min_p:"0",
+                     repeat_penalty:"1.0", presence_penalty:"0" };
+
+/** The six sampler inputs.
+ *
+ *  `valueOf` is how a pane restores what was typed - the launcher pane is
+ *  redrawn on every Generate and would otherwise empty itself; the campaign
+ *  pane is rendered once and passes nothing.
+ *
+ *  `showDefaults` is the one real difference between the panes and is kept:
+ *  blank in the CAMPAIGN means greedy, and saying so is the point, while blank
+ *  in the LAUNCHER means no flag is written at all - printing "0 (greedy)"
+ *  there would name a value the script does not set. */
+function samplerFields(prefix, valueOf, showDefaults){
+  return SAMPLERS.map(k => {
+    const id = prefix + k;
+    const v = valueOf ? valueOf(id) : "";
+    return h`<div class="field"><label for="${id}">${k.replace(/_/g, " ")}</label>
+      <input type="number" id="${id}" step="0.01" value="${v}"
+             placeholder="${showDefaults ? (SAMPLER_PH[k] || "—") : "—"}"></div>`;
+  }).join("");
+}
+
+/** One thinking select, bare - no wrapper, no label, no prose.
+ *
+ *  `which` is "reason" (auto/on/off) or "reasonpre" (default/on/off). Both
+ *  panes send the neutral option as null, meaning NO flag rather than a flag
+ *  restating a default that could later move. Each pane supplies its own
+ *  surrounding <div class="field">, label and explanation, which is where the
+ *  two genuinely differ. */
+function thinkingSelect(prefix, which, valueOf, neutralLabel){
+  const id = prefix + which;
+  const neutral = which === "reason" ? "auto" : "default";
+  const cur = valueOf ? (valueOf(id) || "") : "";
+  const opt = (v, txt) => h`<option value="${v}"${cur === v ? " selected" : ""}>${txt}</option>`;
+  return h`<select id="${id}">${raw(
+    h`<option value="${neutral}"${cur === "on" || cur === "off" ? "" : " selected"}>${
+      neutralLabel}</option>` + opt("on", "on") + opt("off", "off"))}</select>`;
+}
+
+/** The shared half of both readers: template, kwargs, thinking, samplers. */
+function readAskFields(prefix){
+  const val = id => { const el = $(id); return (el && el.value.trim()) || null; };
+  const sampling = {};
+  SAMPLERS.forEach(k => {
+    const el = $(prefix + k);
+    if(el && el.value.trim() !== "") sampling[k] = parseFloat(el.value);
+  });
+  return {
+    chat_template_file: val(prefix + "tmplfile"),
+    chat_template_kwargs: val(prefix + "tmplkw"),
+    // auto/default are llama.cpp's own answers, sent as null so no flag is
+    // emitted rather than one restating a default that could later move.
+    reasoning: val(prefix + "reason") === "auto" ? null : val(prefix + "reason"),
+    reasoning_preserve: val(prefix + "reasonpre") === "default"
+      ? null : val(prefix + "reasonpre"),
+    sampling: sampling
+  };
+}
+
+/** The template file list, as a <datalist>. Two of these existed over one array. */
+function templateList(id){
+  return h`<datalist id="${id}">${raw(((SWEEP && SWEEP.templates) || [])
+    .map(t => h`<option value="${t}"></option>`).join(""))}</datalist>`;
+}
+
 function sweepAskSection(){
-  const tl = (SWEEP && SWEEP.templates) || [];
-  const num = (id, label, ph) => h`<div class="field"><label for="${id}">${label}</label>
-    <input type="number" id="${id}" step="0.01" placeholder="${ph}"></div>`;
   return h`<details class="adv" id="swaskbox"><summary>How the model is asked while measuring
       &mdash; template, thinking, samplers</summary>
     <p class="hint">Frozen for the campaign, not swept. Set these to <b>what you will actually
@@ -1848,7 +2106,7 @@ function sweepAskSection(){
       <label for="swtmplfile">Chat template file</label>
       <input type="text" id="swtmplfile" list="tmpllist2"
              placeholder="&mdash; the model&rsquo;s own &mdash;">
-      <datalist id="tmpllist2">${raw(tl.map(t => h`<option value="${t}"></option>`).join(""))}</datalist>
+      ${raw(templateList("tmpllist2"))}
       <p class="hint">Without one the benchmark still asks through the server&rsquo;s
         <span class="mono">/apply-template</span>, so it uses whatever the GGUF carries. Pin the
         file here when the launcher will pin it, or the two are measuring different prompts.
@@ -1860,11 +2118,9 @@ function sweepAskSection(){
     </div>
     <div class="row">
       <div class="field"><label for="swreason">Thinking</label>
-        <select id="swreason"><option value="auto">auto</option>
-          <option value="on">on</option><option value="off">off</option></select></div>
+        ${raw(thinkingSelect("sw", "reason", null, "auto"))}</div>
       <div class="field"><label for="swreasonpre">Preserve thinking</label>
-        <select id="swreasonpre"><option value="default">template default</option>
-          <option value="on">on</option><option value="off">off</option></select></div>
+        ${raw(thinkingSelect("sw", "reasonpre", null, "template default"))}</div>
     </div>
     <p class="sublabel" style="margin-top:14px">SAMPLERS</p>
     <p class="hint">Blank means <b>greedy</b> (temp 0) &mdash; the right default for comparing
@@ -1875,10 +2131,7 @@ function sweepAskSection(){
         token matches it, and under greedy that comparison is deterministic &mdash; greedy is
         speculation&rsquo;s best case. Fill these in before drawing a speculation
         conclusion.</details></p>
-    <div class="row">${raw(num("swtemp", "temp", "0 (greedy)") + num("swtopk", "top-k", "0")
-      + num("swtopp", "top-p", "1.0") + num("swminp", "min-p", "0"))}</div>
-    <div class="row">${raw(num("swreppen", "repeat-penalty", "1.0")
-      + num("swprespen", "presence-penalty", "0"))}</div>
+    <div class="row">${raw(samplerFields("sw", null, true))}</div>
   </details>`;
 }
 
@@ -1930,25 +2183,7 @@ function sweepBody(){
  *  Sampler names are the launch-script card's, so one vocabulary reaches both
  *  and web.py does the single mapping to a sweep config's shorter spelling. */
 function sweepAskBody(){
-  const t = id => { const el = $(id); return (el && el.value.trim()) || null; };
-  const n = id => { const el = $(id); return el && el.value.trim() !== ""
-                                      ? parseFloat(el.value) : null; };
-  const sel = id => { const el = $(id); return el ? el.value : null; };
-  const sampling = {};
-  [["swtemp", "temp"], ["swtopk", "top_k"], ["swtopp", "top_p"],
-   ["swminp", "min_p"], ["swreppen", "repeat_penalty"],
-   ["swprespen", "presence_penalty"]].forEach(([id, k]) => {
-     const v = n(id); if(v !== null) sampling[k] = v;
-   });
-  return {
-    chat_template_file: t("swtmplfile"),
-    chat_template_kwargs: t("swtmplkw"),
-    // auto/default are llama.cpp's own answers, sent as null so no flag is
-    // emitted rather than one restating a default that could later move
-    reasoning: sel("swreason") === "auto" ? null : sel("swreason"),
-    reasoning_preserve: sel("swreasonpre") === "default" ? null : sel("swreasonpre"),
-    sampling: sampling
-  };
+  return readAskFields("sw");
 }
 
 async function sweepPlan(){
@@ -2253,8 +2488,6 @@ function sweepResults(){
 }
 
 /* -- 4. the launcher ------------------------------------------------------ */
-const SAMPLERS = ["temp", "top_k", "top_p", "min_p", "repeat_penalty",
-                  "presence_penalty"];
 const SCRIPT_FIELDS = ["swport", "swhost", "swload", "sm_tmplfile", "sm_tmplkw",
                        "sm_reason", "sm_reasonpre"]
   .concat(SAMPLERS.map(k => "sm_" + k));
@@ -2344,8 +2577,7 @@ function sweepScript(){
         <label for="sm_tmplfile">Template file</label>
         <input type="text" id="sm_tmplfile" list="tmpllist" value="${fv("sm_tmplfile")}"
                placeholder="&mdash; use the model&rsquo;s own &mdash;">
-        <datalist id="tmpllist">${raw(((SWEEP && SWEEP.templates) || [])
-          .map(t => h`<option value="${t}"></option>`).join(""))}</datalist>
+        ${raw(templateList("tmpllist"))}
         <p class="hint" id="tmplhint">${(SWEEP && SWEEP.templates && SWEEP.templates.length)
           ? SWEEP.templates.length + " .jinja file(s) found next to the model — pick one or paste a path"
           : "No .jinja files next to the model; paste a full path."}</p>
@@ -2364,11 +2596,7 @@ function sweepScript(){
       <div class="row">
         <div class="field">
           <label for="sm_reason">Thinking</label>
-          <select id="sm_reason">
-            <option value="auto"${fv('sm_reason') === 'on' || fv('sm_reason') === 'off' ? "" : " selected"}>auto — detect from the template</option>
-            <option value="on"${fv('sm_reason') === 'on' ? " selected" : ""}>on</option>
-            <option value="off"${fv('sm_reason') === 'off' ? " selected" : ""}>off</option>
-          </select>
+          ${raw(thinkingSelect("sm_", "reason", fv, "auto — detect from the template"))}
           <p class="hint">Replaces <span class="mono">enable_thinking</span> in the kwargs above,
             which current builds accept and then warn about:
             <i>&ldquo;Setting 'enable_thinking' via --chat-template-kwargs is deprecated. Use
@@ -2376,11 +2604,7 @@ function sweepScript(){
         </div>
         <div class="field">
           <label for="sm_reasonpre">Preserve thinking across history</label>
-          <select id="sm_reasonpre">
-            <option value="default"${fv('sm_reasonpre') === 'on' || fv('sm_reasonpre') === 'off' ? "" : " selected"}>template default</option>
-            <option value="on"${fv('sm_reasonpre') === 'on' ? " selected" : ""}>on</option>
-            <option value="off"${fv('sm_reasonpre') === 'off' ? " selected" : ""}>off</option>
-          </select>
+          ${raw(thinkingSelect("sm_", "reasonpre", fv, "template default"))}
           <p class="hint">Keeps the reasoning trace for the <b>whole</b> history, not just the
             last assistant message.
             <details class="why"><summary>why the kwargs above cannot do this</summary>
@@ -2399,10 +2623,7 @@ function sweepScript(){
         model cards do <i>not</i> want, so fill these in from yours. Server defaults: a client
         sending its own overrides them per request.</p>
       <div class="row">
-        ${raw(SAMPLERS
-          .map(k => h`<div class="field"><label for="sm_${k}">${k.replace(/_/g, " ")}</label>
-            <input type="number" id="sm_${k}" step="0.01" value="${fv("sm_" + k)}"
-                   placeholder="&mdash;"></div>`).join(""))}
+        ${raw(samplerFields("sm_", fv, false))}
       </div>
     </details>
     <div class="actions">
@@ -2419,13 +2640,10 @@ function sweepScript(){
 
 function sweepScriptBody(){
   const row = sweepPickedRow();
-  const sampling = {};
-  SAMPLERS.forEach(k => {
-    const el = $("sm_" + k);
-    if(el && el.value !== "") sampling[k] = parseFloat(el.value);
-  });
   const cfg = row ? row.config : SWEEP.predicted;
-  const val = id => { const el = $(id); return (el && el.value.trim()) || null; };
+  // The same ten fields the campaign pane asks, read by the same function - the
+  // two must agree or the measurement does not describe the launch.
+  const ask = readAskFields("sm_");
   return { path: SWEEP.path,
            // A row picked out of Past sweeps may belong to a model this page has
            // never analyzed, and rows record a basename rather than a path. The
@@ -2433,15 +2651,11 @@ function sweepScriptBody(){
            model_name: (row && row.model) || SWEEP.model || null,
            config: cfg, shell: SWEEP.shell,
            mmproj: (cfg && cfg.mmproj) ? cfg.mmproj : (SWEEP.mmproj || false),
-           sampling: sampling,
-           chat_template_file: val("sm_tmplfile"),
-           chat_template_kwargs: val("sm_tmplkw"),
-           // "auto"/"default" are llama.cpp's own answers, so they are sent as
-           // null - meaning no flag at all rather than a flag that restates the
-           // default and would then be wrong if the default ever moved.
-           reasoning: val("sm_reason") === "auto" ? null : val("sm_reason"),
-           reasoning_preserve: val("sm_reasonpre") === "default"
-             ? null : val("sm_reasonpre"),
+           sampling: ask.sampling,
+           chat_template_file: ask.chat_template_file,
+           chat_template_kwargs: ask.chat_template_kwargs,
+           reasoning: ask.reasoning,
+           reasoning_preserve: ask.reasoning_preserve,
            port: parseInt(($("swport") || {}).value || 8080),
            bind_host: ($("swhost") || {}).value || "127.0.0.1",
            load_mode: ($("swload") || {}).value || "none",
@@ -2680,8 +2894,19 @@ function paretoPanel(pf){
       <tbody>${raw(body)}</tbody></table></div>`;
 }
 
+/** The open campaign's rows.
+ *
+ *  Suppressed on step 2 for THIS model, because "ALL RECORDED" above is already
+ *  showing the same rows: same ROW_HEAD, same sweepRow(r, i, true), same
+ *  `name="swpick"` radio group. Two tables sharing one radio group means the
+ *  ticked row can be scrolled out of sight in the table you are reading, and
+ *  initSweep auto-opens this model's campaign, so it happened on every visit.
+ *  On step 3 there is no "ALL RECORDED", so this is the only way to pick a row
+ *  and it stays. */
 function campaignRows(ranked){
   if(!ranked || !ranked.length) return "";
+  const g = (SWEEP.campaigns || []).find(x => campaignId(x) === SWEEP.openCampaign);
+  if(stepNow() === "measure" && g && g.model === SWEEP.model) return "";
   const shown = ranked.slice(0, 24);
   return h`<p class="sublabel" style="margin-top:16px">EVERY ROW &middot; fastest first &middot;
       pick one to build a script from${ranked.length > 24
@@ -2728,6 +2953,112 @@ function sweepCopy(btn){
   });
 }
 
+/* ------------------------------------------------------ stored model cards
+ *
+ * A card is a cache of the three cheap reads analyze() makes - the GGUF header,
+ * the tensor table and the mmproj geometry - kept by file name so a model that is
+ * no longer on this disk stays plannable. They accumulate as a side effect of
+ * every analyze, and used to drop out of the picker only from the CLI, so the
+ * list grew to match the folder and then drifted away from it. This is the in-UI
+ * way to get one back: it reuses the campaign delete's two-click idiom, because
+ * forgetting a card is the one action here that edits a store the user did not
+ * just create. */
+
+async function loadCards(){
+  let d;
+  try{ d = await (await fetch("/api/cards")).json(); }
+  catch(e){ d = { cards: [] }; }
+  CARDS.cards = (d && d.cards) || [];
+  drawCards();
+}
+
+function cardSize(b){ return (b == null || !b) ? "-" : (b / 1e9).toFixed(1) + " GB"; }
+
+function cardWhen(t){
+  if(!t) return "";
+  const d = new Date(t * 1000);
+  return isNaN(d) ? "" : d.toLocaleDateString(undefined,
+    {year:"numeric", month:"short", day:"numeric"});
+}
+
+function cardConfirm(c){
+  const busy = CARDS.delBusy === c.name;
+  return h`<div class="cardconfirm">
+    <p><b>Forget the card for <span class="mono">${c.name}</span>?</b></p>
+    <p>A card is a cache of the header read, not data you typed. If the file is
+      still on disk, the next Analyze re-reads it; if it has gone, this is the
+      only way to get it out of the picker.</p>
+    <div class="actions">
+      <button class="ghost danger" type="button" data-action="card-forget-yes"
+              data-name="${c.name}" ${busy ? "disabled" : ""}>${
+              busy ? "forgetting…" : "Forget it"}</button>
+      <button class="ghost" type="button" data-action="card-forget-no">Cancel</button>
+    </div>
+  </div>`;
+}
+
+function drawCards(){
+  const list = $("cardlist"), count = $("cardcount");
+  if(!list) return;
+  const cards = CARDS.cards;
+  if(count) count.textContent = cards ? String(cards.length) : "";
+  if(!cards){
+    list.innerHTML = '<p class="cardempty">reading stored cards…</p>';
+    return;
+  }
+  if(!cards.length){
+    list.innerHTML = '<p class="cardempty">none stored yet - one is recorded every '
+      + 'time you press Analyze, so a model stays plannable after its file moves.</p>';
+    return;
+  }
+  list.innerHTML = cards.map(c =>
+    CARDS.delKey === c.name
+      ? cardConfirm(c)
+      // One metadata line, not two: the date is the least interesting thing here
+      // and does not deserve a column of its own in a 340px rail.
+      : h`<div class="cardrow">
+          <span class="nm">${c.name}</span>
+          <span class="meta">${c.arch} · ${num(c.n_layers)} layers · ${B(c.params)
+            } · ${cardSize(c.file_bytes)}${c.has_mmproj ? " · vision" : ""}${
+            cardWhen(c.when) ? " · " + cardWhen(c.when) : ""}</span>
+          <button class="carddel" type="button" data-action="card-forget"
+                  data-name="${c.name}" title="Forget this card"
+                  aria-label="Forget the card for ${c.name}">&#10005;</button>
+        </div>`
+  ).join("")
+  + (CARDS.note ? h`<div class="cardnote">${raw(CARDS.note)}</div>` : "");
+}
+
+function askCardDelete(name){
+  CARDS.delKey = (CARDS.delKey === name) ? null : name;
+  CARDS.note = "";
+  drawCards();
+}
+
+async function doCardDelete(name){
+  CARDS.delBusy = name;
+  drawCards();
+  let d;
+  try{
+    d = await (await fetch("/api/cards/forget", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name })
+    })).json();
+  }catch(e){ d = { ok: false, error: String(e) }; }
+  CARDS.delBusy = null;
+  CARDS.delKey = null;
+  if(d.ok){
+    CARDS.cards = d.cards || [];
+    CARDS.note = h`Forgot <span class="mono">${name}</span>.`;
+    // The picker reads the same store, so a forgotten card has to drop out of
+    // the dropdown on the same round trip rather than on the next Scan.
+    scanModels();
+  }else{
+    CARDS.note = h`<span style="color:var(--warn)">Could not forget: ${d.error || "unknown"}</span>`;
+  }
+  drawCards();
+}
+
 /* -------------------------------------------------------------- wiring */
 const ACTIONS = {
   "theme":       () => toggleTheme(),
@@ -2750,9 +3081,10 @@ const ACTIONS = {
                          if(stepNow() !== "script"){ setStep("script"); return; }
                          drawSweep({ grid: false, script: true, history: true }); },
   "set-step":    el => setStep(el.dataset.step),
-  // The toggle over the results and the chips above Analyze are the same
-  // control: both go through setPlanMode(), which owns the one variable.
-  "plan-mode":     el => setPlanMode(el.dataset.mode),
+  // One control for the plan mode, not two. The results column used to carry a
+  // second segmented pair writing this same variable ("plan-mode"), which is
+  // gone - what sits there now states the numbers each mode buys and points at
+  // the chips.
   "set-plan-mode": el => setPlanMode(el.dataset.mode),
   "sweep-open":  el => openCampaign(el.dataset.id),
   "sweep-del":     el => askDelete(el.dataset.id),
@@ -2765,7 +3097,12 @@ const ACTIONS = {
   "sweep-save":  () => sweepGen(true),
   "sweep-copy":  el => sweepCopy(el),
   "sweep-dl":    () => sweepDownload(),
-  "rec-script":  () => recToScript()
+  "rec-script":  () => recToScript(),
+  // A card is one GPU-and-file header read, not two hours of measurement, so
+  // this is the same two-click shape as the campaign delete with calmer copy.
+  "card-forget":     el => askCardDelete(el.dataset.name),
+  "card-forget-yes": el => doCardDelete(el.dataset.name),
+  "card-forget-no":  () => { CARDS.delKey = null; drawCards(); }
 };
 
 document.addEventListener("click", ev => {
@@ -2808,6 +3145,7 @@ $("path").addEventListener("input", () => {
     $("draftpick").value = "__none__";
     $("draftpath").value = "";
     loadDrafters();
+    probe();
   }, 250);
 });
 // Switching the basis with a stale number in the budget box is exactly the

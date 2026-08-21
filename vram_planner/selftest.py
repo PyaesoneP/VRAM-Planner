@@ -395,6 +395,9 @@ def _run_suite(require_refs, tmp, skipped_real):
     # with the drafter's md - the draft cache is real VRAM the plan only derives,
     # so the allocation sweep measures it too.
     from .sweep import build_grid, classify_drafter
+    def load_drafter_q(pth):
+        from .plan import load_drafter
+        return bool(load_drafter(pth).get("name"))
     drf_mtp = classify_drafter(mtpp)
     drf_dfl = classify_drafter(pd)
     drf_bad = drf_missing = False
@@ -406,12 +409,34 @@ def _run_suite(require_refs, tmp, skipped_real):
         classify_drafter(os.path.join(nod, "nope.gguf"))
     except ValueError:
         drf_missing = True
+    # A path a PERSON pasted. Windows Explorer's "Copy as path" wraps it in
+    # double quotes, and a text field has no shell to strip them - so abspath()
+    # read `"C:\...` as RELATIVE, prepended the working directory, and reported
+    # a file not found that was sitting exactly where the message pointed. Both
+    # drafter readers take the quotes off, and so does every path field on the
+    # web form; a quote INSIDE a name is legal on POSIX and stays.
+    from .paths import user_path
+    from .web import clean_paths
+    drf_quoted = (classify_drafter('"%s"' % mtpp) == drf_mtp
+                  and classify_drafter("  %s  " % mtpp) == drf_mtp
+                  and load_drafter_q('"%s"' % pd)
+                  and user_path('"/a/b.gguf"') == "/a/b.gguf"
+                  and user_path("'/a/b.gguf'") == "/a/b.gguf"
+                  # not a matched pair, and not this function's business
+                  and user_path('/a/b"c.gguf') == '/a/b"c.gguf'
+                  and user_path('"/a/b.gguf') == '"/a/b.gguf'
+                  and user_path(None) == "" and user_path('""') == ""
+                  # the body cleaner touches paths and nothing else
+                  and clean_paths({"path": '"/m.gguf"', "mmproj": True,
+                                   "model_name": 'x"y'})
+                  == {"path": "/m.gguf", "mmproj": True, "model_name": 'x"y'})
+
     fg = [c for c in build_grid({"n_layers": 8, "n_ctx_train": 8192,
                                  "is_moe": False}, drafter=drf_mtp)
           if c.get("spec")]
     fg_ok = (drf_mtp["kind"] == "mtp" and drf_mtp["depth"] == 1
              and drf_dfl["kind"] == "dflash" and drf_dfl["block_size"] == 8
-             and drf_bad and drf_missing
+             and drf_bad and drf_missing and drf_quoted
              and {c["spec"] for c in fg} == {"draft-mtp"}
              and {c["spec_n_max"] for c in fg} == {1}
              and all(c["md"] == os.path.abspath(mtpp) for c in fg))
@@ -425,7 +450,8 @@ def _run_suite(require_refs, tmp, skipped_real):
     #     the next rung; a `spilled` row LOADED, which is a measurement, not a
     #     wall. Family = every knob equal except the tagged axis.
     from .bench import _same_family, _worse, _prune_queue, _tag_axes, \
-        _depth_extras, _spec_retry, _draft_depths
+        _depth_extras, _spec_retry, _draft_depths, _spec_give_back, \
+        _freer_rung, _spec_wall_note, _spec_ctx_rung
     from .sweep import _key
     wa = dict(ctx=4096, kv="f16", fa=True, seq=1, ub=512, ngl=20, fill=2048)
     wall_ok = True
@@ -616,6 +642,92 @@ def _run_suite(require_refs, tmp, skipped_real):
     print("  WALL speed mode walks context, not layers  %s"
           % ("OK" if spd_ok else "FAIL"))
     ok = ok and spd_ok
+    # ...unless stage A phase 2 left dense FFN blocks ON the card, in which case
+    # THOSE are what the draft cache reclaims. They were bought with the VRAM
+    # phase 1 had left over and buying them was worth a few per cent; the
+    # context in this mode is what the campaign went looking for.
+    #
+    # This is not a preference between two levers. Muse-Glimmer-30B at ngl 52 on
+    # a 5070 Ti Laptop: one FFN block is ~214 MiB, one context rung at 131072
+    # against a q8_0 cache is ~66 MiB. The real campaign walked context down all
+    # seven rungs - 131072 to 62464, less than half the window - freed 463 MiB,
+    # and never fitted the 1556 MiB dflash drafter. Three FFN blocks free more
+    # than the whole context axis can, because that axis caps out at the size of
+    # the KV cache and a drafter is usually bigger.
+    tr8 = {}
+    dwf = dict(wa, ngl=8, ctx=40960, n_cpu_ffn=5, spec="draft-dflash",
+               spec_n_max=3)
+    f1 = _spec_retry(dict(dwf), {"status": "oom"}, facts8, tr8, drafter=drf,
+                     axis="ctx")
+    ffn_ok = (f1 is not None and f1["n_cpu_ffn"] == 6 and f1["ctx"] == 40960
+              and f1["ngl"] == 8 and f1["spec_n_max"] == 3)
+    f2 = _spec_retry(f1, {"status": "oom"}, facts8, tr8, drafter=drf, axis="ctx")
+    ffn_ok = ffn_ok and f2 is not None and f2["n_cpu_ffn"] == 7 \
+        and f2["ctx"] == 40960
+    # a fit continues the depth ladder at that rung, like on any other axis
+    f3 = _spec_retry(f2, {"status": "ok"}, facts8, tr8, drafter=drf, axis="ctx")
+    ffn_ok = ffn_ok and f3 is not None and f3["n_cpu_ffn"] == 7 \
+        and f3["spec_n_max"] == 4
+    # Exhausted at n_layers, the walk falls through to stage A's own axis and
+    # carries on there - the rungs it would have walked had phase 2 never run,
+    # so nothing is lost by trying the FFN first.
+    #
+    # And it goes until a rung FITS or the axis runs out. There is no budget:
+    # five was the old bound, then seven, and seven was three rungs short on the
+    # first model that tested it - Muse-Glimmer-30B's dflash drafter fits at
+    # n_cpu_ffn 34 and the walk stopped at 31, having spent every load it was
+    # allowed to conclude the opposite of the truth.
+    tr9, c9, seen9, ran_out = {}, dict(dwf), [], False
+    for _ in range(400):
+        nx = _spec_retry(c9, {"status": "oom"}, facts8, tr9, drafter=drf,
+                         axis="ctx")
+        if nx is None:
+            ran_out = True
+            break
+        seen9.append((nx["n_cpu_ffn"], nx["ctx"]))
+        c9 = nx
+    ctxs = [x for v, x in seen9[3:]]
+    ffn_ok = (ffn_ok and ran_out                       # ended on its own terms
+              and [v for v, _ in seen9[:3]] == [6, 7, 8]
+              and all(x == 40960 for _, x in seen9[:3])   # context untouched
+              and seen9[3][0] == 8 and seen9[3][1] < 40960  # then the context
+              and all(v == 8 for v, _ in seen9[3:])
+              and ctxs == sorted(ctxs, reverse=True) and len(set(ctxs)) == len(ctxs)
+              # ...all the way to the end of it, not to a rung count
+              and _spec_ctx_rung(ctxs[-1]) is None)
+    # Phase 2 never ran, so there is no FFN on the card to give back and the
+    # walk is exactly what it was: straight down the context.
+    ffn_ok = ffn_ok and _spec_retry(dict(dws), {"status": "oom"}, facts8, {},
+                                    drafter=drf, axis="ctx")["ctx"] == 36864
+    # An MoE has no dense FFN to give back - --n-cpu-moe IS its FFN knob and is
+    # already the axis - so the rule can only ever name what the caller passed.
+    ffn_ok = (ffn_ok
+              and _spec_give_back(dict(dwf), {"is_moe": True, "n_layers": 8},
+                                  "ncmoe") == "ncmoe"
+              and _spec_give_back(dict(dwf), facts8, "ctx") == "n_cpu_ffn"
+              and _spec_give_back(dict(dwf, n_cpu_ffn=8), facts8, "ctx") == "ctx"
+              # "freer" is read from the monotone tables, not from a second copy
+              and _freer_rung("n_cpu_ffn", 7, 8) == 8
+              and _freer_rung("n_cpu_ffn", 8, 8) is None
+              and _freer_rung("ngl", 8, 8) == 7 and _freer_rung("ngl", 1, 8) is None)
+    # The all-OOM note has to suggest the same ladder the walk would have
+    # spent, or the advice contradicts the eight OOM lines above it. In the
+    # speed mode -ngl is pinned at every block, so an ngl ladder there proposes
+    # leaving the mode rather than making room inside it.
+    nt, nt2 = [], []
+    nout = [{"status": "oom", "config": {"spec": "draft-dflash"}}]
+    ntodo = [{"spec": "draft-dflash", "spec_n_max": 1}, {"spec": "ngram-mod"}]
+    _spec_wall_note(nout, ntodo, dict(wa, ngl=52, ncmoe=0, n_cpu_ffn=24),
+                    nt.append, facts={"n_layers": 52, "is_moe": False})
+    _spec_wall_note(nout, ntodo, dict(wa, ngl=52, ncmoe=0, n_cpu_ffn=52),
+                    nt2.append, facts={"n_layers": 52, "is_moe": False})
+    ffn_ok = (ffn_ok
+              and any("n_cpu_ffn=25,26,27,28" in ln for ln in nt)
+              and not any("ngl=" in ln for ln in nt)
+              and any("ngl=48,49,50,51" in ln for ln in nt2))
+    print("  WALL phase 2 FFN blocks given back before the context  %s"
+          % ("OK" if ffn_ok else "FAIL"))
+    ok = ok and ffn_ok
     # The MTP depth ladder is NOT capped at an external drafter's
     # nextn_predict_layers. --spec-draft-n-max is a draft RUN LENGTH: measured
     # rows on gemma-4-12B gave fifteen different results with acceptance
@@ -2130,7 +2242,7 @@ def _run_suite(require_refs, tmp, skipped_real):
         # cache llama.cpp keeps at f16 whatever -ctk says. It OOMed on both
         # models tried and speculation was the WINNER on both once given room:
         # ngl 31 -> 28 (3.95 vs 3.25), ncmoe 29 -> 34 (54.87 vs 47.17).
-        from .bench import _spec_retry, SPEC_RETRY_RUNGS
+        from .bench import _spec_retry
         moe, dense = {"is_moe": True, "n_layers": 41}, {"is_moe": False, "n_layers": 65}
         oom, okrow = {"status": "oom"}, {"status": "ok"}
 
@@ -2152,10 +2264,11 @@ def _run_suite(require_refs, tmp, skipped_real):
             # the model and walking would only prove it more slowly
             and _spec_retry({"spec": "ngram-mod", "ncmoe": 29}, oom, moe, {}) is None
             and _spec_retry({"spec": "none", "ncmoe": 29}, oom, moe, {}) is None
-            # bounded, or an OOM that is not about the draft cache marches the
-            # whole ladder proving the model does not fit at all
-            and len(walk({"spec": "draft-mtp", "ncmoe": 0}, moe, "ncmoe"))
-                == SPEC_RETRY_RUNGS + 1
+            # no rung budget: it walks to the END of the axis, because a walk
+            # that stops short reports "speculation does not fit" while meaning
+            # "I stopped looking". The axis itself is the bound.
+            and walk({"spec": "draft-mtp", "ncmoe": 0}, moe, "ncmoe")
+                == list(range(0, 42))
             # and it cannot walk off either end
             and _spec_retry({"spec": "draft-mtp", "ncmoe": 41}, oom, moe, {}) is None
             and _spec_retry({"spec": "draft-mtp", "ngl": 1}, oom, dense, {}) is None)
@@ -3060,6 +3173,75 @@ def _run_suite(require_refs, tmp, skipped_real):
         print("  NOUB raised %s: %s  FAIL" % (type(e).__name__, e))
     ok = ok and c_ok
 
+    # 16.6d) ZERO IS A VALUE. "0 CPU FFN blocks" is an answer - keep every
+    #     dense FFN on the card - and it was being read as a blank field and
+    #     dropped, twice over: the browser's `0` failed `v not in (None, "",
+    #     False)` because Python has 0 == False, and even when a 0 survived that,
+    #     grid_context() applied the plan mode's every-block pin OVER it. The
+    #     user set the knob to zero and watched the FFN get offloaded anyway.
+    print("\n  Zero as an override")
+    try:
+        from .web import given, read_ui
+        from .bench import ngl_ladder, grid_context
+
+        # the wire: 0 is given, blank is not, and False is still a checkbox
+        z_ok = (given(0) and given("0") and given(0.0)
+                and not given(None) and not given("") and not given(False))
+        # every override the plan form sends, not just the one that was noticed
+        args_z = _H._speed_args(_H, {"path": "", "ot": 0})
+        z_ok = z_ok and args_z["ot"] == 0
+        z_ok = z_ok and _H._speed_args(_H, {"path": ""})["ot"] is None
+
+        # ...and the knob is ONE knob. The plan form's override and the sweep
+        # card's -ot field are two inputs for the same number, and the campaign
+        # only ever read the second: planning at 0 and then sweeping measured
+        # every block exiled, at every rung, which is the opposite of what was
+        # asked for. The specific field wins; blank inherits; both blank is the
+        # plan mode's own pin.
+        def _ot(**kw):
+            return _H._speed_args(_H, dict(kw, path=""))["ot"]
+        z_ok = z_ok and (_ot(n_cpu_ffn_override=0) == 0
+                         and _ot(n_cpu_ffn_override=8) == 8
+                         and _ot(n_cpu_ffn_override=8, ot=0) == 0
+                         and _ot(n_cpu_ffn_override=0, ot=8) == 8
+                         and _ot() is None)
+        # the browser does the same thing, so the two halves cannot drift
+        _js = read_ui("app.js")
+        z_ok = z_ok and ("plannedFfn" in _js
+                         and 'v("swot") !== null ? v("swot") : plannedFfn()' in _js)
+
+        # the pin: planner_split() cannot answer for a path that is not a model,
+        # so the ladder falls back to its own seed - which is the interesting
+        # case, because the FFN pin does not come from the seed at all.
+        zc = {"ctx": 8192, "kv": "q8_0", "ub": 512, "fa": True, "seq": 1}
+        _ax, _v, pins_d = ngl_ladder("no-such-model.gguf", zc, 48)
+        _ax2, _v2, pins_0 = ngl_ladder("no-such-model.gguf", zc, 48, ffn_pin=0)
+        _ax3, _v3, pins_9 = ngl_ladder("no-such-model.gguf", zc, 48, ffn_pin=9)
+        # absent means the mode's every-block pin, which is what makes it the
+        # mode; 0 and 9 are answers, and 0 is not "absent" spelled differently
+        z_ok = z_ok and (pins_d["n_cpu_ffn"] == 48 and pins_0["n_cpu_ffn"] == 0
+                         and pins_9["n_cpu_ffn"] == 9)
+        # ...and it is clamped, not trusted: more blocks than the model has is
+        # a typo, not a config
+        z_ok = z_ok and ngl_ladder("no-such-model.gguf", zc, 48,
+                                   ffn_pin=999)[2]["n_cpu_ffn"] == 48
+
+        # the clobber: the pin has to reach the LADDER, because grid_context
+        # applies pins over the baseline - a hand-set value riding in on `base`
+        # was overwritten by the mode's own, silently.
+        zf = {"n_layers": 48, "n_ctx_train": 32768, "is_moe": False}
+        zb = dict(zc, n_cpu_ffn=0)
+        z_ok = z_ok and grid_context(zf, base=zb,
+                                     model_path="no-such-model.gguf")[0]["n_cpu_ffn"] == 48
+        z_ok = z_ok and grid_context(zf, base=zb, model_path="no-such-model.gguf",
+                                     ffn_pin=0)[0]["n_cpu_ffn"] == 0
+        print("  ZERO  0 blocks on CPU is a config, not a blank field  %s"
+              % ("OK" if z_ok else "FAIL"))
+    except Exception as e:
+        z_ok = False
+        print("  ZERO raised %s: %s  FAIL" % (type(e).__name__, e))
+    ok = ok and z_ok
+
     # 16.7) SPILL GATES: a row wrongly called spilled is a row stage B cannot
     #     rank and the recommendation card will not show. Three of the four
     #     clauses were firing on healthy rows.
@@ -3446,6 +3628,42 @@ def _run_suite(require_refs, tmp, skipped_real):
                        + crash)
         cl = parse_log(clean)
         ok_ = (as_["oom"] and not no["oom"] and cl["oom"])
+
+        # 19b) ...and the other way round: `error loading model` was IN RE_OOM,
+        #     so every way a FILE can be refused was recorded as the card
+        #     running out. It is not a harmless mislabel. _draft_probe() reads
+        #     an OOM on a speculative row as "free some VRAM and retry" and
+        #     walks the FFN back to the CPU one rung at a time, so an MTP head
+        #     shipped without the blocks its header promises - it loads as a
+        #     draft model and llama.cpp indexes past the end - was re-refused at
+        #     seven progressively freer splits and left seven rows behind that
+        #     read as "speculation does not fit here".
+        from .sweep import RE_OOM
+        from .bench import _spec_retry
+        drf = parse_log(
+            "0.04.733.251 E common_speculative_init_result: failed to load "
+            "draft model, 'mtp-Q.gguf': error loading model: invalid vector "
+            "subscript\n")
+        # a load error is NOT an OOM, and the reason survives for the row to say
+        ok_ = ok_ and (not drf["oom"]
+                       and drf["load_error"] == "invalid vector subscript"
+                       and not RE_OOM.search("error loading model: bad file"))
+        # ...but the allocator failing INSIDE the loader still is one
+        oom_in_load = parse_log("error loading model: unable to allocate "
+                                "CUDA0 buffer of size 3808.00 MiB\n")
+        ok_ = ok_ and oom_in_load["oom"] and oom_in_load["load_error"] is None
+        # and the walk leaves a loadfail row alone - this is the whole point.
+        # The identical row as an OOM still walks, so the gate is the STATUS and
+        # not some accident of the config.
+        _spec_c = {"spec": "draft-mtp", "spec_n_max": 1, "ngl": 64,
+                   "n_cpu_ffn": 0, "ctx": 4096}
+        _facts = {"n_layers": 64, "is_moe": False}
+        _drf = {"kind": "mtp", "depth": 4}
+        ok_ = ok_ and (
+            _spec_retry(_spec_c, {"config": _spec_c, "status": "loadfail"},
+                        _facts, {}, _drf, "ctx") is None
+            and _spec_retry(_spec_c, {"config": _spec_c, "status": "oom"},
+                            _facts, {}, _drf, "ctx") is not None)
         print("  WALLSIG assert-only log is oom, post-ready assert is not  %s"
               % ("OK" if ok_ else "FAIL"))
     except Exception as e:

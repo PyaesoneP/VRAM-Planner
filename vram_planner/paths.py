@@ -29,3 +29,21 @@ def _user_file(name):
         except Exception:
             return old
     return new
+def user_path(s):
+    """A path as a PERSON supplies it, cleaned into one Python can open.
+
+    Windows Explorer's "Copy as path" (Ctrl+Shift+C) wraps what it gives you in
+    double quotes, and pasting that into a text field leaves them there. A
+    string starting with `"` is not an absolute path, so abspath() helpfully
+    prepends the working directory and the file "is not found" while sitting
+    exactly where the error message says to look - which is the most confusing
+    shape a not-found error can take. A shell strips these quotes before the
+    program ever sees them; a text field has no shell, so this stands in for one.
+
+    Only a MATCHED outer pair is removed. A quote inside a filename is legal on
+    POSIX and is none of this function's business."""
+    s = (s or "").strip()
+    for q in ('"', "'"):
+        if len(s) >= 2 and s[0] == q and s[-1] == q:
+            return s[1:-1].strip()
+    return s

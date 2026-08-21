@@ -1869,7 +1869,12 @@ function sweepForm(pf){
             + "their FFN has to stay in RAM (-ot)"
           : "How large a context fits with every block on the GPU (-c), then "
             + "how little FFN has to stay in RAM (-ot)"))}
-      ${raw(sweepStage("b", "B &middot; speculation", "MTP and DFlash draft depths, plus the n-gram types"))}
+      ${raw(sweepStage("b", "B &middot; speculation",
+        // A draft cache that does not fit walks back up whatever stage A phase 2
+        // spent - those FFN blocks were bought with the leftover VRAM and are
+        // worth a few per cent, where the context is what the campaign reports.
+        "MTP and DFlash draft depths, plus the n-gram types. A draft cache that "
+        + "does not fit re-exiles dense FFN blocks before it gives back context"))}
     </div>
     <div class="row" style="margin-top:10px">
       <div class="field"><label for="swfill">Context filled (tokens)</label>
@@ -1893,9 +1898,11 @@ function sweepForm(pf){
     <div class="row fieldgrid">
     <div class="field">
       <label for="swot">Dense FFN blocks on CPU (-ot)</label>
-      <input type="number" id="swot" min="0" step="1" placeholder="blank = the plan mode's split">
-      <p class="hint">Blank measures the split the plan mode proposes, which is every
-        block&rsquo;s dense FFN on the CPU. Fill it in only to measure some other count.
+      <input type="number" id="swot" min="0" step="1"
+        placeholder="blank = the plan form&rsquo;s value, or the mode&rsquo;s split">
+      <p class="hint">Blank takes the plan form&rsquo;s <b>CPU FFN blocks</b> if you set one,
+        and otherwise measures the split the plan mode proposes &mdash; every block&rsquo;s
+        dense FFN on the CPU. Fill it in to measure some other count than the one you planned.
         Dense models only; an MoE&rsquo;s experts are stage A&rsquo;s
         <span class="mono">--n-cpu-moe</span> ladder.</p>
     </div>
@@ -2146,6 +2153,22 @@ function sweepStages(){
     .filter(x => x.checked).map(x => x.value).join("") || "a";   // A alone is a campaign
 }
 
+/** The plan form's "CPU FFN blocks" override, or null when it is blank.
+ *
+ *  The campaign inherits it the way it inherits context, KV quant and ubatch:
+ *  the settings you are PLANNING for are the ones worth measuring. It did not,
+ *  and the sweep card's own -ot field is the only thing that ever reached the
+ *  grid - so setting the planner to 0, watching the plan card keep every FFN on
+ *  the GPU, and then sweeping got you a campaign that exiled all of them at
+ *  every rung. Two fields for one knob, and the one on screen lost. */
+function plannedFfn(){
+  const el = $("ncpuffn");
+  const f = $("ncpuffnfield");
+  if(!el || (f && f.hidden) || el.value === "") return null;   // MoE, or blank
+  const n = parseInt(el.value);
+  return isNaN(n) ? null : n;
+}
+
 function sweepBody(){
   const v = id => { const el = $(id); return el && el.value !== "" ? parseInt(el.value) : null; };
   const chain = $("swchain") ? $("swchain").checked : true;
@@ -2177,9 +2200,12 @@ function sweepBody(){
            // fit card's toggle is currently showing.
            mmproj_place: $("mmprojplace").value,
            plan_mode: (LAST && LAST.plan_mode) || PLAN_MODE || null,
-           // Blank lets the plan mode pin every block, which is what the modes
-           // are; a number measures some other split by hand.
-           ot: v("swot"),
+           // The sweep card's own field wins when it is filled - it is the more
+           // specific answer. Blank falls back to the plan form's override, and
+           // only when BOTH are blank does the plan mode pin every block, which
+           // is what the modes are. 0 is a value in either: keep every dense FFN
+           // on the card and ladder the other axis against that.
+           ot: v("swot") !== null ? v("swot") : plannedFfn(),
            // A typed path wins; otherwise the select, where "" is auto (the
            // server's discovery, the long-standing default) and __none__ is no
            // drafter at all.

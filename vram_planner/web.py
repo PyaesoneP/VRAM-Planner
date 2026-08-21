@@ -7,7 +7,7 @@ from urllib.parse import urlparse
 from .const import MiB, __version__
 from .gguf import load_gguf
 from .model import extract_config
-from .paths import _data_dir
+from .paths import _data_dir, user_path
 from .gpu import get_bandwidth, get_gpu_processes, get_gpus, get_ram, platform_support
 from .lmstudio import benchmark_server, default_models_dir, load_benchmarks, match_speed_history, read_lmstudio_runtime, resolve_runtime_ngl, save_benchmark, scan_models, scan_server_logs, scan_speed_history
 from .calib import _active_gpu, calibration_status, record_calibration, refresh_calibration
@@ -37,6 +37,39 @@ _POSTS = ("/api/analyze", "/api/calibrate", "/api/script", "/api/script/save",
           "/api/speed/plan", "/api/speed/start", "/api/speed/stop",
           "/api/speed/skip", "/api/speed/delete", "/api/recommend",
           "/api/cards/forget")
+
+
+def given(v):
+    """True when a form field actually carries a value.
+
+    ZERO IS A VALUE. "0 CPU FFN blocks" is an answer - keep every dense FFN on
+    the card - and so is `--n-cpu-moe 0` and `-ngl 0`. The obvious membership
+    test for "blank" spelled it `v not in (None, "", False)`, and Python has
+    `0 == False`, so every zero the browser sent was read as an EMPTY field and
+    dropped. The planner then fell back to its own two-plan split, which exiles
+    every FFN - which is exactly what setting the field to 0 was asking it not
+    to do."""
+    return v is not None and v is not False and v != ""
+
+
+# Every body field that names a FILE on disk. Cleaned once on receipt rather
+# than at each of the dozen places one is read: the paste that put quotes round
+# a drafter path puts them round a model path just as easily, and an endpoint
+# that forgot to strip them fails with "not found" pointing at a file that is
+# right there.
+_PATH_KEYS = ("path", "drafter", "mmproj", "chat_template_file", "dir",
+              "draft_path", "model_path")
+
+
+def clean_paths(data):
+    """Strip a person's quotes off every path field in a request body."""
+    if not isinstance(data, dict):
+        return data
+    for k in _PATH_KEYS:
+        v = data.get(k)
+        if isinstance(v, str) and v:          # `mmproj` may be a bool ("find it")
+            data[k] = user_path(v)
+    return data
 
 
 def read_ui(name):
@@ -117,7 +150,7 @@ class Handler(BaseHTTPRequestHandler):
         from .sweep import parse_overrides
         def as_int(k, default=None):
             v = data.get(k)
-            return int(v) if v not in (None, "", False) else default
+            return int(v) if given(v) else default
         path = data.get("path") or ""
         return {
             "models": [path] if path and os.path.exists(path) else None,
@@ -155,10 +188,18 @@ class Handler(BaseHTTPRequestHandler):
             # each knob at the split that won rather than at the planner's guess.
             "chain": bool(data.get("chain", True)),
             "rounds": max(1, as_int("rounds", 1) or 1),
-            # Dense FFN blocks pinned to the CPU (-ot). None lets the plan mode
-            # pin every block, which is what defines both modes; a number
-            # measures some other split by hand.
-            "ot": as_int("ot"),
+            # Dense FFN blocks pinned to the CPU (-ot). The sweep card's own
+            # field wins; blank falls back to the PLAN FORM's override, the same
+            # way ctx, kv and ub are frozen from it - the split you planned is
+            # the one worth measuring. Only when both are blank does the plan
+            # mode pin every block, which is what defines both modes.
+            #
+            # The fallback lives here as well as in the browser so the endpoint
+            # does not depend on which of the two fields a body happened to fill
+            # in: a campaign that silently measures a different split than the
+            # plan above it is the whole bug this pair of lines exists to fix.
+            "ot": (as_int("ot") if given(data.get("ot"))
+                   else as_int("n_cpu_ffn_override")),
             # verify is opt-in from the browser, like --speed-verify on the CLI
             "verify": bool(data.get("verify")),
             "verify_overrides": (parse_overrides(data.get("verify_overrides").split())
@@ -723,7 +764,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(404, {"error": "not found"})
         try:
             n = int(self.headers.get("Content-Length", 0))
-            data = json.loads(self.rfile.read(n).decode("utf-8")) if n else {}
+            data = clean_paths(
+                json.loads(self.rfile.read(n).decode("utf-8")) if n else {})
         except Exception as e:
             return self._send(200, {"ok": False, "error": "bad request: %s" % e})
         if u.path == "/api/calibrate":
@@ -783,19 +825,19 @@ class Handler(BaseHTTPRequestHandler):
                 bw_vram_gbs=float(data.get("bw_vram_gbs") or 0) or None,
                 bw_ram_gbs=float(data.get("bw_ram_gbs") or 0) or None,
                 ram_eff=float(data.get("ram_eff") or 0) or None,
-                ctx_fill=(int(data["ctx_fill"]) if data.get("ctx_fill") not in (None,"",False) else None),
+                ctx_fill=(int(data["ctx_fill"]) if given(data.get("ctx_fill")) else None),
                 n_cpu_moe_override=(int(data["n_cpu_moe_override"])
-                                    if data.get("n_cpu_moe_override") not in (None, "", False)
+                                    if given(data.get("n_cpu_moe_override"))
                                     else None),
                 n_cpu_ffn_override=(int(data["n_cpu_ffn_override"])
-                                    if data.get("n_cpu_ffn_override") not in (None, "", False)
+                                    if given(data.get("n_cpu_ffn_override"))
                                     else None),
                 # Which of the two dense plans to report. Absent means "let the
                 # planner decide", which is what the first analyze of a model
                 # sends - the toggle only has a value once one has been drawn.
                 plan_mode=(data.get("plan_mode") or None),
                 gpu_layers_override=(int(data["gpu_layers_override"])
-                                     if data.get("gpu_layers_override") not in (None, "", False)
+                                     if given(data.get("gpu_layers_override"))
                                      else None),
                 ram_free_mib=(float(data["ram_free_mib"])
                               if data.get("ram_free_mib") else None),

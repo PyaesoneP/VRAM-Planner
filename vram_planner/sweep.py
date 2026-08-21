@@ -26,7 +26,7 @@ from .gguf import load_gguf, parse_meta_only
 from .model import extract_config, ot_regex   # re-export: home is model.py
 from .gpu import get_gpu_processes, gpu_list
 from .lmstudio import default_models_dir
-from .paths import _data_dir
+from .paths import _data_dir, user_path
 
 
 # ---------------------------------------------------------------------------
@@ -152,10 +152,25 @@ RE_READY   = re.compile(r"llama_server: (model loaded|listening on http)")
 # message - ggml-backend.cpp:179 is the NULL-buffer check in
 # ggml_backend_alloc_ctx_tensors, and its only cause is an allocation that
 # returned nothing - so the assert is an OOM signal here too.
+# Words that mean THE ALLOCATOR RAN OUT. `error loading model` used to be one of
+# them and is not: it is the loader's generic prefix and covers every way a file
+# can be refused - a bad architecture, a truncated download, an MTP head shipped
+# without the blocks its header promises. Calling those OOM is not a harmless
+# mislabel. Stage B reads an OOM on a speculative row as "free some VRAM and try
+# again" and walks the FFN back to the CPU a rung at a time, so a drafter that
+# cannot load at all is re-refused at seven progressively freer splits, and the
+# store ends up holding seven rows that read as "speculation does not fit here"
+# when the truth is that llama.cpp never got as far as allocating anything.
+# A genuine allocation failure inside the loader still says "unable to
+# allocate" / "failed to allocate", which are matched on their own account.
 RE_OOM     = re.compile(r"out of memory|failed to allocate|cudaMalloc failed|"
                         r"unable to allocate|ggml_backend_.*alloc.*failed|"
-                        r"failed to create context|error loading model|"
+                        r"failed to create context|"
                         r"GGML_ASSERT\(buffer\) failed", re.I)
+# The loader's own refusal, with its reason - "error loading model: invalid
+# vector subscript". Captured so the row can SAY what was wrong with the file
+# instead of blaming the card.
+RE_LOAD_ERR = re.compile(r"error loading model:\s*(.+)", re.I)
 
 INFO_KEYS = ("arch", "n_layer", "n_embd", "n_head", "n_head_kv", "n_ff", "n_expert",
              "n_expert_used", "n_swa", "n_embd_head_k", "n_embd_head_v",
@@ -204,6 +219,11 @@ def parse_log(text):
     # words appearing after it is up are something else's problem.
     head = text.split("llama_server: model loaded")[0]
     out["oom"] = bool(RE_OOM.search(head)) and not out["ready"]
+    # A file the loader refused, when the allocator was not the thing that
+    # failed. Order matters: an "error loading model: unable to allocate ..." is
+    # an OOM that happens to be reported by the loader, and stays one.
+    m = None if (out["oom"] or out["ready"]) else RE_LOAD_ERR.search(head)
+    out["load_error"] = m.group(1).strip().strip("'\"") if m else None
     return out
 
 
@@ -366,8 +386,11 @@ def build_argv(exe, model_path, c, port, probe=True, host="127.0.0.1"):
 class _Server:
     """One launched llama-server, plus everything read out of its startup log.
 
-    `status` is "ok" only when the ready line appeared; "oom", "exit" and
-    "timeout" describe the ways it did not."""
+    `status` is "ok" only when the ready line appeared; "oom", "loadfail",
+    "exit" and "timeout" describe the ways it did not. "loadfail" is the loader
+    refusing the FILE - a wrong architecture, a truncated download, a drafter
+    that is not a whole model - which is a fact about the file and not about
+    the split, so nothing downstream should read it as a wall."""
 
     def __init__(self, port, log_path):
         self.port = port
@@ -463,7 +486,16 @@ def serve(backend, model_path, c, port=8231, timeout=420.0, settle=2.0,
                     srv.status = "ok"
                     break
                 if rc is not None:
-                    srv.status = "oom" if srv.parsed["oom"] else "exit"
+                    if srv.parsed["oom"]:
+                        srv.status = "oom"
+                    elif srv.parsed.get("load_error"):
+                        # Not a measurement of anything: the config never got
+                        # far enough to be one. Its own status so the wall walk
+                        # leaves it alone and the row says what was wrong.
+                        srv.status = "loadfail"
+                        srv.error = srv.parsed["load_error"]
+                    else:
+                        srv.status = "exit"
                     srv.exit_code = rc
                     break
                 # Short: this is also how often an abort is noticed, and a stop
@@ -790,6 +822,7 @@ def classify_drafter(path):
     block count capping the depths. Anything else is refused rather than
     measured as something it is not. Cheap like find_drafter_for(): only the
     GGUF header is read."""
+    path = user_path(path)          # "Copy as path" quotes are not part of it
     p = os.path.abspath(path)
     if not os.path.isfile(p):
         raise ValueError("drafter file not found: %s" % path)

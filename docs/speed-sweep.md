@@ -792,23 +792,58 @@ one-nextn-layer drafter, which ended the wall walk the instant depth 1 fitted: t
 campaign would spend two loads finding a context where the draft cache fits and then
 never measure the depth question it went looking for.
 
-**Which knob "frees room" means depends on the mode**, the same three-way split stage A
-makes — the walk has to spend what the plan left free, or it measures a config the plan
-never proposed:
+**Which knob "frees room" means** is decided in one place, and the first answer is always
+the same: **whatever phase 2 just spent.**
 
-| model / mode | the walk gives back | a rung is |
+| the config carries | the walk gives back | a rung is |
 |---|---|---|
+| dense FFN blocks on the card (`-ot` below every block) | **`-ot`** | one more block's FFN back on the CPU |
+| …and then, once every block is exiled again | stage A's own axis, below | |
 | MoE | `--n-cpu-moe` | one more block's experts on the CPU |
 | dense, `--speed-mode context` | `-ngl` | one fewer block on the GPU |
-| dense, `--speed-mode speed` | **context** | a tenth of the window, snapped down to a multiple of 1024 |
+| dense, `--speed-mode speed` | context | a tenth of the window, snapped down to a multiple of 1024 |
 
-In the speed mode `-ngl` is pinned at every block and the `-ot` pin with it — that pair
-*is* the mode — so walking layers down there would trade the whole regime away to fit a
-draft cache and then report the result as speculation working. It gives back context
-instead, granularly: a tenth per rung is enough that two or three rungs cover a draft
+Phase 2 exists to spend the VRAM phase 1 left over, on pulling dense FFN blocks back onto
+the card. So wherever it ran, those blocks **are** the headroom, in a form that can be
+handed straight back — and handing one back costs a few per cent of decode, which is what
+buying it was worth in the first place. The context is not cheap in the same way: in the
+speed mode it is what the campaign went looking for, the number the whole thing reports.
+
+This is not a preference between two levers. On Muse-Glimmer-30B at `-ngl 52`, on a
+5070 Ti Laptop with 11.5 GiB free, **one FFN block is ~214 MiB** while **one context rung
+at 131072 against a q8_0 cache is ~66 MiB**. The campaign that prompted this walked
+context down all seven rungs — 131072 to 62464, less than half the window — freed 463 MiB,
+and never fitted the 1556 MiB dflash drafter. Three FFN blocks free more than the entire
+context axis can, because that axis caps out at the size of the KV cache and a drafter is
+usually bigger. Five would have fitted it. The walk could not have succeeded on the axis
+it was walking, and it gave back the answer to fail.
+
+Once every block is exiled again, what is left is exactly the config phase 1 promoted, so
+the walk carries on down stage A's own axis from there — the rungs it would have walked
+had phase 2 never run, which is where the old walk *started*. In the speed mode that is
+context, granularly: a tenth per rung is enough that two or three rungs cover a draft
 cache of a few hundred MiB against a KV cache of a few thousand, and coarser steps would
-hand back gigabytes of window to buy back megabytes. **Seven** rungs is the limit either
-way, so the speed walk reaches roughly half the starting window before it gives up.
+hand back gigabytes of window to buy back megabytes. In the speed mode `-ngl` itself is
+never spent — it is pinned at every block, and that pin *is* the mode.
+
+**There is no rung budget.** The walk goes until a rung fits or the axis runs out — the
+only stopping rule that matches the question it is asking. "Does speculation fit anywhere
+in this plan" has an answer, and a budget that stops short reports *no* while meaning *I
+did not look*.
+
+It was five rungs, then seven, and seven was wrong on the first model that tested it.
+Muse-Glimmer-30B's dflash drafter fits at `-ot 34`; the seven-rung walk started at stage
+A's winner of 24 and stopped at **31**, three rungs short, having spent every load it was
+allowed to conclude the opposite of the truth. No constant could have known where to
+stop: that drafter wants ~2 GiB against the 1556 MiB its file suggests, because a
+202048-token vocabulary puts ~394 MiB of logits buffer on the card at `-ub 512`.
+
+It is affordable because a rung that OOMs fails during **load** — 11 to 21 s on that
+model, not one generated token — so the whole FFN axis is a couple of minutes and the
+context axis after it a few more. The loads that cost real time are the ones that *fit*,
+and a rung that fits ends the walk. Reaching the end of both axes is itself an answer:
+*not at any split this plan can reach*, which is a finding, where a budget running out is
+only a gap.
 
 ---
 

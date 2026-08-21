@@ -1,6 +1,7 @@
 """Turning a model file plus a budget into a layer split."""
 import os
 from .const import _mib
+from .paths import user_path
 from .gguf import load_gguf, parse_meta_only
 from .model import classify_tensors, extract_config, ot_regex
 from .kv import (KV_TYPE_BYTES, kv_bytes_per_token, kv_bytes_per_token_growing,
@@ -198,6 +199,7 @@ def load_drafter(path):
     (-md + --spec-type draft-mtp). Returns {path, name, bytes, tensor_bytes,
     cfg, meta} or raises ValueError when the file is not readable. The caller
     decides what the file IS; this only says what it costs."""
+    path = user_path(path)          # "Copy as path" quotes are not part of it
     p = os.path.abspath(path)
     if not os.path.isfile(p):
         raise ValueError("drafter file not found: %s" % path)

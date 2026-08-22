@@ -1122,13 +1122,20 @@ def _run_suite(require_refs, tmp, skipped_real):
     # that device's number (head and KV follow the blocks off the GPU)
     _cl2 = classify_tensors(load_gguf(p2), rk["config"])
     _allb = list(range(nL2))
+    # a stale calibrated value must never ride a degenerate payload - the UI
+    # keys its hero on `calibrated`, and None.toFixed() is a whole results
+    # panel replaced by an error string
+    _deg = estimate_speed(rk["config"], _cl2, _allb, 1024,
+                          "f16", 50.0, None, cpu_head=True, ram_eff=0.6)
     na_ok = (na_ok
              and "missing" not in estimate_speed(rk["config"], _cl2, _allb, 1024,
                                                  "f16", 50.0, None, cpu_head=False)
              and "missing" in estimate_speed(rk["config"], _cl2, _allb, 1024,
                                              "f16", None, 80.0, cpu_head=False)
              and "missing" not in estimate_speed(rk["config"], _cl2, _allb, 1024,
-                                                 "f16", 50.0, 80.0, cpu_head=True))
+                                                 "f16", 50.0, 80.0, cpu_head=True)
+             and _deg.get("tok_s") is None and _deg.get("calibrated") is False
+             and "ram_eff" not in _deg)
     print("  SPEED-NA probe unavailable: %d/%d plans n/a (missing=%s), byte split kept  %s"
           % (sum(1 for sp_ in na_sp if sp_.get("ok") is False), len(na_sp),
              sorted({m for sp_ in na_sp for m in (sp_.get("missing") or [])}),

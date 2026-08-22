@@ -1013,10 +1013,10 @@ function renderSpeed(r){
   const sp = r.speed;
   if(!sp || sp.error) return "";
   const degraded = sp.ok === false;
-  const num_ = sp.calibrated
-    ? h`<span class="hero ok">${sp.tok_s.toFixed(1)}</span> tok/s`
-    : degraded
+  const num_ = degraded
     ? h`<span class="hero" style="color:var(--warn)">n/a</span>`
+    : sp.calibrated
+    ? h`<span class="hero ok">${sp.tok_s.toFixed(1)}</span> tok/s`
     : h`<span class="hero">${sp.tok_s_lo.toFixed(0)}&ndash;${sp.tok_s_hi.toFixed(0)}</span> tok/s`;
   const bwSide = (v, s) => v == null ? "unavailable"
     : Math.round(v) + " GB/s" + (s === "auto" ? " (auto-detected)" : "");
@@ -1024,9 +1024,9 @@ function renderSpeed(r){
     <h2>Generation speed</h2>
     <p style="margin:2px 0 14px">${raw(num_)}
       <span class="muted small" style="margin-left:10px">${
-        sp.calibrated ? "calibrated · RAM at " + (sp.ram_eff * 100).toFixed(0) + "% of peak"
-        : degraded ? raw(sp.reason)
-                   : "uncalibrated bracket · measure once to collapse it"}</span></p>
+        degraded ? raw(sp.reason)
+        : sp.calibrated ? "calibrated · RAM at " + (sp.ram_eff * 100).toFixed(0) + "% of peak"
+                        : "uncalibrated bracket · measure once to collapse it"}</span></p>
     <div class="tablewrap"><table><tbody>
       ${raw(brow("Read from VRAM per token", fmt(sp.gpu_mib)))}
       ${raw(brow("Read from system RAM per token", fmt(sp.cpu_mib) +
@@ -1351,7 +1351,7 @@ async function useMeasured(tokS, fill){
   const sp = r.speed;
   if(sp.ok === false || !sp.bw_vram_gbs || !sp.bw_ram_gbs){
     $("calhint").innerHTML = '<b style="color:var(--warn)">Calibration needs the plan&rsquo;s ' +
-      'bandwidths. ' + (sp.ok === false ? raw(sp.reason)
+      'bandwidths. ' + (sp.ok === false ? sp.reason
         : "Enter them in the bandwidth fields first.") + '</b>';
     return;
   }

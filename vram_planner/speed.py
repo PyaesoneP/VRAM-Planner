@@ -92,17 +92,21 @@ def estimate_speed(cfg, cl, gpu_blocks, ctx_fill, kv_type,
         missing.append("bw_vram_gbs")
     if b["cpu_bytes"] > 0 and not have_ram:
         missing.append("bw_ram_gbs")
+    if missing:
+        # A degenerate payload must not claim a calibrated number it cannot
+        # carry: the UI keys its hero on `calibrated`, and None.toFixed() is a
+        # whole results panel replaced by an error string.
+        out["tok_s"] = None
+        out["tok_s_hi"] = None
+        out["tok_s_lo"] = None
+        out["missing"] = missing
+        out["calibrated"] = False
+        return out
     if ram_eff:
         out["ram_eff"] = ram_eff
         out["calibrated"] = True
     else:
         out["calibrated"] = False
-    if missing:
-        out["tok_s"] = None
-        out["tok_s_hi"] = None
-        out["tok_s_lo"] = None
-        out["missing"] = missing
-        return out
     def tps(re_):
         t = 0.0
         if b["gpu_bytes"] > 0:

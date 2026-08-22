@@ -8,7 +8,7 @@ from .kv import (KV_TYPE_BYTES, kv_bytes_per_token, kv_bytes_per_token_growing,
                  kv_bytes_total, kv_bytes_total_at, max_ctx_for_kv_budget,
                  recurrent_bytes, resolve_kv_lengths, swa_cache_len)
 from .compute import MTP_SPEC_CONST_MIB, MTP_SPEC_PER_SEQ_MIB, compute_buffer_split, compute_buffer_terms, graph_is_split, output_head_on_gpu, vision_config, vision_grid, vision_peak_mib
-from .gpu import gpu_list, platform_support
+from .gpu import gpu_list, platform_support, cached_bandwidth
 from .speed import estimate_speed
 from .calib import calibration_status
 from .cards import load_card, remember_card
@@ -781,11 +781,29 @@ def analyze(path, ctx, kv_type, n_ubatch, flash_attn,
     result["plan"] = plan
 
     # ---- speed roofline ----------------------------------------------------
+    # Bandwidths are recorded alongside the plans that use them, with their
+    # source: "given" (typed in the UI), "auto" (probed from this machine),
+    # "none" (unknown). A number with no stated source is a silently wrong
+    # number, so the old made-up 500/50 default is gone: a plan that reads a
+    # side whose bandwidth is unknown degrades to n/a, and only the byte split
+    # survives - which is still true.
+    bw_v, bw_r = bw_vram_gbs, bw_ram_gbs
+    bw_src = {"vram": "given" if bw_v else None,
+              "ram": "given" if bw_r else None}
+    if None in bw_src.values():
+        auto = cached_bandwidth()
+        if bw_src["vram"] is None and auto.get("vram_gbs"):
+            bw_v, bw_src["vram"] = auto["vram_gbs"], "auto"
+        if bw_src["ram"] is None and auto.get("ram_gbs"):
+            bw_r, bw_src["ram"] = auto["ram_gbs"], "auto"
+
     def _roofline(p_):
         # The plan carries its own placement: n_gpu_layers says where the blocks
         # are, n_cpu_ffn says which of their dense FFN tensors -ot exiled to
         # RAM. per_token_bytes() charges each byte to the side that streams it
-        # every token.
+        # every token, and a plan is scored on its OWN split - it needs only the
+        # bandwidth of the side it actually reads from, and nothing about the
+        # other plan.
         try:
             ngl = p_.get("n_gpu_layers")
             if ngl is None:
@@ -797,17 +815,30 @@ def analyze(path, ctx, kv_type, n_ubatch, flash_attn,
             plan_ctx = int(p_.get("max_ctx") or ctx)
             fill = ctx_fill if ctx_fill is not None else min(plan_ctx, 8192)
             sp = estimate_speed(cfg, cl, gpu_blocks, fill, kv_type,
-                                bw_vram_gbs or 500.0, bw_ram_gbs or 50.0,
+                                bw_v, bw_r,
                                 cpu_head=True,   # the head stays in RAM at every -ngl
                                 ram_eff=ram_eff, n_cpu_moe=p_.get("n_cpu_moe", 0) or 0,
                                 n_cpu_ffn=n_cpu_ffn)
             sp["n_gpu_layers"] = int(ngl)
             sp["n_cpu_moe"] = p_.get("n_cpu_moe", 0) or 0
             sp["n_cpu_ffn"] = n_cpu_ffn
+            sp["bw_vram_source"] = bw_src["vram"] or "none"
+            sp["bw_ram_source"] = bw_src["ram"] or "none"
             sp["bw_auto"] = bw_note or ""
+            if "missing" in sp:
+                sp["ok"] = False
+                sides = " and ".join({"bw_vram_gbs": "VRAM",
+                                      "bw_ram_gbs": "system RAM"}[m]
+                                     for m in sp["missing"])
+                sp["reason"] = ("no bandwidth for %s, so there is no honest number. "
+                                "The per-token byte split above is still valid - "
+                                "enter a bandwidth to get a speed." % sides)
+            else:
+                sp["ok"] = True
+            sp["notes"] = _speed_notes(sp, flash_attn, bool(mtp_spec or dflash))
             return sp
         except Exception as e:
-            return {"error": "%s: %s" % (type(e).__name__, e)}
+            return {"error": "%s: %s" % (type(e).__name__, e), "ok": False}
 
     # Every plan carries its own, because the two modes run at genuinely different
     # speeds and the browser toggles between them WITHOUT asking again - a single
@@ -873,6 +904,28 @@ def analyze(path, ctx, kv_type, n_ubatch, flash_attn,
                         "toward 100%%) but gets slower. Close apps for headroom."
                         % (ram_used, ram_free_mib, ram_used - ram_free_mib))
     return result
+
+
+def _speed_notes(sp, flash_attn, has_spec):
+    """Where the speed model is thin, said out loud.
+
+    The byte counts are exact, and the bandwidth uncertainty is already visible
+    as the bracket width, so these name the parts of the machine the estimate
+    does not cover at all - the UI prints them next to the number rather than
+    letting a clean bracket imply more coverage than there is."""
+    if "error" in sp or sp.get("missing"):
+        return []
+    notes = []
+    if not flash_attn:
+        notes.append("Flash attention is off, but the estimate assumes the tiled "
+                     "KV read path - expect the low end of the bracket.")
+    if has_spec:
+        notes.append("Speculative decoding is not modelled: the number is the "
+                     "per-accepted-token floor, before rejection overhead.")
+    notes.append("Decode only, bandwidth bound: the compute term (FLOPs) is not "
+                 "modelled, so a small active model or a very short context can "
+                 "run slower than this.")
+    return notes
 
 
 def _llama_flags(ctx, kv_type, flash_attn, ngl=None, n_cpu_moe=None,

@@ -112,6 +112,27 @@ def get_bandwidth():
     return res
 
 
+_BW_CACHE = {"when": 0.0, "val": None}
+
+BW_CACHE_TTL = 120.0    # seconds
+
+
+def cached_bandwidth(fresh=False):
+    """get_bandwidth(), memoised for the planner path.
+
+    analyze() runs in tight loops (calibration, sweeps) and the RAM probe shells
+    out for up to 20s per call; a machine's peak bandwidth does not move within
+    two minutes. Failures are cached too, so a driver that is down cannot put
+    the whole planner on the slow probe path. The UI's refresh button and the
+    /api/bandwidth endpoint call get_bandwidth() directly."""
+    if not fresh and _BW_CACHE["val"] is not None and \
+            (time.time() - _BW_CACHE["when"]) < BW_CACHE_TTL:
+        return _BW_CACHE["val"]
+    val = get_bandwidth()
+    _BW_CACHE["when"], _BW_CACHE["val"] = time.time(), val
+    return val
+
+
 def get_gpu_processes():
     """Per-process dedicated VRAM. This is what turns the compute buffer from an
     estimate into a measurement: load a model, read the real number, subtract the

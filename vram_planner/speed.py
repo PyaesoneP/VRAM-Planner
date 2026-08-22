@@ -70,29 +70,51 @@ def per_token_bytes(cfg, cl, gpu_blocks, ctx_fill, kv_type, cpu_head=True,
 
 
 def estimate_speed(cfg, cl, gpu_blocks, ctx_fill, kv_type,
-                   bw_vram_gbs, bw_ram_gbs, cpu_head=True, ram_eff=None,
-                   n_cpu_moe=0, n_cpu_ffn=0):
+                   bw_vram_gbs=None, bw_ram_gbs=None, cpu_head=True,
+                   ram_eff=None, n_cpu_moe=0, n_cpu_ffn=0):
     """tok/s for generation. With ram_eff set (from a calibration) this returns a
-    single number; without it, a hi/lo bracket."""
+    single number; without it, a hi/lo bracket.
+
+    Bandwidths are per side: a plan whose bytes all live on one side needs only
+    that side's number. When a side is READ FROM but its bandwidth is missing,
+    the throughput comes back None with "missing" naming the absent inputs - a
+    plan without a usable number is worse than no number, and substituting 500/50
+    would be exactly that."""
     b = per_token_bytes(cfg, cl, gpu_blocks, ctx_fill, kv_type, cpu_head,
                         n_cpu_moe, n_cpu_ffn)
-    def tps(re_):
-        t = b["gpu_bytes"] / (bw_vram_gbs * GPU_EFF * 1e9)
-        if b["cpu_bytes"] > 0:
-            t += b["cpu_bytes"] / (bw_ram_gbs * re_ * 1e9)
-        return (1.0 / t) if t > 0 else 0.0
     out = dict(b)
     out["bw_vram_gbs"] = bw_vram_gbs
     out["bw_ram_gbs"] = bw_ram_gbs
     out["ctx_fill"] = ctx_fill
+    have_vram, have_ram = (bw_vram_gbs or 0) > 0, (bw_ram_gbs or 0) > 0
+    missing = []
+    if b["gpu_bytes"] > 0 and not have_vram:
+        missing.append("bw_vram_gbs")
+    if b["cpu_bytes"] > 0 and not have_ram:
+        missing.append("bw_ram_gbs")
     if ram_eff:
-        out["tok_s"] = tps(ram_eff)
         out["ram_eff"] = ram_eff
         out["calibrated"] = True
     else:
+        out["calibrated"] = False
+    if missing:
+        out["tok_s"] = None
+        out["tok_s_hi"] = None
+        out["tok_s_lo"] = None
+        out["missing"] = missing
+        return out
+    def tps(re_):
+        t = 0.0
+        if b["gpu_bytes"] > 0:
+            t += b["gpu_bytes"] / (bw_vram_gbs * GPU_EFF * 1e9)
+        if b["cpu_bytes"] > 0:
+            t += b["cpu_bytes"] / (bw_ram_gbs * re_ * 1e9)
+        return (1.0 / t) if t > 0 else 0.0
+    if ram_eff:
+        out["tok_s"] = tps(ram_eff)
+    else:
         out["tok_s_hi"] = tps(RAM_EFF_HI)
         out["tok_s_lo"] = tps(RAM_EFF_LO)
-        out["calibrated"] = False
     return out
 
 

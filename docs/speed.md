@@ -18,9 +18,19 @@ seconds/token = gpu_bytes/BW_vram + cpu_bytes/BW_ram
 
 The byte counts are exact (tensor table, `n_expert_used/n_expert` of the expert
 weights, plus the KV re-read that grows as the context fills). The bandwidths are
-not, so the planner reports a **bracket** until you calibrate it. Peak VRAM and RAM
-bandwidth are auto-detected (`nvidia-smi` memory clock × inferred bus width;
-`Win32_PhysicalMemory` speed × total data width) and both fields are editable.
+not, so the planner reports a **bracket** until you calibrate it.
+
+Every plan's prediction records the bandwidths it used **and where they came
+from**: *entered* (typed into the form), *auto-detected* (a one-shot probe —
+`nvidia-smi` memory clock × inferred bus width; `Win32_PhysicalMemory` speed ×
+total data width — cached for two minutes, failures included), or *unavailable*.
+If a side the plan reads from has no bandwidth, that plan degrades to **n/a**
+rather than being scored with a made-up number: the per-token byte split is still
+reported, because it is still true, and a wrong number inside a clean bracket is
+worse than no number. A plan only needs the bandwidth of the side it actually
+streams from — a fully on-GPU plan scores fine with no RAM figure at all — and
+each plan is scored on its own split, so one plan's prediction never depends on
+the other plan existing.
 
 The bracket is wide for a reason: scattered MoE expert gathers over system RAM run
 far below peak, while contiguous streaming runs near it. One measurement collapses

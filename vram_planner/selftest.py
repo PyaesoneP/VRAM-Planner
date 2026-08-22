@@ -7,6 +7,7 @@ from .compute import CB_CUDA_CTX_MIB, CB_DEFAULTS, CB_SPLIT_GRAPH_MIB, CB_SPLIT_
 from .lmstudio import REF_GPU, current_backend, read_lmstudio_runtime, resolve_runtime_ngl
 from .calib import CALIB_SCHEMA, CALIB_TERMS, _CALIB_CACHE, _active_gpu, _design, _struct_offset, calib_coeffs, fit_calibration, mark_unreliable
 from .plan import analyze, find_mmproj
+from .speed import estimate_speed
 
 
 # ---------------------------------------------------------------------------
@@ -1089,6 +1090,111 @@ def _run_suite(require_refs, tmp, skipped_real):
              pk2["scores_mib"] / p1["scores_mib"], pk2["act_mib"] / p1["act_mib"],
              pfa["scores_mib"] == 0.0, "OK" if vis_ok else "FAIL"))
     ok = ok and vis_ok
+
+    # 5d) AC1 - no bandwidth anywhere, not even the probe: no plan may fall back
+    #     on a fabricated figure. Every plan degrades to n/a, names the side it
+    #     cannot score, and keeps only the byte split that is still true. Patch
+    #     the probe as plan.py sees it, not the machine.
+    from . import plan as _planmod
+    _real_probe = _planmod.cached_bandwidth
+    _planmod.cached_bandwidth = lambda fresh=False: {"vram_gbs": None, "ram_gbs": None}
+    try:
+        rna = analyze(p2, 4096, "f16", 512, False, vram_budget_mib=30,
+                      ram_budget_mib=8000, gpu_reserve_mib=0, compute_override_mib=5,
+                      safety_pct=0, bw_vram_gbs=None, bw_ram_gbs=None, ctx_fill=1024)
+    finally:
+        _planmod.cached_bandwidth = _real_probe
+    na_sp = [p_.get("speed") for p_ in (rna.get("plans") or {}).values()
+             if isinstance(p_.get("speed"), dict)]
+    na_ok = len(na_sp) >= 2
+    for sp_ in na_sp:
+        na_ok = (na_ok and sp_.get("ok") is False
+                 and sp_.get("tok_s_hi") is None and sp_.get("tok_s_lo") is None
+                 and sp_.get("missing")
+                 and set(sp_.get("missing")) <= {"bw_vram_gbs", "bw_ram_gbs"}
+                 and sp_.get("bw_vram_gbs") is None and sp_.get("bw_ram_gbs") is None
+                 and sp_.get("bw_vram_source") == "none"
+                 and sp_.get("bw_ram_source") == "none"
+                 and bool(sp_.get("reason"))
+                 and (sp_.get("gpu_mib", 0) > 0 or sp_.get("cpu_mib", 0) > 0))
+    # per-side need: the probe above only covers what a whole plan does; this
+    # checks estimate_speed directly - a plan that reads one device needs only
+    # that device's number (head and KV follow the blocks off the GPU)
+    _cl2 = classify_tensors(load_gguf(p2), rk["config"])
+    _allb = list(range(nL2))
+    # a stale calibrated value must never ride a degenerate payload - the UI
+    # keys its hero on `calibrated`, and None.toFixed() is a whole results
+    # panel replaced by an error string
+    _deg = estimate_speed(rk["config"], _cl2, _allb, 1024,
+                          "f16", 50.0, None, cpu_head=True, ram_eff=0.6)
+    na_ok = (na_ok
+             and "missing" not in estimate_speed(rk["config"], _cl2, _allb, 1024,
+                                                 "f16", 50.0, None, cpu_head=False)
+             and "missing" in estimate_speed(rk["config"], _cl2, _allb, 1024,
+                                             "f16", None, 80.0, cpu_head=False)
+             and "missing" not in estimate_speed(rk["config"], _cl2, _allb, 1024,
+                                                 "f16", 50.0, 80.0, cpu_head=True)
+             and _deg.get("tok_s") is None and _deg.get("calibrated") is False
+             and "ram_eff" not in _deg)
+    print("  SPEED-NA probe unavailable: %d/%d plans n/a (missing=%s), byte split kept  %s"
+          % (sum(1 for sp_ in na_sp if sp_.get("ok") is False), len(na_sp),
+             sorted({m for sp_ in na_sp for m in (sp_.get("missing") or [])}),
+             "OK" if na_ok else "FAIL"))
+    ok = ok and na_ok
+
+    # 5e) AC2 - a plan's prediction is standalone: recomputed from that plan's OWN
+    #     placement only (its -ngl / -ot, nothing about the sibling plan) it must
+    #     reproduce the number analyze attached, to the bit.
+    def _alone(p_):
+        ngl = p_.get("n_gpu_layers")
+        if ngl is None:
+            ngl = nL2 if p_.get("fits_fully") else 0
+        return estimate_speed(rk["config"], _cl2,
+                              list(range(max(0, nL2 - int(ngl)), nL2)),
+                              1024, "f16", 600.0, 80.0, cpu_head=True,
+                              n_cpu_moe=p_.get("n_cpu_moe") or 0,
+                              n_cpu_ffn=p_.get("n_cpu_ffn") or 0)
+    solo_ok = True
+    for _nm in ("speed", "context"):
+        _a = (pl.get(_nm) or {}).get("speed") or {}
+        _b = _alone(pl.get(_nm) or {})
+        for _k in ("tok_s_hi", "tok_s_lo", "gpu_mib", "cpu_mib", "expert_frac", "ctx_fill"):
+            solo_ok = solo_ok and _a.get(_k) is not None and _a.get(_k) == _b.get(_k)
+    _cxsp = (pl.get("context") or {}).get("speed") or {}
+    print("  SPEED-SOLO recomputed from own split: speed %.2f/%.2f, context %.2f/%.2f  %s"
+          % (sk.get("tok_s_hi") or 0.0, sk.get("tok_s_lo") or 0.0,
+             _cxsp.get("tok_s_hi") or 0.0, _cxsp.get("tok_s_lo") or 0.0,
+             "OK" if solo_ok else "FAIL"))
+    ok = ok and solo_ok
+
+    # 5f) AC3 - synthetic bandwidths, real consequence. The two plans bill the
+    #     same bytes to different sides: the speed plan exiles the whole dense
+    #     FFN to RAM (streaming it every token) but keeps every block's KV on the
+    #     GPU; the context plan keeps as much FFN on the GPU as the card allows
+    #     and, once the card is tight enough, starts evicting whole blocks -
+    #     weights AND KV - to the slow side. A generous card favours the context
+    #     plan (FFN stays on the fast side); a tight one favours the speed plan
+    #     (all KV stays on the fast side), so the PREDICTED ordering must flip
+    #     somewhere in the family. A property of placement, not of the model:
+    #     no single card can show it.
+    flip_rows = []
+    for b in (30, 25, 20, 15, 10, 8):
+        fr = analyze(p2, 4096, "f16", 512, False, vram_budget_mib=b,
+                     ram_budget_mib=8000, gpu_reserve_mib=0, compute_override_mib=5,
+                     safety_pct=0, bw_vram_gbs=50, bw_ram_gbs=25)
+        fps = fr.get("plans") or {}
+        hi = {k: (v.get("speed") or {}).get("tok_s_hi") for k, v in fps.items()}
+        if hi.get("speed") is None or hi.get("context") is None:
+            continue
+        flip_rows.append((b, hi["speed"], hi["context"]))
+    flip_ok = (len(flip_rows) >= 3
+               and any(s - c > 0 for _, s, c in flip_rows)
+               and any(s - c < 0 for _, s, c in flip_rows))
+    print("  SPEED-FLIP bw 50/25, predicted tok_s_hi speed/context as the card shrinks: "
+          "%s  %s"
+          % (" ".join("b%d:%.2f/%.2f" % (b, s, c) for b, s, c in flip_rows),
+             "OK" if flip_ok else "FAIL"))
+    ok = ok and flip_ok
 
     # 6) sliding-window attention: windowed layers must cap at their window (and
     #    use their own head dims), or KV is overstated by 10-20x at long context.

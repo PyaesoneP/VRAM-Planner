@@ -1012,15 +1012,21 @@ function renderSettings(r){
 function renderSpeed(r){
   const sp = r.speed;
   if(!sp || sp.error) return "";
-  const num_ = sp.calibrated
+  const degraded = sp.ok === false;
+  const num_ = degraded
+    ? h`<span class="hero" style="color:var(--warn)">n/a</span>`
+    : sp.calibrated
     ? h`<span class="hero ok">${sp.tok_s.toFixed(1)}</span> tok/s`
     : h`<span class="hero">${sp.tok_s_lo.toFixed(0)}&ndash;${sp.tok_s_hi.toFixed(0)}</span> tok/s`;
+  const bwSide = (v, s) => v == null ? "unavailable"
+    : Math.round(v) + " GB/s" + (s === "auto" ? " (auto-detected)" : "");
   return h`<section class="card">
     <h2>Generation speed</h2>
     <p style="margin:2px 0 14px">${raw(num_)}
       <span class="muted small" style="margin-left:10px">${
-        sp.calibrated ? "calibrated · RAM at " + (sp.ram_eff * 100).toFixed(0) + "% of peak"
-                      : "uncalibrated bracket · measure once to collapse it"}</span></p>
+        degraded ? raw(sp.reason)
+        : sp.calibrated ? "calibrated · RAM at " + (sp.ram_eff * 100).toFixed(0) + "% of peak"
+                        : "uncalibrated bracket · measure once to collapse it"}</span></p>
     <div class="tablewrap"><table><tbody>
       ${raw(brow("Read from VRAM per token", fmt(sp.gpu_mib)))}
       ${raw(brow("Read from system RAM per token", fmt(sp.cpu_mib) +
@@ -1028,12 +1034,13 @@ function renderSpeed(r){
       ${raw(sp.expert_frac < 1 ? brow("Experts active per token",
         (sp.expert_frac * 100).toFixed(2) + "% of expert weights") : "")}
       ${raw(brow("Context assumed filled", num(sp.ctx_fill) + " tokens"))}
-      ${raw(brow("Bandwidth used", Math.round(sp.bw_vram_gbs) + " GB/s VRAM · " +
-        sp.bw_ram_gbs.toFixed(1) + " GB/s RAM"))}
+      ${raw(brow("Bandwidth used", bwSide(sp.bw_vram_gbs, sp.bw_vram_source) + " VRAM · " +
+        bwSide(sp.bw_ram_gbs, sp.bw_ram_source) + " RAM"))}
     </tbody></table></div>
     <p class="note">Generation is memory-bandwidth bound: every token reads each active weight
       once. Byte counts are exact; the bandwidths are not, which is the whole width of the
       bracket. Prompt processing is compute bound and is <b>not</b> modelled here.</p>
+    ${raw((sp.notes || []).map(n => h`<p class="note">&bull; ${n}</p>`).join(""))}
     <div class="actions">
       <button class="ghost" type="button" data-action="bench">&#9654; Benchmark the loaded model</button>
       <span class="muted small">runs one short generation on the LM Studio server
@@ -1341,8 +1348,15 @@ async function useMeasured(tokS, fill){
   $("rameff").value = "";              // clear so the solve is not anchored to an old value
   const r = LAST;
   if(!r || !r.speed) return;
+  const sp = r.speed;
+  if(sp.ok === false || !sp.bw_vram_gbs || !sp.bw_ram_gbs){
+    $("calhint").innerHTML = '<b style="color:var(--warn)">Calibration needs the plan&rsquo;s ' +
+      'bandwidths. ' + (sp.ok === false ? sp.reason
+        : "Enter them in the bandwidth fields first.") + '</b>';
+    return;
+  }
   // solve: t_total = gpu_bytes/(BWv*GPU_EFF) + cpu_bytes/(BWr*eff)
-  const sp = r.speed, GPU_EFF = 0.85;
+  const GPU_EFF = 0.85;
   const gpuB = sp.gpu_mib * 1048576, cpuB = sp.cpu_mib * 1048576;
   const tTot = 1 / tokS, tGpu = gpuB / (sp.bw_vram_gbs * GPU_EFF * 1e9), tCpu = tTot - tGpu;
   if(cpuB <= 0 || tCpu <= 0){

@@ -1461,9 +1461,13 @@ def _plan_dense_fit(cfg, cl, eff_vram, ram, kv_total, weights, embed, output,
         gpu_rec = rec_total if k == 0 else _mib(SR[k])
         resident = gpu_w + gpu_kv + gpu_rec
         return resident + _cb(ngl, n_cpu_ffn)["gpu"], resident
-    # Both VRAM and resident bytes are non-increasing in the exile within a
-    # row, so a row's best point is its SMALLEST feasible exile: f=0 when the
-    # whole row fits, f=n when none of it does, otherwise a bisection.
+    # Within a row, VRAM and resident bytes are non-increasing in the exile on
+    # [1, n] - the graph is split at every one of those points, so the split
+    # surcharge is constant there - and the one step that can go the other way
+    # is 0 -> 1 on the all-GPU row, where the surcharge arrives while only
+    # block 0's FFN leaves. A row's best point is its SMALLEST feasible exile:
+    # f=0 when the whole row fits, f=n when none of it does, else a bisection
+    # over [1, n] with f=0 checked on its own.
     def row_point(ngl):
         if point(ngl, 0)[0] <= eff_vram:
             return 0
@@ -1719,9 +1723,13 @@ def _plan_moe(cfg, cl, eff_vram, ram, kv_total, kv_layer, compute, weights,
         gpu_rec = rec_total if k == 0 else _mib(SR[k])
         resident = gpu_w + gpu_kv + gpu_rec
         return resident + _cb(ngl, n_cm)["gpu"], resident
-    # VRAM and resident bytes are both non-increasing in the exile within a
-    # row, so a row's best point is its SMALLEST feasible exile: n_cm=0 when
-    # the whole row fits, n_cm=n when none of it does, else a bisection.
+    # Within a row, VRAM and resident bytes are non-increasing in the exile on
+    # [1, n] - the graph is split at every one of those points, so the split
+    # surcharge is constant there - and the one step that can go the other way
+    # is 0 -> 1 on the all-GPU row, where the surcharge arrives while only
+    # block 0's experts leave. A row's best point is its SMALLEST feasible
+    # exile: n_cm=0 when the whole row fits, n_cm=n when none of it does, else
+    # a bisection over [1, n] with n_cm=0 checked on its own.
     def row_point(ngl):
         if point(ngl, 0)[0] <= eff_vram:
             return 0
@@ -1765,10 +1773,15 @@ def _plan_moe(cfg, cl, eff_vram, ram, kv_total, kv_layer, compute, weights,
         m_row = n_layers
     c_row = cost(n_layers, m_row)
     _v_row, r_row = point(n_layers, m_row)
+    # finish() derives the RAM line from the cost dict; do the same here
+    ram_row = (c_row["cpu_weights_mib"] + c_row["cpu_kv_mib"]
+               + c_row["cpu_recurrent_mib"] + c_row.get("cpu_compute_mib", 0.0))
     c["min_sacrifice"] = {
         "n_gpu_layers": n_layers, "n_cpu_moe": m_row,
         "vram_used_mib": c_row["vram_used_mib"],
         "vram_ok": c_row["vram_used_mib"] <= eff_vram,
+        "ram_used_mib": ram_row,
+        "ram_ok": ram_row <= ram,
         # what the row keeps resident - the grid's point must keep at least
         # this much, because the row is a grid point
         "resident_mib": r_row,

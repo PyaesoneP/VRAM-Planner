@@ -1749,7 +1749,12 @@ def _plan_moe(cfg, cl, eff_vram, ram, kv_total, kv_layer, compute, weights,
     else:
         _key, ngl, n_cm = best
     c = cost(ngl, n_cm)
-    attention_overflow = point(n_layers, n_layers)[0] > eff_vram
+    # The flag means "the returned plan does not fit" - set only when no grid
+    # point fits at all and the fallback (nothing on the GPU) is what comes
+    # back, like the dense kv_overflow. The all-blocks row failing while a
+    # lower row still fits is a degraded but feasible plan; _verdict must read
+    # its own numbers for it, or a long-context MoE plan reads "DOES NOT FIT".
+    attention_overflow = best is None
     if attention_overflow:
         c["attention_overflow"] = True
     # The old row's answer survives as a sub-field: every block on the GPU,

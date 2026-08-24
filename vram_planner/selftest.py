@@ -1148,6 +1148,24 @@ def _run_suite(require_refs, tmp, skipped_real):
           % (gotm[0], gotm[1], "OK" if moe_ok else "FAIL"))
     ok = ok and moe_ok
 
+    # KV pressure: the all-blocks row does not fit even with every expert on
+    # the CPU, but lower rows still do. The legacy tail flag fired on that
+    # and _verdict stamped the (feasible) plan "DOES NOT FIT"; the flag now
+    # means "the returned plan does not fit", like the dense kv_overflow, so
+    # this plan must come back unflagged with a readable verdict.
+    pk_b = 12
+    rkv = analyze(p3, 4096, "f16", 512, False, vram_budget_mib=pk_b,
+                  ram_budget_mib=8000, gpu_reserve_mib=0,
+                  compute_override_mib=5, safety_pct=0, plan_mode="fit")
+    pkv = (rkv.get("plans") or {}).get("fit") or rkv["plan"]
+    press_ok = (_moe_pt(gm_nL, gm_nL)[0] > float(pk_b)
+                and bool(pkv.get("vram_ok"))
+                and not pkv.get("attention_overflow")
+                and (pkv.get("verdict") or {}).get("state") in ("fits", "tight"))
+    print("  GRID-MOE kv-pressure all-blocks row infeasible, plan fits  %s"
+          % ("OK" if press_ok else "FAIL"))
+    ok = ok and press_ok
+
     # GRID-DOM: heterogeneous blocks. Layers are not interchangeable - the
     #    FFN widths alternate here - so the suffix sums must index the REAL
     #    per-layer bytes, and the plan must still be the brute-force argmax.

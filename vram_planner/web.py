@@ -148,6 +148,7 @@ class Handler(BaseHTTPRequestHandler):
         --speed-kv and --speed-ub, which freeze those axes instead of sweeping
         them."""
         from .sweep import parse_overrides
+        from .bench import norm_plan_mode
         def as_int(k, default=None):
             v = data.get(k)
             return int(v) if given(v) else default
@@ -157,14 +158,20 @@ class Handler(BaseHTTPRequestHandler):
             "stages": (data.get("stages") or "ab").lower(),
             # Which question stage A answers on a dense model. The browser sends
             # whichever plan the fit card's toggle is showing, so the campaign
-            # optimises the plan the user is actually looking at.
-            "plan_mode": (data.get("plan_mode") or None),
+            # optimises the plan the user is actually looking at. "auto" and the
+            # old spellings ("speed" / "context") normalise here: auto reaches
+            # the campaign as None and lets it keep its own coverage rule, and
+            # the old spellings predate the retag but mean the same plans.
+            "plan_mode": (norm_plan_mode(data.get("plan_mode"))
+                          if data.get("plan_mode") not in (None, "", "auto")
+                          else None),
             # Context is frozen from the form in every mode but one: a dense
-            # "plan for speed" campaign SWEEPS it, and the form's value there is
-            # the context the user asked about, not one they pinned. Sending it
-            # as a freeze made stage A's own axis look like a contradiction and
+            # ceiling-plan campaign SWEEPS it, and the form's value there is the
+            # context the user asked about, not one they pinned. Sending it as a
+            # freeze made stage A's own axis look like a contradiction and
             # parked stages C and D at a window the campaign had just improved on.
-            "ctx": (None if (data.get("plan_mode") == "speed" and not data.get("axes"))
+            "ctx": (None if (data.get("plan_mode") in ("ceiling", "speed")
+                             and not data.get("axes"))
                     else as_int("context")),
             "kv": data.get("kv_type") or None,
             # The physical batch, frozen like ctx and kv rather than swept. It

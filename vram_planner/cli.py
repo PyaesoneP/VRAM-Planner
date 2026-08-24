@@ -167,21 +167,23 @@ def main():
     # an argparse default would drag the whole subprocess-heavy module into
     # every --help. selftest asserts the two agree.
     ap.add_argument("--speed-stages", default="ab", metavar="LETTERS",
-                    help="with --speed-sweep: which stages to run (a=the wall, "
-                         "b=speculation). Stage A's axis follows --speed-mode: "
-                         "context for a speed plan, -ngl for a context plan, "
-                         "--n-cpu-moe on an MoE; it then walks the dense FFN back "
+                     help="with --speed-sweep: which stages to run (a=the wall, "
+                          "b=speculation). Stage A's axis follows --speed-mode: "
+                          "context for the ceiling plan, -ngl for the fit plan, "
+                          "--n-cpu-moe on an MoE; it then walks the dense FFN back "
                          "onto the card if the wall left room. The old letters "
                          "still work - d is stage B, and c was the ubatch sweep, "
                          "now a frozen setting (--speed-ub)")
     ap.add_argument("--speed-mode", default="auto", metavar="MODE",
-                    choices=("auto", "speed", "context"),
+                    choices=("auto", "ceiling", "fit"),
                     help="with --speed-sweep, dense models: which question stage A "
-                         "answers. 'speed' keeps every block's attention and KV on "
-                         "the GPU with the dense FFN exiled (-ngl all, -ot) and "
-                         "sweeps CONTEXT for the largest window that loads; "
-                         "'context' holds the context and sweeps -ngl. 'auto' asks "
-                         "the planner which one this model and card land in")
+                         "answers. 'ceiling' keeps every block's attention and KV "
+                         "on the GPU with the dense FFN exiled (-ngl all, -ot) and "
+                         "sweeps CONTEXT for the largest window that loads; 'fit' "
+                         "holds the context and sweeps -ngl. 'auto' keeps the "
+                         "coverage rule: the ceiling plan ladders context whenever "
+                         "it covers the requested context, otherwise the fit plan "
+                         "ladders layers")
     ap.add_argument("--speed-fill", type=int, default=None, metavar="TOKENS",
                     help="with --speed-sweep: prompt length to measure at")
     ap.add_argument("--speed-fills", nargs="+", type=int, default=None,

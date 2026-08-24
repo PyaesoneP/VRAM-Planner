@@ -45,9 +45,9 @@ let PLAN_MODE = null;
 // Auto's label needs the plan to be on screen before it can say which way auto
 // went, so the chips are rebuilt whenever either the pick or the plan changes.
 const PLAN_MODES = [
-  ["auto",    "Auto",    "whichever answers the context above"],
-  ["speed",   "Speed",   "all layers on the GPU; context is what fits"],
-  ["context", "Context", "hold the context; pay in layers"]
+  ["auto",    "Auto",    "whichever the planner predicts faster at the context above"],
+  ["ceiling", "Ceiling", "all layers on the GPU; context is what fits"],
+  ["fit",     "Fit",     "hold the context; pay in FFN, then layers"]
 ];
 
 const CALIB_TERMS = ["floor", "ctx", "act", "nofa"];
@@ -307,8 +307,11 @@ function setCtx(v){ $("ctx").value = v; markCtx(); }
  * is one piece of state and no way for the two to disagree - the failure mode
  * of every second control that means the same thing.
  *
- * "auto" is null on the wire: the server reads an absent mode as "you decide"
- * and answers with whichever plan covers the context that was asked for. */
+  * "auto" is null on the wire: the server reads an absent mode as "you decide",
+  * prices both plans at the context that was asked for, and answers with the
+  * one it predicts faster. LAST.plan_mode is that answer - there is no client
+  * copy of the rule, because a second copy is how the card and the campaign
+  * used to disagree. */
 function drawPlanModeChips(){
   const box = $("planmodechips");
   if(!box) return;
@@ -317,7 +320,8 @@ function drawPlanModeChips(){
   box.innerHTML = PLAN_MODES.map(([id, label, hint]) =>
     h`<button type="button" class="chip" data-action="set-plan-mode" data-mode="${id}"
               title="${hint}" aria-pressed="${id === cur ? "true" : "false"}">${
-      label + (id === "auto" && !PLAN_MODE && went ? " · " + went : "")}</button>`).join("");
+      label + (id === "auto" && !PLAN_MODE && went
+               ? " · " + went.charAt(0).toUpperCase() + went.slice(1) : "")}</button>`).join("");
 }
 
 /** Set the category, and show it without a round trip where that is possible.
@@ -334,11 +338,10 @@ function setPlanMode(m){
   PLAN_MODE = next;
   if(!LAST){ drawPlanModeChips(); return; }
   const plans = LAST.plans;
-  // Auto is not a plan, it is a rule - the same one analyze() applies: take the
-  // speed plan whenever it already covers the context that was asked for.
-  const sp = plans && plans.speed;
-  const pick = PLAN_MODE || (sp && (sp.max_ctx || 0) >= (LAST.inputs.context || 0)
-                             ? "speed" : "context");
+  // Auto is not a plan, it is a rule the SERVER applies: price both plans at
+  // the requested context, take the faster. LAST.plan_mode is that answer, so
+  // "auto" here is the identity - there is no client mirror of the rule.
+  const pick = PLAN_MODE || LAST.plan_mode;
   if(plans && plans[pick] && LAST.plan_mode !== pick){
     LAST.plan_mode = pick;
     LAST.plan = plans[pick];
@@ -937,12 +940,13 @@ function recToScript(){
  *
  * A model that does not fit has one answer per question: keep every block's
  * attention and KV on the GPU with the dense FFN exiled and take the largest
- * context that still fits (SPEED), or hold the context you asked for and walk
- * -ngl down until it fits (CONTEXT). The server computes both and preselects
- * one, so flipping is free - no round trip, and every card below re-renders
- * from the plan that was picked. */
+ * context that still fits (CEILING), or hold the context you asked for and walk
+ * -ot (then -ngl) down to the least exile that fits (FIT). The server computes
+ * both, prices both AT THE CONTEXT YOU ASKED FOR, and preselects the one it
+ * predicts faster - so flipping is free (no round trip) and every card below
+ * re-renders from the plan that was picked. */
 function renderModes(r){
-  if(!r.plans || !r.plans.speed || !r.plans.context){
+  if(!r.plans || !r.plans.ceiling || !r.plans.fit){
     // A mode was asked for and there was no choice to make. Saying so beats a
     // control that silently does nothing: an MoE's --n-cpu-moe has one answer,
     // and a model that fits whole has no split to trade at all.
@@ -958,23 +962,37 @@ function renderModes(r){
   // variable, on screen at once, three inches apart. What the chips cannot carry
   // is the NUMBERS, so that is what is left here: what this mode bought, and
   // what the other one would have.
-  const mode = r.plan_mode || "speed";
-  const sp = r.plans.speed, cx = r.plans.context;
+  const mode = r.plan_mode || "fit";
+  const otherKey = mode === "ceiling" ? "fit" : "ceiling";
+  const pick = r.plan_pick || {};
+  // What each plan is worth AT YOUR CONTEXT - the comparison the pick is made
+  // on, not each plan's roofline at the context IT proposes.
+  const atCtx = e => {
+    if(!e || !e.ok) return "n/a";
+    if(e.calibrated && e.tok_s != null)
+      return num(Math.round(e.tok_s)) + " tok/s, calibrated";
+    if(e.tok_s_hi != null)
+      return num(Math.round(e.tok_s_lo)) + "&ndash;" + num(Math.round(e.tok_s_hi)) + " tok/s";
+    return "n/a";
+  };
   const fig = pl => num(pl.max_ctx || r.inputs.context) + " ctx · "
                     + (pl.n_gpu_layers || 0) + " layers";
-  const otherName = mode === "speed" ? "Context" : "Speed";
-  const other = mode === "speed" ? cx : sp;
   return h`<section class="card modes">
-    <h2>Plan for ${mode}</h2>
+    <h2>${mode === "ceiling" ? "Context ceiling" : "Fit at your context"}</h2>
     <p class="note" style="margin-top:0">This split gives <b class="mono">${
-      raw(fig(mode === "speed" ? sp : cx))}</b>. <b>${otherName}</b> would give <b class="mono">${
-      raw(fig(other))}</b> &mdash; switch with the chips above <b>Analyze fit</b>.
+      raw(fig(r.plans[mode]))}</b> &mdash; <b class="mono">${raw(atCtx(pick[mode]))}</b>
+      at ${num(r.inputs.context)} ctx. <b>${otherKey === "ceiling" ? "Ceiling" : "Fit"}</b>
+      would give <b class="mono">${raw(fig(r.plans[otherKey]))}</b> &mdash;
+      <b class="mono">${raw(atCtx(pick[otherKey]))}</b>.
+      ${pick.reason ? raw(pick.reason) + " " : ""}
+      Switch with the chips above <b>Analyze fit</b>.
       <details class="why"><summary>what the two trade</summary>
-        Both exile every block&rsquo;s dense FFN to RAM (<b>-ot</b>); they differ in what is
-        left free. <b>Speed</b> pins every layer on the GPU so all the KV stays in VRAM and
-        the window becomes whatever still fits. <b>Context</b> holds the window you asked for
-        and gives up layers to pay for it. The choice also decides which recorded row
-        <b>Run this</b> calls the best one.</details></p>
+        Both exile dense FFN to RAM (<b>-ot</b>); they differ in what is left free.
+        <b>Ceiling</b> pins every layer on the GPU so all the KV stays in VRAM and the
+        window becomes whatever still fits. <b>Fit</b> holds the window you asked for and
+        gives up FFN &mdash; then layers, if the full exile is not enough &mdash; to pay for it.
+        The auto pick prices both at your context and takes the faster; the choice also
+        decides which recorded row <b>Run this</b> calls the best one.</details></p>
   </section>`;
 }
 
@@ -1562,7 +1580,7 @@ function tier(label, note){
  * not a place to learn a vocabulary from. Defined once here and reused as the
  * `title` on each <th>, so the two cannot drift. */
 const TERMS = [
-  ["ctx", "context length", "The window the server was STARTED with (-c), which is what the KV cache is sized for — not how much of it was filled. Frozen for the campaign in every mode except dense “plan for speed”, where it is the axis stage A sweeps."],
+  ["ctx", "context length", "The window the server was STARTED with (-c), which is what the KV cache is sized for — not how much of it was filled. Frozen for the campaign in every mode except the dense ceiling plan, where it is the axis stage A sweeps."],
   ["ot", "CPU FFN blocks", "How many blocks had their dense FFN tensors (gate/up/down) pinned to system RAM with -ot, leaving their attention and KV in VRAM. Both dense plan modes pin every block; this column shows what actually ran."],
   ["ngl", "GPU layers", "How many transformer blocks live in VRAM. llama.cpp offloads the LAST n, so this is a count and not a list."],
   ["ncmoe", "CPU expert layers", "On an MoE only: the routed experts of the first n blocks are pushed to system RAM, leaving their attention and KV in VRAM. A different knob from ngl, and usually the one that matters — experts are most of the file and only a few of them fire per token."],
@@ -1860,7 +1878,7 @@ function sweepFormDisabled(){
  * axis, and left the one number a speed campaign is FOR invisible on the page. */
 function sweptNote(){
   const mode = (LAST && LAST.plan_mode) || PLAN_MODE;
-  if(LAST && !LAST.is_moe && mode === "speed")
+  if(LAST && !LAST.is_moe && mode === "ceiling")
     return h`KV quant and ubatch are taken from the form above and frozen;
       <b>context is the axis</b> &mdash; stage A sweeps it to find the largest window
       that loads, then spends what is left on FFN blocks`;
@@ -1875,7 +1893,7 @@ function sweepForm(pf){
     <div class="chips" role="group" aria-label="Stages">
       ${raw(sweepStage("a", "A &middot; the wall", (LAST && LAST.is_moe)
         ? "How few experts can sit on the CPU before it spills (--n-cpu-moe)"
-        : (LAST && LAST.plan_mode === "context")
+        : (LAST && LAST.plan_mode === "fit")
           // Both phases, in the order stage A runs them: whole blocks first,
           // then - if every block already fits - how much dense FFN can come
           // back onto the card with the VRAM that is left.

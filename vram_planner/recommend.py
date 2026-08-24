@@ -16,12 +16,12 @@ name every reason they differ.
 "Fastest row measured" is itself only half the story, and which half depends on
 the question being asked. A dense model that does not fit has two plans, and
 each one pins a placement and leaves exactly one knob free - the context in the
-SPEED plan, the -ot exile (then -ngl) in the CONTEXT plan. Along a knob that is
+ceiling plan, the -ot exile (then -ngl) in the fit plan. Along a knob that is
 monotone in VRAM the value worth having is the one at the WALL, not the one that
 read fastest: measured rows move 4.2% of tok/s across a doubling of context, and
-downward, so ranking a speed campaign by tok/s recommends the smallest window in
-the mode whose whole purpose is the largest one. mode_axis() below decides which
-knob a category leaves free and recommend() ranks along it, using the same
+downward, so ranking a ceiling campaign by tok/s recommends the smallest window
+in the plan whose whole purpose is the largest one. mode_axis() below decides
+which knob a category leaves free and recommend() ranks along it, using the same
 pick_extreme() the campaign promotes stages with - so the card and the sweep
 cannot land on different rows. Off the two-plan regime - an MoE, a model that
 fits whole - nothing is left free and fastest-wins stands unchanged.
@@ -30,8 +30,8 @@ Pure: no I/O, no subprocess, no GPU. Same rule as bench.py's findings code, and
 for the same reason - the CLI and the browser reach one conclusion by
 construction rather than by two people remembering to keep them in step.
 """
-from .bench import (axis_direction, comparable, pick_extreme, rank_rows,
-                    trustworthy, _ANY)
+from .bench import (axis_direction, comparable, norm_plan_mode, pick_extreme,
+                    rank_rows, trustworthy, _ANY)
 
 # Knobs a measured row can carry that a plan has no field for. The plan's
 # vocabulary is ngl / ncmoe / ctx / kv; a row also records how the batch was
@@ -55,14 +55,14 @@ NGL_SAME = 0
 # questions do not share an objective. Each mode pins one placement and leaves
 # exactly one knob free, and along that knob the value worth having is the one
 # at the wall - not the one that read fastest. Measured rows move 4.2% of tok/s
-# across a DOUBLING of context, and downward, so ranking a speed campaign by
-# tok/s recommends the SMALLEST window in the one mode whose whole purpose is
+# across a DOUBLING of context, and downward, so ranking a ceiling campaign by
+# tok/s recommends the SMALLEST window in the one plan whose whole purpose is
 # the largest.
 #
 # So the recommendation ranks the way the campaign PROMOTES: extreme along the
 # mode's own axis, with tok/s only settling a tie between rows at the SAME
 # value. No slack, no threshold - the largest that loaded wins even when it is
-# the slowest row on the ladder, because that is what the speed mode is FOR and
+# the slowest row on the ladder, because that is what the ceiling plan is FOR and
 # because decode moves 4.2% across a doubling of the window anyway. A row whose
 # numbers cannot be believed is removed by the spill gates (trustworthy()),
 # which read the memory counters, rather than by inferring a spill from a speed
@@ -87,25 +87,26 @@ def mode_axis(plan_result):
     but the rule is one rule and a card that ranked by another would recommend a
     config the sweep would never promote:
 
-      * SPEED pins both placements at maximum - every block on the GPU, every
-        block's dense FFN off it - so the only thing left free is the window.
-      * CONTEXT holds the window and pays for it in the cheapest currency first:
-        while every block still fits, the free knob is the -ot exile and less
-        exiled is better; once a full exile is not enough, whole blocks start
-        leaving and the free knob is -ngl. The campaign reaches the same two
-        answers in the other order - it searches -ngl first and only walks the
-        -ot exile back when every block turned out to fit - because it can
+      * the CEILING plan pins both placements at maximum - every block on the
+        GPU, every block's dense FFN off it - so the only thing left free is the
+        window.
+      * the FIT plan holds the window and pays for it in the cheapest currency
+        first: while every block still fits, the free knob is the -ot exile and
+        less exiled is better; once a full exile is not enough, whole blocks
+        start leaving and the free knob is -ngl. The campaign reaches the same
+        two answers in the other order - it searches -ngl first and only walks
+        the -ot exile back when every block turned out to fit - because it can
         MEASURE which case it is in, where this has to read it off the plan.
 
     A plan outside the two-plan regime has no mode and nothing left free: an
     MoE's --n-cpu-moe and a fits-whole plan are single answers, so they get
     (None, None) and the fastest row wins as before.
     """
-    mode = (plan_result or {}).get("plan_mode")
+    mode = norm_plan_mode((plan_result or {}).get("plan_mode"))
     plan = (plan_result or {}).get("plan") or {}
-    if mode not in ("speed", "context") or plan.get("mode") != mode:
+    if mode not in ("ceiling", "fit") or norm_plan_mode(plan.get("mode")) != mode:
         return None, None
-    if mode == "speed":
+    if mode == "ceiling":
         return "ctx", axis_direction("ctx")
     n_layers = ((plan_result or {}).get("config") or {}).get("n_layers") or 0
     if n_layers and (plan.get("n_gpu_layers") or 0) >= n_layers:
@@ -132,14 +133,15 @@ def plan_config(plan_result):
     plan = (plan_result or {}).get("plan") or {}
     inp = (plan_result or {}).get("inputs") or {}
     c = {"ngl": plan.get("n_gpu_layers"), "ncmoe": plan.get("n_cpu_moe") or 0,
-         # The -ot pin is what DEFINES both dense modes, so it has to survive
-         # into the launch script; without it the script asks for the layers of
-         # a speed plan and none of the tensor split that made them fit.
+          # The -ot pin is what DEFINES both dense plans, so it has to survive
+          # into the launch script; without it the script asks for the layers of
+          # a ceiling plan and none of the tensor split that made them fit.
          "n_cpu_ffn": plan.get("n_cpu_ffn") or 0}
-    # A speed plan's answer IS its context - the largest that fits at ngl=all with
-    # the FFN exiled - and that is generally not the number the user typed in. Take
-    # the plan's own where it has one, or every speed row is judged against a
-    # context the plan never proposed and rejected as answering another question.
+    # A ceiling plan's answer IS its context - the largest that fits at ngl=all
+    # with the FFN exiled - and that is generally not the number the user typed
+    # in. Take the plan's own where it has one, or every ceiling row is judged
+    # against a context the plan never proposed and rejected as answering
+    # another question.
     if plan.get("max_ctx") is not None:
         c["ctx"] = int(plan["max_ctx"])
     elif inp.get("context") is not None:
@@ -179,7 +181,7 @@ def _conditions_match(row, planned, free_axis=None):
 
     `free_axis` is the knob the selected category is free to move, and it is
     exempted for the same reason comparable() exempts stage A's swept axis: in
-    the SPEED mode the context is not part of what is being asked, it is the
+    the CEILING plan the context is not part of what is being asked, it is the
     answer, and gating it keeps only the rungs that happen to equal the
     planner's own guess - so the campaign measures a wall and the card then
     recommends the guess. Only ctx is ever both gated here and free; ngl and
@@ -343,7 +345,7 @@ def _stale_delta(won, planned, free_axis=None):
     """Does the winning row answer the question currently on screen?
 
     `free_axis` is exempt on the same grounds it is exempt from
-    _conditions_match: a speed plan did not ASK for a context, it proposed one,
+    _conditions_match: a ceiling plan did not ASK for a context, it proposed one,
     so a row that found a larger window is the answer improving rather than a
     stale experiment.
     """
@@ -382,7 +384,7 @@ def recommend(plan_result, rows, sweep_budget_mib=None, strict=True):
       row      the winning row, or None
       predicted the planner's own config, always
       deltas   [{kind, text}], empty when the two agree
-      mode     "speed" | "context" | None - the category this answers
+      mode     "ceiling" | "fit" | None - the category this answers
       axis     the knob that category leaves free, or None
       objective "extreme" (at the wall along `axis`) or "fastest"
       goal     the criterion in words, for the card to print
@@ -393,8 +395,8 @@ def recommend(plan_result, rows, sweep_budget_mib=None, strict=True):
     axis, direction = mode_axis(plan_result)
     out = {"source": "predicted", "config": planned, "row": None,
            "predicted": planned, "tok_s": None, "vram_mib": None,
-           "deltas": [], "n_rows": 0, "n_trusted": 0,
-           "mode": (plan_result or {}).get("plan_mode"),
+            "deltas": [], "n_rows": 0, "n_trusted": 0,
+            "mode": norm_plan_mode((plan_result or {}).get("plan_mode")),
            "axis": axis, "direction": direction,
            "objective": "extreme" if axis else "fastest",
            "goal": axis_goal(axis, direction) if axis else "the fastest row measured"}

@@ -98,18 +98,19 @@
       <div class="chips modechips" id="planmodechips" role="group"
            aria-labelledby="planmodelabel"></div>
       <p class="hint">A model too big for the card has no single best split &mdash; it has one
-        per question, and this is the question. <b>Auto</b> takes the speed plan whenever it
-        already covers the context above, and the context plan when it does not.
+        per question, and this is the question. <b>Auto</b> prices both plans at the context
+        above and takes the one it predicts faster.
         <details class="why"><summary>what each one gives up</summary>
-          <b>Speed</b> keeps every block&rsquo;s attention and KV on the GPU and exiles every
+          <b>Ceiling</b> keeps every block&rsquo;s attention and KV on the GPU and exiles every
           dense FFN to RAM (<span class="mono">-ngl all</span> +
           <span class="mono">-ot</span>): nothing is left to pay with, so the context becomes
-          whatever still fits. <b>Context</b> holds the window you typed above and walks
-          <span class="mono">-ngl</span> down until it fits, paying in layers.
+          whatever still fits. <b>Fit</b> holds the window you typed above and walks
+          <span class="mono">-ot</span> down first &mdash; then <span class="mono">-ngl</span>
+          if the full exile is not enough &mdash; paying in the least that fits.
           <br><br>The choice also decides what &ldquo;best&rdquo; means among the recorded
           measurements: the recommendation at the top of the results takes the largest
-          <em>context</em> that loaded in the speed plan, and the most <em>layers</em> (or the
-          least FFN exiled) that loaded in the context plan &mdash; not the fastest row.
+          <em>context</em> that loaded in the ceiling plan, and the least <em>exile</em>
+          (FFN first, then layers) that loaded in the fit plan &mdash; not the fastest row.
           Decode re-reads the KV for the tokens present rather than the window allocated, so
           tok/s barely moves across contexts and ranking by it ranks noise.
           <br><br>A model that fits whole, and an MoE &mdash; whose

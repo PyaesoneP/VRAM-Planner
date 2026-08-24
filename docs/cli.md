@@ -43,7 +43,7 @@ is the one worth running after a change.
 |---|---|
 | `--speed-sweep` | drive `llama-server` across a grid, recording how fast it generates |
 | `--speed-stages LETTERS` | which stages run, default `ab` — A the wall (a bisection, then the dense-FFN walk), B speculation. The old letters still work: `d` is stage B, `c` was the ubatch sweep and is now `--speed-ub` |
-| `--speed-mode auto\|speed\|context` | dense only: which question stage A answers — `speed` searches context at `-ngl` all, `context` searches `-ngl` at a fixed context. Either way it then walks the dense FFN back onto the card if the wall left room |
+| `--speed-mode auto\|ceiling\|fit` | dense only: which question stage A answers — `ceiling` keeps every block's attention and KV on the GPU with the dense FFN exiled (`-ngl` all, `-ot`) and searches context for the largest window that loads; `fit` holds the context and searches `-ngl`. Either way it then walks the dense FFN back onto the card if the wall left room. `auto` keeps the coverage rule: ceiling whenever its plan covers the requested context, otherwise fit |
 | `--speed-axes AXIS=V,V` | sweep exact values as a cross product instead of the stages |
 | `--speed-ctx N` / `--speed-kv TYPE` / `--speed-ub N` | freeze context, KV quant and physical batch for the campaign |
 | `--speed-fill TOKENS` | prompt depth to measure at — decode slows as context fills, so this conditions every row |

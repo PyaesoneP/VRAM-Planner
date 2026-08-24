@@ -906,19 +906,34 @@ PLAN_BASIS = "total"
 PLAN_RESERVE_MIB = 512
 PLAN_SAFETY_PCT = 5
 
+# Plan rows and seeds recorded before the ceiling/fit retag carry the old mode
+# names ("speed" / "context"). They map onto the new categories one-to-one; the
+# mapping is read-side only - nothing new is ever written in the old spelling.
+# bench sits below recommend in the DAG, so the shared helper lives here and
+# recommend imports it.
+_LEGACY_PLAN_MODE = {"speed": "ceiling", "context": "fit"}
+
+
+def norm_plan_mode(m):
+    """The category a recorded mode belongs to, new spelling or old."""
+    return _LEGACY_PLAN_MODE.get(m, m)
+
 
 def planner_split(model_path, c, plan_mode=None):
     """Where the planner thinks the split falls, for seeding the ladder.
 
-    Returns {ngl, ncmoe, n_cpu_ffn, max_ctx, mode} - or None if the planner could
-    not answer. `ncmoe` only means anything on an MoE, and on an MoE it is the one
-    that matters; `max_ctx` only means anything in the speed mode, where it is the
-    whole answer. See ngl_ladder().
+    Returns {ngl, ncmoe, n_cpu_ffn, max_ctx, ceiling_max_ctx, mode} - or None if
+    the planner could not answer. `ncmoe` only means anything on an MoE, and on
+    an MoE it is the one that matters; `max_ctx` is the answer of the plan that
+    was read (the ceiling plan's window). `ceiling_max_ctx` is the ceiling
+    plan's answer REGARDLESS of which plan was read - on a non-dense model the
+    two are the same number, and it is the key ngl_ladder() keys its coverage
+    rule on. See ngl_ladder().
 
-    `plan_mode` picks which of the two dense plans to read. analyze() computes both
-    regardless, so this only decides which one lands in result["plan"] - passing
-    "speed" here is what makes the ctx ladder centre on the speed plan's ceiling
-    rather than on the context plan's layer count.
+    `plan_mode` picks which of the two dense plans to read. analyze() computes
+    both regardless, so this only decides which one lands in result["plan"] -
+    passing "ceiling" here is what makes the ctx ladder centre on the ceiling
+    plan's window rather than on the fit plan's layer count.
 
     Imported here rather than at module scope only to keep the cost off the path
     of callers that never build a grid; plan sits above bench in the DAG, so the
@@ -945,10 +960,19 @@ def planner_split(model_path, c, plan_mode=None):
         pl = r.get("plan") or {}
         n = pl.get("n_gpu_layers")
         mx = pl.get("max_ctx")
+        # The ceiling plan's window, from whichever plan was read: ngl_ladder's
+        # coverage rule needs it even when the fit plan is the one on screen,
+        # and on a non-dense model the ceiling plan is the plan, so this falls
+        # back to the read plan's own max_ctx.
+        cmx = pl.get("max_ctx")
+        plans = r.get("plans") or {}
+        if "ceiling" in plans:
+            cmx = (plans["ceiling"] or {}).get("max_ctx") or cmx
         return {"ngl": int(n) if n is not None else None,
                 "ncmoe": int(pl.get("n_cpu_moe") or 0),
                 "n_cpu_ffn": int(pl.get("n_cpu_ffn") or 0),
                 "max_ctx": int(mx) if mx else None,
+                "ceiling_max_ctx": int(cmx) if cmx else None,
                 "mode": r.get("plan_mode")}
     except Exception:
         return None
@@ -968,21 +992,21 @@ def ngl_ladder(model_path, c, n_layers, is_moe=False, plan_mode=None, n_ctx_trai
     centre it - and a bracket that guessed wrong used to hide the wall
     completely. planner_split() is still asked, but only for the pins.
 
-    On a DENSE model the axis follows the PLAN MODE, because the two modes ask
+    On a DENSE model the axis follows the PLAN MODE, because the two plans ask
     different questions and the wall is a different knob in each:
-      * CONTEXT: the context is the thing being held, so whole blocks are what
+      * FIT: the context is the thing being held, so whole blocks are what
         is free. The axis is -ngl with every block's dense FFN exiled, and the
         wall is the most blocks that load. If ALL of them load there is VRAM to
         spare, and phase 2 spends it walking the FFN back on - which is the
         question this function used to answer up front, from the planner's seed,
         before anything had been measured.
-      * SPEED: every block's attention and KV stays on the GPU (-ngl all) with
+      * CEILING: every block's attention and KV stays on the GPU (-ngl all) with
         the FFN exiled, and the only thing left free is the window. The axis is
         ctx and the wall is the largest context that still loads. Same phase 2
         after it, for the same reason.
-    Searching -ngl in the speed mode would measure a config the mode does not
-    propose, and searching ctx in the context mode would sweep the one number
-    the user pinned - each is the other's mistake.
+    Searching -ngl under the ceiling plan would measure a config that plan does
+    not propose, and searching ctx under the fit plan would sweep the one
+    number the user pinned - each is the other's mistake.
 
     On an MoE it is --n-cpu-moe, and -ngl is pinned at every block. The two
     knobs are not interchangeable and the difference is most of the model:
@@ -1017,8 +1041,20 @@ def ngl_ladder(model_path, c, n_layers, is_moe=False, plan_mode=None, n_ctx_trai
         return ("ncmoe", wall_values("ncmoe", n_layers),
                 {"ngl": n_layers, "ncmoe": seed_ncm})
 
-    if (plan_mode or seed.get("mode")) == "speed":
-        # The speed mode pins BOTH placements at maximum - every block on the
+    pm = norm_plan_mode(plan_mode)
+    cmx = seed.get("ceiling_max_ctx")
+    if pm is None:
+        # auto: the campaign's own coverage rule, kept deliberately SEPARATE
+        # from the report's auto (analyze's default pick, which prices both
+        # plans at the requested context and takes the faster). Stage A ladders
+        # the axis its plan leaves free, and the ceiling plan leaves ctx free
+        # exactly when its window reaches the requested context - the same test
+        # the old auto rule ran against the speed plan, now read off the
+        # ceiling plan's window instead of the report's chosen one.
+        req = int(c.get("ctx") or 0)
+        pm = "ceiling" if (cmx is not None and cmx >= req) else "fit"
+    if pm == "ceiling":
+        # The ceiling plan pins BOTH placements at maximum - every block on the
         # GPU, every block's FFN off it - and the window is what is left free.
         pins = {"n_cpu_ffn": ffn, "ngl": n_layers}
         values = wall_values("ctx", n_layers, n_ctx_train)
@@ -1030,11 +1066,15 @@ def ngl_ladder(model_path, c, n_layers, is_moe=False, plan_mode=None, n_ctx_trai
         # not at a default context belonging to whichever model SPEED_BASE was
         # last used against. pin_ctx is False when the user froze the context by
         # hand, which is the one case where their number outranks the planner's.
+        # The seed's max_ctx is the window of the plan the REPORT read - its auto
+        # usually answers fit, whose "window" is just the requested context - so
+        # the pin takes the ceiling window first and the read plan's only as the
+        # fallback the old code got for free when report and campaign agreed.
         if pin_ctx and values:
-            pins["ctx"] = seed.get("max_ctx") or values[-1]
+            pins["ctx"] = cmx or seed.get("max_ctx") or values[-1]
         return "ctx", values, pins
 
-    # The context mode. Whole blocks are the axis and the FFN stays fully exiled
+    # The fit plan. Whole blocks are the axis and the FFN stays fully exiled
     # while they are searched; whether any of it can come back is phase 2's
     # question, answered from what phase 1 measured rather than from the seed.
     seed_ngl = seed.get("ngl")
@@ -1608,8 +1648,8 @@ CARRY_KEYS = ("ngl", "ncmoe", "n_cpu_ffn", "mmproj_offload", "spec",
 #
 # The slack was a speed judgement inside a stage that does not ask a speed
 # question, and it could decide the answer. A large context measured a little
-# slow is still the large context that fits, which is the thing the speed mode
-# exists to find; refusing it because a smaller rung read 6% faster hands back
+# slow is still the large context that fits, which is the thing the ceiling
+# plan exists to find; refusing it because a smaller rung read 6% faster hands back
 # the window to buy noise. Decode moves 4.2% across a DOUBLING of context on a
 # real 27B (74752 -> 148480 at fill 2048), so the signal it was reading is
 # almost all jitter to begin with.
@@ -1630,15 +1670,16 @@ def stage_objective(letter, stage_axis):
 
       * "extreme" - the value at the WALL: the largest that still loads, or the
         smallest on an axis where less means more resident. Stage A only. The
-        axis is the mode's own - context in the dense speed plan, -ngl in the
-        context plan, --n-cpu-moe on an MoE - or n_cpu_ffn in phase 2, which
+        axis is the plan's own - context under the dense ceiling plan, -ngl
+        under the fit plan, --n-cpu-moe on an MoE - or n_cpu_ffn in phase 2,
+        which
         the caller passes explicitly.
       * "fastest" - highest tok/s. Stage B only, and it is the whole point
         there: a draft scheme's worth is its acceptance rate, which nothing
         about the config predicts and no ordering of depths implies.
 
     The distinction matters most where it was doing damage: ranking stage A by
-    tok/s in the speed mode promoted the SMALLEST context on the ladder, because
+    tok/s under the ceiling plan promoted the SMALLEST context on the ladder, because
     a smaller window is a hair faster and the margin never saw the difference as
     real."""
     if letter == "a":
@@ -1654,8 +1695,8 @@ def carry_keys(swept=""):
     definition, and a stage that changed one of them would be answering a
     different question than the one being asked.
 
-    ctx moves across that line in the dense SPEED mode, and only there: stage A
-    sweeps it, so it stops being the question and becomes the answer."""
+    ctx moves across that line under the dense ceiling plan, and only there:
+    stage A sweeps it, so it stops being the question and becomes the answer."""
     return CARRY_KEYS + (("ctx",) if swept == "ctx" else ())
 
 # Below this fraction of unique 8-word windows the output is repetition, not
@@ -1729,8 +1770,8 @@ def comparable(r, model, base, n_predict=None, repeat=None, prompt_id=None,
 
     `swept` names the axis stage A is LADDERING, and exists for exactly one case.
     Context is normally part of what a campaign IS - two contexts are two
-    experiments, not two configs - which is why it is gated here. In the dense
-    SPEED mode it is instead what stage A goes looking for, and gating it there
+    experiments, not two configs - which is why it is gated here. Under the dense
+    ceiling plan it is instead what stage A goes looking for, and gating it there
     rejects every rung of the ladder but the one that happens to equal the
     opening baseline: the campaign would measure a wall and then promote the
     planner's guess. Only an axis stage A actually sweeps may be un-gated, and
@@ -1987,8 +2028,8 @@ def resolve_rounds(chain, rounds):
 
 
 def _carry_summary(c):
-    # `ctx` leads because it is a wall axis like the rest - stage A's own in
-    # the dense speed mode, and one of the two the draft walk gives back. Without
+    # `ctx` leads because it is a wall axis like the rest - stage A's own under
+    # the dense ceiling plan, and one of the two the draft walk gives back. Without
     # it the walk printed the same line at every rung it reached, the context
     # being the only thing that had changed.
     s = ("ctx %s ngl %s ncmoe %s ub %s spec %s"
@@ -2265,7 +2306,7 @@ def speed_sweep(models=None, backend=None, dry_run=False, timeout=420.0,
 
     # Which stages, in campaign order, translating the letters the campaign used
     # to have. Resolved before anything reads `stages` - the extra-fills check
-    # and the speed-mode ctx note both do, and both would answer for a stage
+    # and the ceiling-mode ctx note both do, and both would answer for a stage
     # list nobody asked for.
     stages, snotes = resolve_stages(stages)
     for n in snotes:
@@ -2352,14 +2393,14 @@ def speed_sweep(models=None, backend=None, dry_run=False, timeout=420.0,
             "note    : dense FFN pinned to 0 blocks on CPU by hand - every "
             "block's FFN stays on the card, and stage A's phase 2 is off "
             "because that pin is the answer it would have searched for")
-    # The speed mode's whole job is to FIND the largest context that loads, so a
-    # frozen context contradicts it. Refused out loud rather than silently
+    # The ceiling plan's whole job is to FIND the largest context that loads, so
+    # a frozen context contradicts it. Refused out loud rather than silently
     # sweeping one rung, the way resolve_search() refuses chain-plus-axes.
-    if plan_mode == "speed" and ctx is not None and "a" in (stages or ""):
-        log("note    : --speed-mode speed sweeps CONTEXT to find the wall, so "
+    if norm_plan_mode(plan_mode) == "ceiling" and ctx is not None and "a" in (stages or ""):
+        log("note    : --speed-mode ceiling sweeps CONTEXT to find the wall, so "
             "--speed-ctx %d cannot freeze stage A" % int(ctx))
         log("          A ladders the window anyway; %d is what the later stages "
-            "sit at. Planning FOR a fixed context is --speed-mode context"
+            "sit at. Planning FOR a fixed context is --speed-mode fit"
             % int(ctx))
     gb0, gnl0, gmoe0, stage_axis, gvals0 = grid_context(
         facts, mmproj=mmproj, base=base, model_path=mp, drafter=drafter,
@@ -2661,8 +2702,8 @@ def speed_sweep(models=None, backend=None, dry_run=False, timeout=420.0,
                             and limit is None):
                         extras_done[0] = True
                         # The axis stage A actually searched. Hardcoding
-                        # ngl/ncmoe here was wrong in the speed mode, where ngl
-                        # is PINNED at every block: every "rung" read the same
+                        # ngl/ncmoe here was wrong under the ceiling plan,
+                        # where ngl is PINNED at every block: every "rung" read the same
                         # value and the top three collapsed to one, so a
                         # --speed-fills campaign measured one depth row instead
                         # of three.
@@ -2833,8 +2874,8 @@ def speed_sweep(models=None, backend=None, dry_run=False, timeout=420.0,
             stop has rows this process never saw, and they are exactly the ones
             that say where the previous stage got to.
 
-            `gb_`, NOT `base`. comparable() gates ctx, and in the dense SPEED
-            mode nobody pinned one - the campaign opens at SPEED_BASE's context
+            `gb_`, NOT `base`. comparable() gates ctx, and under the dense
+            ceiling plan nobody pinned one - the campaign opens at SPEED_BASE's context
             and stage A goes looking for the real wall. `base` still says the
             opening value afterwards; `gb_` is the baseline this stage actually
             ran at, so it carries what A found. Comparing measured rows against
@@ -3062,7 +3103,7 @@ def speed_sweep(models=None, backend=None, dry_run=False, timeout=420.0,
 # had to and then measure the whole depth ladder at a context it never needed
 # to give up. Fewer loads, worse answers.
 
-# In the dense SPEED mode the walk frees VRAM by giving back CONTEXT, and a
+# Under the dense ceiling plan the walk frees VRAM by giving back CONTEXT, and a
 # context rung cannot be "one less" the way a layer can - the axis runs to six
 # figures. Each rung gives back this share of the window, snapped to
 # CTX_STEP so the rungs read as sizes a person would type.
@@ -3092,9 +3133,10 @@ def _spec_axis(facts, plan_mode):
     """The three-way axis rule, for a caller that has a mode but no resolved axis.
 
     The walk has to move the knob the plan left free, or it measures a config the
-    plan never proposed. In the dense SPEED mode -ngl is pinned at every block -
-    that pin IS the mode - so walking it down would trade the whole regime away to
-    fit a draft cache, and report the result as speculation working here.
+    plan never proposed. Under the dense CEILING plan -ngl is pinned at every
+    block - that pin IS the plan - so walking it down would trade the whole
+    regime away to fit a draft cache, and report the result as speculation
+    working here.
 
     speed_sweep() does NOT use this: it resolves the axis once from grid_context()
     and passes it down. Under --speed-mode auto the mode is whichever plan the
@@ -3103,7 +3145,7 @@ def _spec_axis(facts, plan_mode):
     campaign never varied."""
     if facts.get("is_moe"):
         return "ncmoe"
-    return "ctx" if plan_mode == "speed" else "ngl"
+    return "ctx" if norm_plan_mode(plan_mode) == "ceiling" else "ngl"
 
 
 def _draft_depths(spec, drafter=None):
@@ -3156,7 +3198,7 @@ def _spec_give_back(c, facts, axis):
     blocks back onto the card, so wherever it ran, those blocks ARE the
     headroom. They are also the cheapest thing in the config to give back: they
     were bought with the leftover, and buying them was worth a few per cent.
-    The context is not cheap - in the speed mode it is what the campaign went
+    The context is not cheap - under the ceiling plan it is what the campaign went
     looking for, the number the whole thing reports.
 
     Measured, Muse-Glimmer-30B at ngl 52 on a 5070 Ti Laptop with 11.5 GiB free.
@@ -3210,8 +3252,8 @@ def _spec_retry(c, row, facts, tries, drafter=None, axis=None):
     phase 2 pulled onto the card, wherever it pulled any, because those are the
     leftover VRAM in a form that can be handed straight back. Only when every
     block is exiled again does the walk fall through to stage A's own axis -
-    higher n_cpu_moe on an MoE, lower ngl for a dense CONTEXT plan, lower
-    CONTEXT for a dense SPEED plan, whose -ngl is pinned at every block and is
+    higher n_cpu_moe on an MoE, lower ngl for a dense fit plan, lower
+    CONTEXT for a dense ceiling plan, whose -ngl is pinned at every block and is
     not the campaign's to spend.
 
     The depth ladder is nested inside each rung, ascending:
@@ -3315,9 +3357,9 @@ def _spec_wall_note(out, todo, base, log, facts=None):
     moe = base.get("ncmoe") is not None and base.get("ncmoe") != 0
     # The ladder to suggest is the one the WALK would have spent, or the advice
     # contradicts the eight OOM lines printed directly above it. On a dense
-    # config carrying FFN blocks on the card, that is -ot: in the speed mode
-    # -ngl is pinned at every block, so an ngl ladder there proposes leaving the
-    # mode rather than making room inside it.
+    # config carrying FFN blocks on the card, that is -ot: under the ceiling
+    # plan -ngl is pinned at every block, so an ngl ladder there proposes
+    # leaving the plan rather than making room inside it.
     give = _spec_give_back(base, facts or {}, "ncmoe" if moe else "ngl")
     axis = give if give == "n_cpu_ffn" else ("ncmoe" if moe else "ngl")
     cur = base.get(axis)
@@ -3345,7 +3387,7 @@ def _spec_wall_note(out, todo, base, log, facts=None):
 
 
 def _fmt_row(c, row, i=None, n=None):
-    # `ctx` is in the table because in the dense SPEED mode it is stage A's
+    # `ctx` is in the table because under the dense ceiling plan it is stage A's
     # AXIS - the one number the whole campaign is looking for. Without it every
     # probe of that search printed an identical line, and the ladder read as the
     # same config measured seven times.

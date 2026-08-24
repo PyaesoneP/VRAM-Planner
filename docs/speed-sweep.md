@@ -111,8 +111,8 @@ Which knob the wall is made of depends on the question being asked (`--speed-mod
 
 | model / mode | pinned | phase 1 searches | the wall is |
 |---|---|---|---|
-| dense, `--speed-mode speed` | `-ngl` all, `-ot` all blocks | **context** | the largest window that loads |
-| dense, `--speed-mode context` | context, `-ot` all blocks | **`-ngl`** | the most blocks that load |
+| dense, `--speed-mode ceiling` | `-ngl` all, `-ot` all blocks | **context** | the largest window that loads |
+| dense, `--speed-mode fit` | context, `-ot` all blocks | **`-ngl`** | the most blocks that load |
 | MoE | `-ngl` all | **`--n-cpu-moe`** | the smallest expert offload that loads |
 
 **"Loads" means `status: ok` and nothing else.** Not fastest, not "fast enough", not
@@ -273,11 +273,11 @@ same one at both stages.
 
 | stage | promotes | why |
 |---|---|---|
-| **A** phase 1 | the value at the **wall** — largest `ctx` (speed mode), largest `-ngl` (context mode), smallest `--n-cpu-moe` (MoE) | the axis is monotone in VRAM, so the value at the wall is the one worth having |
+| **A** phase 1 | the value at the **wall** — largest `ctx` (ceiling plan), largest `-ngl` (fit plan), smallest `--n-cpu-moe` (MoE) | the axis is monotone in VRAM, so the value at the wall is the one worth having |
 | **A** phase 2 | the **smallest `-ot` exile** that loads | fewer FFN blocks in RAM is more resident, and phase 1 proved there was room |
 | **B** | the **fastest** row, by more than 2% | a draft scheme's worth is its acceptance rate, and no ordering of depths implies it |
 
-Stage A used to rank by tok/s like stage B, and on the speed mode that was actively wrong.
+Stage A used to rank by tok/s like stage B, and on the ceiling plan that was actively wrong.
 Decode re-reads the KV for the tokens actually **present** (`fill`), not for the window
 that was *allocated*, so tok/s across a context ladder is nearly flat — measured rows on a
 27B dense model move **4.2% across a doubling of context**, and downward. Fastest-wins
@@ -334,7 +334,7 @@ Three rules make it safe:
 
 What actually carries forward is a fixed set of knobs — `ngl`, `ncmoe`, `n_cpu_ffn`, the
 projector's placement and the speculation triple (`spec`, `spec_n_max`, `md`) — plus `ctx`
-in the speed mode. Everything else a row carries is the campaign's *definition* rather than
+in the ceiling plan. Everything else a row carries is the campaign's *definition* rather than
 its result, and a stage that changed one of those would be answering a different question
 than the one being asked. **`ub` moved across that line when stage C was retired**, and it
 had to move in both lists at once: out of what carries, and into what a comparison gates
@@ -434,8 +434,8 @@ card. Run stage A at two or three contexts, pick the shortest you can live with,
 tune everything else there.
 
 ```
-python -m vram_planner --speed-sweep --models MODEL --speed-ctx 32768  --speed-stages a --speed-mode context
-python -m vram_planner --speed-sweep --models MODEL --speed-ctx 131072 --speed-stages a --speed-mode context
+python -m vram_planner --speed-sweep --models MODEL --speed-ctx 32768  --speed-stages a --speed-mode fit
+python -m vram_planner --speed-sweep --models MODEL --speed-ctx 131072 --speed-stages a --speed-mode fit
 ```
 
 Quantising the KV cache buys layers the same way (`q8_0` is about half of `f16`) and
@@ -502,11 +502,11 @@ The alternative: keep every block on the GPU and pin the **dense FFN tensors**
 -ot "blk\.(0|1|2)\.ffn_(gate|up|down)\.weight=CPU"
 ```
 
-**Both dense plan modes pin this at every block.** That is the point: FFN weights are the
-cheap thing to exile (they stream once per token either way) and KV is the expensive thing
-to lose, so exiling the FFN is what buys either the window (speed mode) or the layers
-(context mode). The modes then differ only in which of those two is held and which is
-solved for.
+**Both dense plans pin this at every block in phase 1.** That is the point: FFN weights
+are the cheap thing to exile (they stream once per token either way) and KV is the
+expensive thing to lose, so exiling the FFN is what buys either the window (ceiling
+plan) or the layers (fit plan). The plans then differ only in which of those two is held
+and which is solved for.
 
 Because the pin is fixed for phase 1, the old stage E that swept it from a planner seed is
 gone. What was a real question in it — how much FFN can come back once the wall is known —
@@ -548,7 +548,7 @@ present), and they are worth far less.
 | `--dry-run` | print the configs and estimate, run nothing |
 | `--models NAME` | substring match on the file name |
 | `--speed-stages ab` | which stages to run (`a` the wall, `b` speculation). The old letters still work: `d` is stage B, `c` was the ubatch sweep and is now `--speed-ub` |
-| `--speed-mode auto\|speed\|context` | dense only: which question stage A answers (§5) |
+| `--speed-mode auto\|ceiling\|fit` | dense only: which question stage A answers (§5). `auto` is the coverage rule — ceiling ladders context whenever its plan covers the requested context, fit ladders layers otherwise — not the report's faster-at-your-context pick |
 | `--speed-ctx N` / `--speed-kv TYPE` / `--speed-ub N` | freeze context / KV quant / physical batch |
 | `--speed-fill N` | prompt length to measure at |
 | `--speed-fills N N …` | first value = campaign fill; the rest re-measure the top stage-A rungs at deeper fills (§3). Refuses to combine with `--speed-fill` |
@@ -700,7 +700,7 @@ A  131072  32   0     8    512   2048     none          0    vram   |     8.10  
 
 | column | meaning |
 |---|---|
-| `ctx` | the window the row was loaded with — stage A's own axis in the dense speed mode, so a search over it reads as a column rather than as one config measured seven times |
+| `ctx` | the window the row was loaded with — stage A's own axis in the dense ceiling plan, so a search over it reads as a column rather than as one config measured seven times |
 | `ot` | blocks whose dense FFN tensors are pinned to the CPU (`-ot`) — every block in phase 1 of either dense plan mode, and whatever phase 2 walked it back to |
 | `tok/s` | **median of `--repeat` cache-warm passes** — pure decode |
 | `prefill` | from one cold pass, `cache_prompt` off |
@@ -800,14 +800,14 @@ the same: **whatever phase 2 just spent.**
 | dense FFN blocks on the card (`-ot` below every block) | **`-ot`** | one more block's FFN back on the CPU |
 | …and then, once every block is exiled again | stage A's own axis, below | |
 | MoE | `--n-cpu-moe` | one more block's experts on the CPU |
-| dense, `--speed-mode context` | `-ngl` | one fewer block on the GPU |
-| dense, `--speed-mode speed` | context | a tenth of the window, snapped down to a multiple of 1024 |
+| dense, `--speed-mode fit` | `-ngl` | one fewer block on the GPU |
+| dense, `--speed-mode ceiling` | context | a tenth of the window, snapped down to a multiple of 1024 |
 
 Phase 2 exists to spend the VRAM phase 1 left over, on pulling dense FFN blocks back onto
 the card. So wherever it ran, those blocks **are** the headroom, in a form that can be
 handed straight back — and handing one back costs a few per cent of decode, which is what
 buying it was worth in the first place. The context is not cheap in the same way: in the
-speed mode it is what the campaign went looking for, the number the whole thing reports.
+ceiling plan it is what the campaign went looking for, the number the whole thing reports.
 
 This is not a preference between two levers. On Muse-Glimmer-30B at `-ngl 52`, on a
 5070 Ti Laptop with 11.5 GiB free, **one FFN block is ~214 MiB** while **one context rung
@@ -820,11 +820,11 @@ it was walking, and it gave back the answer to fail.
 
 Once every block is exiled again, what is left is exactly the config phase 1 promoted, so
 the walk carries on down stage A's own axis from there — the rungs it would have walked
-had phase 2 never run, which is where the old walk *started*. In the speed mode that is
+had phase 2 never run, which is where the old walk *started*. In the ceiling plan that is
 context, granularly: a tenth per rung is enough that two or three rungs cover a draft
 cache of a few hundred MiB against a KV cache of a few thousand, and coarser steps would
-hand back gigabytes of window to buy back megabytes. In the speed mode `-ngl` itself is
-never spent — it is pinned at every block, and that pin *is* the mode.
+hand back gigabytes of window to buy back megabytes. In the ceiling plan `-ngl` itself is
+never spent — it is pinned at every block, and that pin *is* the plan.
 
 **There is no rung budget.** The walk goes until a rung fits or the axis runs out — the
 only stopping rule that matches the question it is asking. "Does speculation fit anywhere

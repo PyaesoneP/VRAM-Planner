@@ -1,5 +1,5 @@
 """Synthetic GGUF writer and the self-test suite."""
-import os, struct
+import inspect, os, struct
 from .const import _mib
 from .gguf import GGML_TYPES, _parse_one, load_gguf
 from .model import RE_EXPS, classify_tensors, extract_config
@@ -7,6 +7,7 @@ from .compute import CB_CUDA_CTX_MIB, CB_DEFAULTS, CB_SPLIT_GRAPH_MIB, CB_SPLIT_
 from .lmstudio import REF_GPU, current_backend, read_lmstudio_runtime, resolve_runtime_ngl
 from .calib import CALIB_SCHEMA, CALIB_TERMS, _CALIB_CACHE, _active_gpu, _design, _struct_offset, calib_coeffs, fit_calibration, mark_unreliable
 from .plan import analyze, find_mmproj
+from . import plan as _plan
 from .speed import estimate_speed
 
 
@@ -954,7 +955,7 @@ def _run_suite(require_refs, tmp, skipped_real):
     #    question, so analyze() computes BOTH and reports one: the CEILING plan
     #    pins every block on the GPU with the dense FFN exiled (-ngl all, -ot all)
     #    and solves for the largest context; the FIT plan holds the context and
-    #    walks -ot (then -ngl) down to the least exile that fits.
+    #    searches the (blocks-on-GPU, FFN-exile) grid for the most resident bytes.
     def _two(**kw):
         return analyze(p2, 4096, "f16", 512, False, vram_budget_mib=30,
                        ram_budget_mib=8000, gpu_reserve_mib=0,
@@ -973,14 +974,16 @@ def _run_suite(require_refs, tmp, skipped_real):
               and ceil_plan.get("n_cpu_ffn") == nL2
               and fit_plan.get("kind") == "dense_fit"
               and fit_plan.get("max_ctx") == 4096
-              # the fit plan pays in the CHEAPEST currency first: it exiles
-              # only as much dense FFN as it has to, and gives the rest back to
-              # the GPU. Whole blocks move only when a full exile is not enough.
-              and 0 <= (fit_plan.get("n_cpu_ffn") or 0) <= nL2
-              and (fit_plan.get("n_gpu_layers") == nL2
-                   or fit_plan.get("n_cpu_ffn") == nL2)
-              # the exiled FFN must be charged to the CPU side of the roofline
-              and sk.get("cpu_mib", 0) > 0
+               # the fit plan is the ARGMAX of VRAM-resident bytes over the
+               # whole (ngl, exile) grid, subject to holding the context -
+               # usually an INTERIOR point (a few blocks off the GPU and less
+               # FFN exiled) that beats both corners, not a corner itself.
+               # GRID-INT pins the argmax itself against a brute force.
+               and 0 <= (fit_plan.get("n_gpu_layers") or 0) <= nL2
+               and 0 <= (fit_plan.get("n_cpu_ffn") or 0) <= nL2
+               and (fit_plan.get("vram_ok") or fit_plan.get("kv_overflow"))
+               # the exiled FFN must be charged to the CPU side of the roofline
+               and sk.get("cpu_mib", 0) > 0
               and rk["plan"] is pl[rk["plan_mode"]])
     print("  2PLAN  ceiling ngl=%s ffn=%s max_ctx=%s | fit ngl=%s ffn=%s | reported=%s  %s"
           % (ceil_plan.get("n_gpu_layers"), ceil_plan.get("n_cpu_ffn"),
@@ -988,23 +991,29 @@ def _run_suite(require_refs, tmp, skipped_real):
              fit_plan.get("n_cpu_ffn"),
              rk.get("plan_mode"), "OK" if two_ok else "FAIL"))
     ok = ok and two_ok
-    # 5aa) The fit plan's FFN give-back, which is the dense answer to the
-    #      MoE expert split: exiling FFN frees VRAM without costing any KV, so
-    #      with every block on the GPU the search wants the SMALLEST exile that
-    #      fits. A bigger card must therefore keep MORE FFN in VRAM, never less
-    #      - the old planner pinned every block unconditionally and left the
-    #      spare VRAM unused while streaming those weights over PCIe per token.
+    # 5aa) Give-back, now carried by min_sacrifice - the old row's answer
+    #      (every block on the GPU, the least FFN exile that still held the
+    #      context) survives inside the fit plan. That row must stay monotone:
+    #      a bigger card exiles no more, and here it exiles strictly less -
+    #      otherwise the give-back is not happening at all. The grid's point,
+    #      whenever it leaves the row, keeps at least as many bytes resident:
+    #      the row is one of the grid's points.
     ffn_at = []
     for budget in (30, 60, 120, 400):
         rr = analyze(p2, 4096, "f16", 512, False, vram_budget_mib=budget,
                      ram_budget_mib=8000, gpu_reserve_mib=0, compute_override_mib=5,
                      safety_pct=0, plan_mode="fit")
         cp = (rr.get("plans") or {}).get("fit") or rr["plan"]
-        ffn_at.append((budget, cp.get("n_gpu_layers"), cp.get("n_cpu_ffn") or 0))
-    # more VRAM must never mean MORE exiled, and somewhere it must mean less -
-    # otherwise the give-back is not happening at all
-    give_ok = all(a[2] >= b[2] for a, b in zip(ffn_at, ffn_at[1:]))
-    give_ok = give_ok and ffn_at[0][2] > ffn_at[-1][2]
+        ms = cp.get("min_sacrifice") or {}
+        ffn_at.append((budget, ms.get("n_cpu_ffn") or 0,
+                       (cp.get("gpu_weights_mib") or 0) + (cp.get("gpu_kv_mib") or 0)
+                       + (cp.get("gpu_recurrent_mib") or 0),
+                       ms.get("resident_mib") or 0, bool(ms.get("vram_ok"))))
+    give_ok = all(a[1] >= b[1] for a, b in zip(ffn_at, ffn_at[1:]))
+    give_ok = give_ok and ffn_at[0][1] > ffn_at[-1][1]
+    give_ok = give_ok and all(
+        (not row_ok) or res >= row_res - 1e-6
+        for _, _, res, row_res, row_ok in ffn_at)
     # ...and the emitted -ot count is the plan's, not a hardcoded "all blocks"
     rr = analyze(p2, 4096, "f16", 512, False, vram_budget_mib=60, ram_budget_mib=8000,
                  gpu_reserve_mib=0, compute_override_mib=5, safety_pct=0,
@@ -1012,10 +1021,221 @@ def _run_suite(require_refs, tmp, skipped_real):
     cp = (rr.get("plans") or {}).get("fit") or rr["plan"]
     cmd = cp.get("llama_cmd") or ""
     give_ok = give_ok and (("-ot" in cmd) == bool(cp.get("n_cpu_ffn")))
-    print("  2PLAN  fit plan gives FFN back as VRAM allows: %s  %s"
-          % (" ".join("%s->ot%s" % (b, f) for b, _, f in ffn_at),
+    print("  2PLAN  fit row exiles less as VRAM grows; grid keeps >= row resident: %s  %s"
+          % (" ".join("%s->ot%s" % (b, f) for b, f, _, _, _ in ffn_at),
              "OK" if give_ok else "FAIL"))
     ok = ok and give_ok
+
+    # GRID-INT: the fit plan is the ARGMAX of VRAM-resident bytes over the
+    #    whole (ngl, exile) grid, subject to holding the context. Brute-force
+    #    the grid with the same O(n) cost the planner builds with, and compare:
+    #    the plan must BE the argmax (ties to more layers, less exile), it must
+    #    be an INTERIOR point at this budget - both corners leave bytes on the
+    #    table here - and it must keep at least the row's resident bytes. The
+    #    planner's inputs are captured with a wrapper, restored afterwards.
+    _cap = {}
+    _orig_fit = _plan._plan_dense_fit
+
+    def _wrap_fit(*_a, **_k):
+        _b = inspect.signature(_orig_fit).bind(*_a, **_k)
+        _b.apply_defaults()
+        _cap["fit"] = tuple(_b.arguments.values())
+        return _orig_fit(*_a, **_k)
+
+    _plan._plan_dense_fit = _wrap_fit
+    try:
+        rg = _two()
+    finally:
+        _plan._plan_dense_fit = _orig_fit
+    def _dense_argmax(args, nLx):
+        """Brute-force argmax of the dense fit grid, priced with the O(n) build."""
+        (cfg, cl, eff, _ram, kv_t, _w, _e, _o, rec_t, _mxg, _ctxg, kvt,
+         _fa, nsg, comp, gx, lmax, lmean, fmean) = args
+        def _pt(ngl, f):
+            cost = _plan._dense_cost(cfg, cl, ngl, f, lmax, lmean, fmean)
+            cb = (comp(ngl, any_on_cpu=graph_is_split(nLx, ngl, 0, f))
+                  if comp else {"gpu": 0.0, "cpu": 0.0})
+            ew = cost["gpu_block_mib"] + gx(ngl)
+            if ngl >= nLx:
+                gk, gr = kv_t, rec_t
+            else:
+                gk = _mib(_plan.kv_bytes_total(cfg, kvt, cost["on_gpu"]))
+                gr = _mib(_plan.recurrent_bytes(cfg, cost["on_gpu"], nsg))
+            return ew + gk + gr + cb["gpu"], ew + gk + gr
+        best = None
+        for ngl in range(nLx + 1):
+            for f in range(nLx + 1):
+                v, r = _pt(ngl, f)
+                if v <= eff and (best is None or (r, ngl, -f) > best[0]):
+                    best = ((r, ngl, -f), ngl, f)
+        return None if best is None else (best[1], best[2])
+
+    exp = _dense_argmax(_cap["fit"], nL2)
+    fit2 = (rg.get("plans") or {}).get("fit") or {}
+    got = (fit2.get("n_gpu_layers"), fit2.get("n_cpu_ffn") or 0)
+    grid_ok = (exp is not None and exp == got and bool(fit2.get("vram_ok")))
+    grid_ok = grid_ok and 0 < got[0] < nL2 and 0 < got[1] < nL2
+    ms2 = fit2.get("min_sacrifice") or {}
+    if ms2.get("vram_ok"):
+        grid_ok = grid_ok and (
+            (fit2.get("gpu_weights_mib") or 0) + (fit2.get("gpu_kv_mib") or 0)
+            + (fit2.get("gpu_recurrent_mib") or 0)
+            >= ms2.get("resident_mib", 0) - 1e-6)
+    print("  GRID-INT argmax=(%d,%d) interior, beats both corners at this budget  %s"
+          % (got[0], got[1], "OK" if grid_ok else "FAIL"))
+    ok = ok and grid_ok
+
+    # GRID-MOE: the same argmax on the expert split. Brute-force the
+    #    (ngl, n-cpu-moe) grid with the same O(n) walk cost() uses and the
+    #    plan must be the argmax - here an interior point wins: a few CPU
+    #    blocks whose experts stay GPU-resident beat all-experts-CPU.
+    _capm = {}
+    _orig_moe = _plan._plan_moe
+
+    def _wrap_moe(*_a, **_k):
+        _b = inspect.signature(_orig_moe).bind(*_a, **_k)
+        _b.apply_defaults()
+        _capm["moe"] = tuple(_b.arguments.values())
+        return _orig_moe(*_a, **_k)
+
+    _plan._plan_moe = _wrap_moe
+    try:
+        rm = analyze(p3, 4096, "f16", 512, False, vram_budget_mib=60,
+                     ram_budget_mib=8000, gpu_reserve_mib=0,
+                     compute_override_mib=5, safety_pct=0, plan_mode="fit")
+    finally:
+        _plan._plan_moe = _orig_moe
+    gm_args = _capm["moe"]
+    (gm_cfg, gm_cl, gm_eff, _gm_ram, gm_kvt, _gm_kvl, gm_comp0, _gm_w,
+     _gm_etc, _gm_elm, _gm_lmax, _gm_lmean, _gm_ff, _gm_fn, _gm_mc,
+     _gm_ctx, gm_kvt2, _gm_fa) = gm_args[:18]
+    _gm_kw = dict(zip(("rec_total", "n_seq", "ngl_override",
+                       "n_cpu_moe_override", "embed", "output", "compute_fn"),
+                      gm_args[18:25]))
+    gm_nL = gm_cfg["n_layers"]
+    gm_ply = gm_cl.get("per_layer_bytes") or {}
+    gm_pex = gm_cl.get("per_layer_expert_bytes") or {}
+
+    def _moe_pt(ngl, m):
+        on = list(range(gm_nL - ngl, gm_nL))
+        on_set = set(on)
+        gw = 0.0
+        for i in range(gm_nL):
+            b = gm_ply.get(i, 0)
+            e = gm_pex.get(i, 0)
+            if i in on_set:
+                # experts of the first n-cpu-moe blocks are pinned to the CPU
+                gw += (b - e) if i < m else b
+        gw = _mib(gw)
+        gk = _mib(_plan.kv_bytes_total(gm_cfg, gm_kvt2, on))
+        gr = _mib(_plan.recurrent_bytes(gm_cfg, on, _gm_kw["n_seq"]))
+        cb = (_gm_kw["compute_fn"](ngl, any_on_cpu=graph_is_split(gm_nL, ngl, m))
+              if _gm_kw["compute_fn"] else {"gpu": gm_comp0, "cpu": 0.0})
+        return gw + gk + gr + cb["gpu"], gw + gk + gr
+
+    gm_best = None
+    for ngl in range(gm_nL + 1):
+        for m in range(gm_nL + 1):
+            v, r = _moe_pt(ngl, m)
+            if v <= gm_eff and (gm_best is None or (r, ngl, -m) > gm_best[0]):
+                gm_best = ((r, ngl, -m), ngl, m)
+    pm = (rm.get("plans") or {}).get("fit") or rm["plan"]
+    gotm = (pm.get("n_gpu_layers"), pm.get("n_cpu_moe") or 0)
+    moe_ok = (gm_best is not None and (gm_best[1], gm_best[2]) == gotm
+              and bool(pm.get("vram_ok")))
+    moe_ok = moe_ok and 0 < gotm[0] < gm_nL and 0 < gotm[1] < gm_nL
+    print("  GRID-MOE argmax=(%d,%d) interior, beats all-experts-CPU  %s"
+          % (gotm[0], gotm[1], "OK" if moe_ok else "FAIL"))
+    ok = ok and moe_ok
+
+    # GRID-DOM: heterogeneous blocks. Layers are not interchangeable - the
+    #    FFN widths alternate here - so the suffix sums must index the REAL
+    #    per-layer bytes, and the plan must still be the brute-force argmax.
+    gm_dom_t = [("token_embd.weight", [hid, 4000], 12)]
+    for i in range(nL):
+        ffn_d = 1536 if i % 2 == 0 else 512
+        gm_dom_t += [
+            ("blk.%d.attn_q.weight" % i, [hid, hid], 12),
+            ("blk.%d.attn_k.weight" % i, [hid, nkv * hd], 12),
+            ("blk.%d.attn_v.weight" % i, [hid, nkv * hd], 12),
+            ("blk.%d.attn_output.weight" % i, [hid, hid], 12),
+            ("blk.%d.ffn_gate.weight" % i, [hid, ffn_d], 12),
+            ("blk.%d.ffn_up.weight" % i, [hid, ffn_d], 12),
+            ("blk.%d.ffn_down.weight" % i, [ffn_d, hid], 12),
+            ("blk.%d.attn_norm.weight" % i, [hid], 0),
+            ("blk.%d.ffn_norm.weight" % i, [hid], 0),
+        ]
+    gm_dom_t += [("output_norm.weight", [hid], 0), ("output.weight", [hid, 4000], 14)]
+    pdom = os.path.join(tmp, "dom.gguf")
+    _write_gguf(pdom, {"llama.block_count": nL, "llama.attention.head_count": nh,
+                       "llama.attention.head_count_kv": nkv,
+                       "llama.embedding_length": hid,
+                       "llama.context_length": 8192,
+                       "llama.feed_forward_length": 1536},
+                {"general.architecture": "llama", "general.name": "DomGrid"},
+                gm_dom_t)
+    _capd = {}
+    _orig_dom = _plan._plan_dense_fit
+
+    def _wrap_dom(*_a, **_k):
+        _b = inspect.signature(_orig_dom).bind(*_a, **_k)
+        _b.apply_defaults()
+        _capd["fit"] = tuple(_b.arguments.values())
+        return _orig_dom(*_a, **_k)
+
+    _plan._plan_dense_fit = _wrap_dom
+    try:
+        rd = analyze(pdom, 4096, "f16", 512, False, vram_budget_mib=28,
+                     ram_budget_mib=8000, gpu_reserve_mib=0,
+                     compute_override_mib=5, safety_pct=0, plan_mode="fit")
+    finally:
+        _plan._plan_dense_fit = _orig_dom
+    dom_exp = _dense_argmax(_capd["fit"], nL)
+    dom_p = (rd.get("plans") or {}).get("fit") or rd["plan"]
+    dom_got = (dom_p.get("n_gpu_layers"), dom_p.get("n_cpu_ffn") or 0)
+    dom_ok = (dom_exp is not None and dom_exp == dom_got
+              and bool(dom_p.get("vram_ok")))
+    print("  GRID-DOM heterogeneous blocks, argmax=(%d,%d) matches brute force  %s"
+          % (dom_got[0], dom_got[1], "OK" if dom_ok else "FAIL"))
+    ok = ok and dom_ok
+
+    # GRID-PERF: the full grid must stay in the milliseconds on a real-sized
+    #    model - 126 layers, 16k grid points, O(1) pricing via suffix sums.
+    #    A regression to pricing every point with the O(n) build would take
+    #    seconds, not tens of milliseconds.
+    gm_big_t = [("token_embd.weight", [hid, 4000], 12)]
+    for i in range(126):
+        gm_big_t += [
+            ("blk.%d.attn_q.weight" % i, [hid, hid], 12),
+            ("blk.%d.attn_k.weight" % i, [hid, nkv * hd], 12),
+            ("blk.%d.attn_v.weight" % i, [hid, nkv * hd], 12),
+            ("blk.%d.attn_output.weight" % i, [hid, hid], 12),
+            ("blk.%d.ffn_gate.weight" % i, [hid, 1536], 12),
+            ("blk.%d.ffn_up.weight" % i, [hid, 1536], 12),
+            ("blk.%d.ffn_down.weight" % i, [1536, hid], 12),
+            ("blk.%d.attn_norm.weight" % i, [hid], 0),
+            ("blk.%d.ffn_norm.weight" % i, [hid], 0),
+        ]
+    gm_big_t += [("output_norm.weight", [hid], 0), ("output.weight", [hid, 4000], 14)]
+    pbig = os.path.join(tmp, "big126.gguf")
+    _write_gguf(pbig, {"llama.block_count": 126, "llama.attention.head_count": nh,
+                       "llama.attention.head_count_kv": nkv,
+                       "llama.embedding_length": hid,
+                       "llama.context_length": 8192,
+                       "llama.feed_forward_length": 1536},
+                {"general.architecture": "llama", "general.name": "PerfGrid"},
+                gm_big_t)
+    import time as _time
+    _t0 = _time.perf_counter()
+    rb = analyze(pbig, 4096, "f16", 512, False, vram_budget_mib=200,
+                 ram_budget_mib=8000, gpu_reserve_mib=0,
+                 compute_override_mib=5, safety_pct=0, plan_mode="fit")
+    _dt = _time.perf_counter() - _t0
+    big_p = (rb.get("plans") or {}).get("fit") or rb["plan"]
+    perf_ok = _dt < 0.25 and bool(big_p.get("vram_ok"))
+    print("  GRID-PERF 126 layers, 16k grid points in %.0f ms  %s"
+          % (_dt * 1000, "OK" if perf_ok else "FAIL"))
+    ok = ok and perf_ok
 
     # 5a) The automatic rule, and the override of it. Absent a mode the plan
     #     PREDICTED FASTER AT THE REQUESTED CONTEXT wins. The old rule keyed on
@@ -4032,9 +4252,10 @@ def _run_suite(require_refs, tmp, skipped_real):
         mode_ok = mode_ok and recommend(sp_pr, s_spill,
                                         sweep_budget_mib=sweep_eff)["config"]["ctx"] == 65536
 
-        # CONTEXT holds the window and pays in the cheapest currency first: while
-        # every block still fits the free knob is the -ot exile and LESS exiled is
-        # better, so the wall runs downward. That direction was wrong until
+        # FIT holds the window; what the campaign leaves free depends on where
+        # on the grid the plan sits - here every block is on the GPU, so the
+        # free knob is the -ot exile and LESS exiled is better, and the wall
+        # runs downward. That direction was wrong until
         # axis_direction() learned the dense table - it read n_cpu_ffn as "up"
         # and promoted the MOST exiled rung, the opposite of the answer.
         cx_pr = {"plan_mode": "fit",
@@ -4107,7 +4328,7 @@ def _run_suite(require_refs, tmp, skipped_real):
         mode_ok = mode_ok and (pick_extreme(s_rows, "ctx")["config"]["ctx"] == 131072
                                and pick_extreme(s_thrash, "ctx")["config"]["ctx"] == 131072
                                and pick_extreme([], "ctx") is None)
-        print("  RECMODE ceiling takes the widest window, fit the least exiled  %s"
+        print("  RECMODE ceiling takes the widest window, fit keeps the most bytes resident  %s"
               % ("OK" if mode_ok else "FAIL"))
         rec_all = rec_all and mode_ok
     except Exception as e:

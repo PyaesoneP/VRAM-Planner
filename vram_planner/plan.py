@@ -579,7 +579,7 @@ def analyze(path, ctx, kv_type, n_ubatch, flash_attn,
             "mmproj_place": mmproj_place,
             # Which question was asked. Filled in below once the dispatch knows
             # whether the two-plan regime even applies - a model with one answer
-            # has no mode, and saying "speed" there would be an invention.
+            # has no mode, and saying "ceiling" there would be an invention.
             "plan_mode": None,
         },
     }
@@ -654,6 +654,28 @@ def analyze(path, ctx, kv_type, n_ubatch, flash_attn,
             break
         max_ctx_gpu = nxt
 
+    # Bandwidths are resolved BEFORE the dispatch, not with the roofline: the
+    # two-plan default below compares the plans at the requested context, and it
+    # must use the same numbers the rooflines print, or the pick would be made
+    # on a speed the card never shows.
+    # A number with no stated source is a silently wrong one, so the old made-up
+    # 500/50 default is gone: a side whose bandwidth is unknown degrades the
+    # roofline to n/a, and only the byte split survives - which is still true.
+    bw_v, bw_r = bw_vram_gbs, bw_ram_gbs
+    bw_src = {"vram": "given" if bw_v else None,
+              "ram": "given" if bw_r else None}
+    if None in bw_src.values():
+        auto = cached_bandwidth()
+        if bw_src["vram"] is None and auto.get("vram_gbs"):
+            bw_v, bw_src["vram"] = auto["vram_gbs"], "auto"
+        if bw_src["ram"] is None and auto.get("ram_gbs"):
+            bw_r, bw_src["ram"] = auto["ram_gbs"], "auto"
+
+    # Calls made before the ceiling/fit retag (old clients, stored sweep
+    # configs) still say "speed" / "context"; the plans they name are the
+    # ceiling and the fit, so read them as such instead of as "auto".
+    plan_mode = {"speed": "ceiling", "context": "fit"}.get(plan_mode, plan_mode)
+    plan_pick = None
     # An explicit knob value means "verify the config I actually ran": the pair
     # is costed exactly, whatever the plans above would have suggested. The
     # regime planners below only ever answer their own questions, so an override
@@ -684,42 +706,123 @@ def analyze(path, ctx, kv_type, n_ubatch, flash_attn,
     elif not fully_fits and cl["ffn_dense_total"] > 0:
         # Two-plan regime: the model does not fit on the GPU at this context, so
         # there is no single answer - there is one per question being asked.
-        #   * for SPEED   keep every layer's attention and KV on the GPU (ngl =
-        #     all) and exile every dense FFN to the CPU (-ot); the answer is the
-        #     largest context that still fits that way.
-        #   * for CONTEXT keep the context pinned and walk ngl down until it fits;
-        #     the FFN stays exiled, because in this mode every GPU byte not spent
-        #     on KV is a byte taken from the context.
-        # Both plans pin the same FFN count; they differ in what is free. If the
-        # chosen context fits the speed plan, the speed plan wins - it is the
-        # faster regime and it already covers the question, so the context plan
-        # would only be reporting the same config at fewer layers.
-        plan = _plan_dense_speed(cfg, cl, eff_vram, ram_budget_mib, kv_total_mib,
-                                 weights_mib, ffn_dense_total_mib, rec_total_mib,
-                                 max_ctx_gpu, ctx, kv_type, flash_attn,
-                                 n_ubatch=n_ubatch, n_seq=n_seq,
-                                 compute_fn=compute_fn, gpu_extra=gpu_extra_weights,
-                                 compute_override_mib=compute_override_mib,
-                                 layer_max=per_layer_max_mib, layer_mean=per_layer_mean_mib,
-                                 ffn_layer_mean=ffn_layer_mean_mib)
-        context_plan = _plan_dense_context(cfg, cl, eff_vram, ram_budget_mib, kv_total_mib,
-                                           weights_mib, embed_mib, output_mib,
-                                           rec_total_mib, max_ctx_gpu, ctx, kv_type,
-                                           flash_attn,
-                                           n_seq=n_seq, compute_fn=compute_fn,
-                                           gpu_extra=gpu_extra_weights,
-                                           layer_max=per_layer_max_mib,
-                                           layer_mean=per_layer_mean_mib,
+        #   * the CEILING plan keeps every layer's attention and KV on the GPU
+        #     (ngl = all) and exiles every dense FFN to the CPU (-ot); its
+        #     answer is the LARGEST context that still fits that way.
+        #   * the FIT plan keeps the requested context pinned and walks -ot
+        #     first, then -ngl, until it fits; its answer is the LEAST exile
+        #     that does, and that is also the fastest way to hold this context.
+        # Both plans load the same bytes, so the only thing that differs between
+        # them at the requested context is HOW MANY weights sit in VRAM - and
+        # that is exactly what the pick compares below.
+        ceiling_plan = _plan_dense_ceiling(cfg, cl, eff_vram, ram_budget_mib, kv_total_mib,
+                                           weights_mib, ffn_dense_total_mib, rec_total_mib,
+                                           max_ctx_gpu, ctx, kv_type, flash_attn,
+                                           n_ubatch=n_ubatch, n_seq=n_seq,
+                                           compute_fn=compute_fn, gpu_extra=gpu_extra_weights,
+                                           compute_override_mib=compute_override_mib,
+                                           layer_max=per_layer_max_mib, layer_mean=per_layer_mean_mib,
                                            ffn_layer_mean=ffn_layer_mean_mib)
-        result["plans"] = {"speed": plan, "context": context_plan}
+        fit_plan = _plan_dense_fit(cfg, cl, eff_vram, ram_budget_mib, kv_total_mib,
+                                   weights_mib, embed_mib, output_mib,
+                                   rec_total_mib, max_ctx_gpu, ctx, kv_type,
+                                   flash_attn,
+                                   n_seq=n_seq, compute_fn=compute_fn,
+                                   gpu_extra=gpu_extra_weights,
+                                   layer_max=per_layer_max_mib,
+                                   layer_mean=per_layer_mean_mib,
+                                   ffn_layer_mean=ffn_layer_mean_mib)
+        result["plans"] = {"ceiling": ceiling_plan, "fit": fit_plan}
         # Which plan is REPORTED is the caller's question to ask; both are always
         # returned so the browser can toggle between them without a round trip.
-        # Absent an explicit mode the speed plan wins whenever it already covers
-        # the requested context - it is the faster regime, so the context plan
-        # would only be the same config at fewer layers.
-        mode = plan_mode if plan_mode in ("speed", "context") else (
-            "speed" if plan["max_ctx"] >= ctx else "context")
+        #
+        # The default is the plan predicted FASTER AT THE REQUESTED CONTEXT.
+        # The old rule keyed on coverage (the ceiling plan's max_ctx >= ctx),
+        # but coverage only ever says which plan CAN answer the context, not
+        # which one runs it faster - and when both can, the fit plan usually
+        # wins, because it leaves the least FFN in RAM and streams the least
+        # per token. Pricing both plans at the same context, with the same
+        # fill, leaves the weight split as the only variable, so the
+        # comparison is the question itself.
+        c_fit = bool(ceiling_plan.get("vram_ok")) and bool(ceiling_plan.get("ram_ok", True))
+        f_fit = bool(fit_plan.get("vram_ok")) and bool(fit_plan.get("ram_ok", True))
+        # Both plans get priced at the requested context, pinned and auto alike:
+        # the card shows both numbers either way, and an explicit pin is still
+        # the answer to "which is faster here" even when it loses.
+        def _at_ctx(p_):
+            try:
+                sp = _tps_at_ctx(p_, cl, cfg, ctx, kv_type, bw_v, bw_r, ram_eff, ctx_fill)
+            except Exception as e:
+                return {"error": "%s: %s" % (type(e).__name__, e), "ok": False}
+            if "missing" in sp:
+                sp["ok"] = False
+                sides = " and ".join({"bw_vram_gbs": "VRAM",
+                                      "bw_ram_gbs": "system RAM"}[m]
+                                     for m in sp["missing"])
+                sp["reason"] = "no bandwidth for %s, so this plan cannot be priced." % sides
+            else:
+                sp["ok"] = True
+            return sp
+        c_sp = _at_ctx(ceiling_plan)
+        f_sp = _at_ctx(fit_plan)
+        c_hi = c_sp.get("tok_s_hi") if "missing" not in c_sp else None
+        f_hi = f_sp.get("tok_s_hi") if "missing" not in f_sp else None
+        if plan_mode == "ceiling":
+            mode = "ceiling"
+        elif plan_mode == "fit":
+            mode = "fit"
+        elif not c_fit:
+            # The ceiling plan cannot hold the context, so it cannot cover it -
+            # the old auto rule's test, with the fit plan as the only remaining
+            # answer (the infeasible-fit-alone case is unreachable: if the fit
+            # plan cannot hold the context, neither can the ceiling one).
+            mode = "fit"
+        elif not f_fit:
+            mode = "ceiling"
+        elif c_hi is None and f_hi is None:
+            mode = "fit"
+        elif c_hi is None:
+            mode = "fit"
+        elif f_hi is None:
+            mode = "ceiling"
+        elif f_hi > c_hi:
+            mode = "fit"
+        elif c_hi > f_hi:
+            mode = "ceiling"
+        else:
+            # Exact tie: the splits are identical, and the ceiling plan's
+            # context is the more informative number to report.
+            mode = "ceiling"
         result["plan_mode"] = mode
+        plan_pick = {
+            "ctx": ctx,
+            "pick": mode,
+            "ceiling": {"tok_s_lo": c_sp.get("tok_s_lo"), "tok_s_hi": c_hi,
+                        "ok": c_sp.get("ok", False), "reason": c_sp.get("reason")},
+            "fit": {"tok_s_lo": f_sp.get("tok_s_lo"), "tok_s_hi": f_hi,
+                    "ok": f_sp.get("ok", False), "reason": f_sp.get("reason")},
+        }
+        if plan_mode in ("ceiling", "fit"):
+            plan_pick["rule"] = "pinned"
+            plan_pick["reason"] = "Pinned: %s." % plan_mode
+        elif not c_fit:
+            plan_pick["rule"] = "only_feasible"
+            plan_pick["reason"] = "The ceiling plan does not load at %s - the fit plan is the only one that does." % f"{ctx:,}"
+        elif not f_fit:
+            plan_pick["rule"] = "only_feasible"
+            plan_pick["reason"] = "The fit plan does not load at %s - the ceiling plan is the only one that does." % f"{ctx:,}"
+        elif c_hi is None and f_hi is None:
+            plan_pick["rule"] = "no_bandwidth"
+            plan_pick["reason"] = "No bandwidth is recorded, so the split decides: the fit plan keeps more weights in VRAM and streams less per token."
+        elif f_hi > c_hi:
+            plan_pick["rule"] = "faster_at_ctx"
+            plan_pick["reason"] = "Predicted faster at %s: %.1f vs %.1f tok/s." % (f"{ctx:,}", f_hi, c_hi)
+        elif c_hi > f_hi:
+            plan_pick["rule"] = "faster_at_ctx"
+            plan_pick["reason"] = "Predicted faster at %s: %.1f vs %.1f tok/s." % (f"{ctx:,}", c_hi, f_hi)
+        else:
+            plan_pick["rule"] = "tie"
+            plan_pick["reason"] = "Predicted equal at %s - the ceiling plan's context is the more informative number." % f"{ctx:,}"
         plan = result["plans"][mode]
     else:
         plan = _plan_dense(cfg, cl, eff_vram, ram_budget_mib, kv_total_mib, kv_per_layer_mib,
@@ -779,24 +882,9 @@ def analyze(path, ctx, kv_type, n_ubatch, flash_attn,
             p_["llama_cmd"] = p_["llama_cmd"] + " --no-mmproj-offload"
     result["inputs"]["plan_mode"] = result.get("plan_mode")
     result["plan"] = plan
+    result["plan_pick"] = plan_pick
 
     # ---- speed roofline ----------------------------------------------------
-    # Bandwidths are recorded alongside the plans that use them, with their
-    # source: "given" (typed in the UI), "auto" (probed from this machine),
-    # "none" (unknown). A number with no stated source is a silently wrong
-    # number, so the old made-up 500/50 default is gone: a plan that reads a
-    # side whose bandwidth is unknown degrades to n/a, and only the byte split
-    # survives - which is still true.
-    bw_v, bw_r = bw_vram_gbs, bw_ram_gbs
-    bw_src = {"vram": "given" if bw_v else None,
-              "ram": "given" if bw_r else None}
-    if None in bw_src.values():
-        auto = cached_bandwidth()
-        if bw_src["vram"] is None and auto.get("vram_gbs"):
-            bw_v, bw_src["vram"] = auto["vram_gbs"], "auto"
-        if bw_src["ram"] is None and auto.get("ram_gbs"):
-            bw_r, bw_src["ram"] = auto["ram_gbs"], "auto"
-
     def _roofline(p_):
         # The plan carries its own placement: n_gpu_layers says where the blocks
         # are, n_cpu_ffn says which of their dense FFN tensors -ot exiled to
@@ -810,8 +898,8 @@ def analyze(path, ctx, kv_type, n_ubatch, flash_attn,
                 ngl = n_layers if p_.get("fits_fully") else 0
             n_cpu_ffn = p_.get("n_cpu_ffn") or 0
             gpu_blocks = list(range(max(0, n_layers - int(ngl)), n_layers))
-            # A speed plan's context IS its answer, so its roofline is read at the
-            # window it actually proposes rather than at the one that was typed.
+            # A ceiling plan's context IS its answer, so its roofline is read at
+            # the window it actually proposes rather than at the one that was typed.
             plan_ctx = int(p_.get("max_ctx") or ctx)
             fill = ctx_fill if ctx_fill is not None else min(plan_ctx, 8192)
             sp = estimate_speed(cfg, cl, gpu_blocks, fill, kv_type,
@@ -840,7 +928,7 @@ def analyze(path, ctx, kv_type, n_ubatch, flash_attn,
         except Exception as e:
             return {"error": "%s: %s" % (type(e).__name__, e), "ok": False}
 
-    # Every plan carries its own, because the two modes run at genuinely different
+    # Every plan carries its own, because the two plans run at genuinely different
     # speeds and the browser toggles between them WITHOUT asking again - a single
     # top-level roofline would keep showing the selected plan's number under the
     # other plan's split.
@@ -928,6 +1016,28 @@ def _speed_notes(sp, flash_attn, has_spec):
     return notes
 
 
+def _tps_at_ctx(plan_, cl, cfg, ctx, kv_type, bw_v, bw_r, ram_eff, ctx_fill=None):
+    """A plan's predicted tok/s at the REQUESTED ctx, priced on its own split.
+
+    Each plan's card roofline is priced at the context that plan proposes, so
+    the two numbers on screen answer different questions and cannot be
+    compared. This prices both plans at the context the user asked for, with
+    the same fill, leaving the byte split - weights on GPU vs weights in RAM -
+    as the only thing that differs. It must stay a mirror of analyze()'s
+    roofline estimate_speed() call (same cpu_head, same ram_eff), or the
+    number it uses to choose would not be the number the card prints."""
+    n_layers = cfg["n_layers"] or 0
+    ngl = plan_.get("n_gpu_layers")
+    if ngl is None:
+        ngl = n_layers if plan_.get("fits_fully") else 0
+    fill = ctx_fill if ctx_fill is not None else min(ctx, 8192)
+    return estimate_speed(cfg, cl, list(range(max(0, n_layers - int(ngl)), n_layers)),
+                          fill, kv_type, bw_v, bw_r,
+                          cpu_head=True,
+                          ram_eff=ram_eff, n_cpu_moe=plan_.get("n_cpu_moe", 0) or 0,
+                          n_cpu_ffn=plan_.get("n_cpu_ffn") or 0)
+
+
 def _llama_flags(ctx, kv_type, flash_attn, ngl=None, n_cpu_moe=None,
                  ot_all_experts=False, n_cpu_ffn=None):
     parts = ["llama-server", "-m <model.gguf>"]
@@ -951,7 +1061,7 @@ def _dense_cost(cfg, cl, ngl, n_cpu_ffn, layer_max, layer_mean, ffn_layer_mean):
     """Exact BLOCK weight bytes on each side for a (-ngl, n_cpu_ffn) pair.
 
     The single source of dense block-weight accounting: the classic split, the
-    verification path, and the speed/context planners all read through this,
+    verification path, and the ceiling/fit planners all read through this,
     because blocks are not interchangeable (hybrid attn vs SSM, quant varies
     per block) and the -ot pin moves tens out of blocks that STAY on the GPU.
     llama.cpp offloads the LAST n_gpu_layers blocks, so which blocks land on
@@ -1087,11 +1197,11 @@ def _plan_dense(cfg, cl, eff_vram, ram, kv_total, kv_layer, compute, weights,
     return build(0, False)
 
 
-def _plan_dense_speed(cfg, cl, eff_vram, ram, kv_total, weights, ffn_total,
-                      rec_total, max_ctx_gpu, ctx, kv_type, flash_attn, n_ubatch, n_seq,
-                      compute_fn, gpu_extra, compute_override_mib,
-                      layer_max, layer_mean, ffn_layer_mean):
-    """Plan FOR SPEED: every layer's attention and KV on the GPU (ngl = all),
+def _plan_dense_ceiling(cfg, cl, eff_vram, ram, kv_total, weights, ffn_total,
+                        rec_total, max_ctx_gpu, ctx, kv_type, flash_attn, n_ubatch, n_seq,
+                        compute_fn, gpu_extra, compute_override_mib,
+                        layer_max, layer_mean, ffn_layer_mean):
+    """Plan the CEILING: every layer's attention and KV on the GPU (ngl = all),
     every dense FFN exiled to the CPU (-ot). The answer is the LARGEST context
     that still fits that way.
 
@@ -1182,7 +1292,7 @@ def _plan_dense_speed(cfg, cl, eff_vram, ram, kv_total, weights, ffn_total,
         head = ("No context fits with every layer on the GPU: attention weights alone are "
                 "%.0f MiB, and with the compute buffer and recurrent state that is %.0f MiB "
                 "before a single token of KV. This plan is infeasible on this card - the "
-                "context plan trades layers for context instead."
+                "fit plan trades layers for context instead."
                 % (cost["gpu_block_mib"] + extra, fixed + cb_at(1)))
     else:
         head = ("All %d layers' attention and KV on the GPU; every dense FFN on the CPU (-ot). "
@@ -1195,7 +1305,7 @@ def _plan_dense_speed(cfg, cl, eff_vram, ram, kv_total, weights, ffn_total,
           "toggle - run the llama.cpp command below).",
           "Context Length: up to ~%s tokens" % f"{max_ctx:,}"]
     return {
-        "kind": "dense_speed", "mode": "speed", "fits_fully": False,
+        "kind": "dense_ceiling", "mode": "ceiling", "fits_fully": False,
         "n_gpu_layers": n_layers, "cpu_layers": 0, "n_cpu_ffn": n_cpu_ffn,
         "vram_ok": vram_ok,
         "vram_used_mib": vram_used, "vram_budget_mib": eff_vram,
@@ -1214,10 +1324,10 @@ def _plan_dense_speed(cfg, cl, eff_vram, ram, kv_total, weights, ffn_total,
     }
 
 
-def _plan_dense_context(cfg, cl, eff_vram, ram, kv_total, weights, embed, output,
-                        rec_total, max_ctx_gpu, ctx, kv_type, flash_attn, n_seq,
-                        compute_fn, gpu_extra, layer_max, layer_mean, ffn_layer_mean):
-    """Plan FOR CONTEXT: the context is pinned and it is the thing being
+def _plan_dense_fit(cfg, cl, eff_vram, ram, kv_total, weights, embed, output,
+                    rec_total, max_ctx_gpu, ctx, kv_type, flash_attn, n_seq,
+                    compute_fn, gpu_extra, layer_max, layer_mean, ffn_layer_mean):
+    """Plan the FIT: the requested context is pinned and it is the thing being
     protected. Two knobs pay for it, in this order:
 
       1. The dense FFN is exiled to the CPU (-ot), and the search asks how
@@ -1234,8 +1344,8 @@ def _plan_dense_context(cfg, cl, eff_vram, ram, kv_total, weights, embed, output
     straight to walking -ngl. On a card with room to spare that left VRAM unused
     and streamed FFN weights over PCIe every token for no reason.
 
-    The sibling (speed plan) pins the other way: -ngl and the FFN exile are both
-    at maximum and the CONTEXT is what is free."""
+    The sibling (ceiling plan) pins the other way: -ngl and the FFN exile are
+    both at maximum and the CONTEXT is what is free."""
     n_layers = cfg["n_layers"] or 0
     gpu_extra = gpu_extra or (lambda ngl: 0.0)
 
@@ -1310,7 +1420,7 @@ def _plan_dense_context(cfg, cl, eff_vram, ram, kv_total, weights, embed, output
                   % n_cpu_ffn)
     ls.append("Context Length: %s tokens" % f"{ctx:,}")
     return {
-        "kind": "dense_context", "mode": "context", "fits_fully": False,
+        "kind": "dense_fit", "mode": "fit", "fits_fully": False,
         "n_gpu_layers": ngl, "cpu_layers": n_layers - ngl, "n_cpu_ffn": n_cpu_ffn,
         "kv_overflow": overflow or None,
         "vram_ok": vram_used <= eff_vram,

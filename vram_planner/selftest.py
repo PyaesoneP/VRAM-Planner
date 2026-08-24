@@ -1045,6 +1045,24 @@ def _run_suite(require_refs, tmp, skipped_real):
     print("  PMODE  auto=%s (expect %s, rule=%s), forced fit/ceiling honoured  %s"
           % (auto, expect, pp.get("rule"), "OK" if mode_ok else "FAIL"))
     ok = ok and mode_ok
+    # 5a-cal) A calibrated price is a single tok_s POINT value, not a hi/lo
+    #     pair - the pick must compare the point values and say so, rather than
+    #     read a None hi edge and fall into the no-bandwidth branch.
+    rc = _two(ram_eff=0.5)
+    pc = rc.get("plan_pick") or {}
+    pc_c, pc_f = pc.get("ceiling") or {}, pc.get("fit") or {}
+    cal_expect = ("fit" if (pc_f.get("tok_s") or 0) > (pc_c.get("tok_s") or 0)
+                  else "ceiling")
+    cal_ok = (pc.get("rule") == "calibrated"
+              and pc_c.get("calibrated") is True and pc_f.get("calibrated") is True
+              and pc_c.get("tok_s") and pc_f.get("tok_s")
+              and pc.get("pick") == cal_expect
+              and rc["plan_mode"] == cal_expect)
+    print("  PMODE-CAL ram_eff=0.5: rule=%s pick=%s (ceiling %.1f, fit %.1f tok/s)  %s"
+          % (pc.get("rule"), pc.get("pick"),
+             pc_c.get("tok_s") or 0.0, pc_f.get("tok_s") or 0.0,
+             "OK" if cal_ok else "FAIL"))
+    ok = ok and cal_ok
 
     # 5b) An explicit knob means "verify the config I actually ran", so it must
     #     reach a planner that HAS that knob rather than being dropped. The mode
@@ -1062,11 +1080,11 @@ def _run_suite(require_refs, tmp, skipped_real):
               and rf_a["plan"]["n_cpu_ffn"] == 2
               and rf_b["plan"]["n_cpu_ffn"] == 6
               and rf_a["plan"]["vram_used_mib"] != rf_b["plan"]["vram_used_mib"]
-               # an override is not a mode: neither plans dict should be offered
-               and "plans" not in ro_a and "plans" not in rf_a
-               # the recommendation path (no override) must STILL reach the two
-               # plans
-               and rk["plan"]["kind"] in ("dense_ceiling", "dense_fit"))
+              # an override is not a mode: neither plans dict should be offered
+              and "plans" not in ro_a and "plans" not in rf_a
+              # the recommendation path (no override) must STILL reach the two
+              # plans
+              and rk["plan"]["kind"] in ("dense_ceiling", "dense_fit"))
     print("  NGL-OVR ngl 1->%.0f MiB, 3->%.0f MiB | ffn 2->%.0f MiB, 6->%.0f MiB  %s"
           % (ro_a["plan"]["vram_used_mib"], ro_b["plan"]["vram_used_mib"],
              rf_a["plan"]["vram_used_mib"], rf_b["plan"]["vram_used_mib"],

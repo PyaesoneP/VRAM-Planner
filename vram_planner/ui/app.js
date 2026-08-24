@@ -967,9 +967,14 @@ function renderModes(r){
   const pick = r.plan_pick || {};
   // What each plan is worth AT YOUR CONTEXT - the comparison the pick is made
   // on, not each plan's roofline at the context IT proposes.
-  const atCtx = e => (e && e.ok && e.tok_s_hi != null)
-      ? num(Math.round(e.tok_s_lo)) + "&ndash;" + num(Math.round(e.tok_s_hi)) + " tok/s"
-      : "n/a";
+  const atCtx = e => {
+    if(!e || !e.ok) return "n/a";
+    if(e.calibrated && e.tok_s != null)
+      return num(Math.round(e.tok_s)) + " tok/s, calibrated";
+    if(e.tok_s_hi != null)
+      return num(Math.round(e.tok_s_lo)) + "&ndash;" + num(Math.round(e.tok_s_hi)) + " tok/s";
+    return "n/a";
+  };
   const fig = pl => num(pl.max_ctx || r.inputs.context) + " ctx · "
                     + (pl.n_gpu_layers || 0) + " layers";
   return h`<section class="card modes">

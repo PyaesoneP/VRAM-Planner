@@ -1042,6 +1042,7 @@ def ngl_ladder(model_path, c, n_layers, is_moe=False, plan_mode=None, n_ctx_trai
                 {"ngl": n_layers, "ncmoe": seed_ncm})
 
     pm = norm_plan_mode(plan_mode)
+    cmx = seed.get("ceiling_max_ctx")
     if pm is None:
         # auto: the campaign's own coverage rule, kept deliberately SEPARATE
         # from the report's auto (analyze's default pick, which prices both
@@ -1050,7 +1051,6 @@ def ngl_ladder(model_path, c, n_layers, is_moe=False, plan_mode=None, n_ctx_trai
         # exactly when its window reaches the requested context - the same test
         # the old auto rule ran against the speed plan, now read off the
         # ceiling plan's window instead of the report's chosen one.
-        cmx = seed.get("ceiling_max_ctx")
         req = int(c.get("ctx") or 0)
         pm = "ceiling" if (cmx is not None and cmx >= req) else "fit"
     if pm == "ceiling":
@@ -1066,8 +1066,12 @@ def ngl_ladder(model_path, c, n_layers, is_moe=False, plan_mode=None, n_ctx_trai
         # not at a default context belonging to whichever model SPEED_BASE was
         # last used against. pin_ctx is False when the user froze the context by
         # hand, which is the one case where their number outranks the planner's.
+        # The seed's max_ctx is the window of the plan the REPORT read - its auto
+        # usually answers fit, whose "window" is just the requested context - so
+        # the pin takes the ceiling window first and the read plan's only as the
+        # fallback the old code got for free when report and campaign agreed.
         if pin_ctx and values:
-            pins["ctx"] = seed.get("max_ctx") or values[-1]
+            pins["ctx"] = cmx or seed.get("max_ctx") or values[-1]
         return "ctx", values, pins
 
     # The fit plan. Whole blocks are the axis and the FFN stays fully exiled

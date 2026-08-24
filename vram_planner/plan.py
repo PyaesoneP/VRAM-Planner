@@ -765,8 +765,18 @@ def analyze(path, ctx, kv_type, n_ubatch, flash_attn,
             return sp
         c_sp = _at_ctx(ceiling_plan)
         f_sp = _at_ctx(fit_plan)
-        c_hi = c_sp.get("tok_s_hi") if "missing" not in c_sp else None
-        f_hi = f_sp.get("tok_s_hi") if "missing" not in f_sp else None
+        # estimate_speed prices with a tok_s_hi/tok_s_lo pair when uncalibrated
+        # and with a single tok_s POINT value once ram_eff is set - so the
+        # comparable number is the hi edge, or that point value when calibrated.
+        # Missing bandwidth (or an error inside the pricing) yields None, and the
+        # ladder below degrades exactly like the roofline did.
+        def _val(sp_):
+            if "missing" in sp_:
+                return None
+            v = sp_.get("tok_s_hi")
+            return sp_.get("tok_s") if v is None else v
+        c_val = _val(c_sp)
+        f_val = _val(f_sp)
         if plan_mode == "ceiling":
             mode = "ceiling"
         elif plan_mode == "fit":
@@ -779,15 +789,15 @@ def analyze(path, ctx, kv_type, n_ubatch, flash_attn,
             mode = "fit"
         elif not f_fit:
             mode = "ceiling"
-        elif c_hi is None and f_hi is None:
+        elif c_val is None and f_val is None:
             mode = "fit"
-        elif c_hi is None:
+        elif c_val is None:
             mode = "fit"
-        elif f_hi is None:
+        elif f_val is None:
             mode = "ceiling"
-        elif f_hi > c_hi:
+        elif f_val > c_val:
             mode = "fit"
-        elif c_hi > f_hi:
+        elif c_val > f_val:
             mode = "ceiling"
         else:
             # Exact tie: the splits are identical, and the ceiling plan's
@@ -797,29 +807,61 @@ def analyze(path, ctx, kv_type, n_ubatch, flash_attn,
         plan_pick = {
             "ctx": ctx,
             "pick": mode,
-            "ceiling": {"tok_s_lo": c_sp.get("tok_s_lo"), "tok_s_hi": c_hi,
+            "ceiling": {"tok_s": c_sp.get("tok_s"),
+                        "tok_s_lo": c_sp.get("tok_s_lo"), "tok_s_hi": c_sp.get("tok_s_hi"),
+                        "calibrated": bool(c_sp.get("calibrated")),
                         "ok": c_sp.get("ok", False), "reason": c_sp.get("reason")},
-            "fit": {"tok_s_lo": f_sp.get("tok_s_lo"), "tok_s_hi": f_hi,
+            "fit": {"tok_s": f_sp.get("tok_s"),
+                    "tok_s_lo": f_sp.get("tok_s_lo"), "tok_s_hi": f_sp.get("tok_s_hi"),
+                    "calibrated": bool(f_sp.get("calibrated")),
                     "ok": f_sp.get("ok", False), "reason": f_sp.get("reason")},
         }
         if plan_mode in ("ceiling", "fit"):
             plan_pick["rule"] = "pinned"
             plan_pick["reason"] = "Pinned: %s." % plan_mode
+        elif not c_fit and not f_fit:
+            plan_pick["rule"] = "infeasible"
+            plan_pick["reason"] = ("Neither plan loads at %s - the ceiling plan holds every "
+                                   "layer on the GPU and the fit plan holds your context, and "
+                                   "neither fits. Lower the context or the quant." % f"{ctx:,}")
         elif not c_fit:
             plan_pick["rule"] = "only_feasible"
             plan_pick["reason"] = "The ceiling plan does not load at %s - the fit plan is the only one that does." % f"{ctx:,}"
         elif not f_fit:
             plan_pick["rule"] = "only_feasible"
             plan_pick["reason"] = "The fit plan does not load at %s - the ceiling plan is the only one that does." % f"{ctx:,}"
-        elif c_hi is None and f_hi is None:
+        elif c_val is None and f_val is None:
             plan_pick["rule"] = "no_bandwidth"
             plan_pick["reason"] = "No bandwidth is recorded, so the split decides: the fit plan keeps more weights in VRAM and streams less per token."
-        elif f_hi > c_hi:
+        elif c_val is None:
+            plan_pick["rule"] = "only_priced"
+            plan_pick["reason"] = ("The ceiling plan cannot be priced at %s (%s) - the fit "
+                                   "plan is the only one that can."
+                                   % (f"{ctx:,}", c_sp.get("reason") or "no usable bandwidth"))
+        elif f_val is None:
+            plan_pick["rule"] = "only_priced"
+            plan_pick["reason"] = ("The fit plan cannot be priced at %s (%s) - the ceiling "
+                                   "plan is the only one that can."
+                                   % (f"{ctx:,}", f_sp.get("reason") or "no usable bandwidth"))
+        elif c_sp.get("calibrated") or f_sp.get("calibrated"):
+            # Both prices ride the same measured RAM efficiency, so they are point
+            # values rather than the edges of an uncalibrated bracket - and the
+            # pick was made on exactly these numbers.
+            if f_val > c_val:
+                plan_pick["rule"] = "calibrated"
+                plan_pick["reason"] = "Calibrated, faster at %s: %.1f vs %.1f tok/s." % (f"{ctx:,}", f_val, c_val)
+            elif c_val > f_val:
+                plan_pick["rule"] = "calibrated"
+                plan_pick["reason"] = "Calibrated, faster at %s: %.1f vs %.1f tok/s." % (f"{ctx:,}", c_val, f_val)
+            else:
+                plan_pick["rule"] = "tie"
+                plan_pick["reason"] = "Predicted equal at %s - the ceiling plan's context is the more informative number." % f"{ctx:,}"
+        elif f_val > c_val:
             plan_pick["rule"] = "faster_at_ctx"
-            plan_pick["reason"] = "Predicted faster at %s: %.1f vs %.1f tok/s." % (f"{ctx:,}", f_hi, c_hi)
-        elif c_hi > f_hi:
+            plan_pick["reason"] = "Predicted faster at %s: %.1f vs %.1f tok/s." % (f"{ctx:,}", f_val, c_val)
+        elif c_val > f_val:
             plan_pick["rule"] = "faster_at_ctx"
-            plan_pick["reason"] = "Predicted faster at %s: %.1f vs %.1f tok/s." % (f"{ctx:,}", c_hi, f_hi)
+            plan_pick["reason"] = "Predicted faster at %s: %.1f vs %.1f tok/s." % (f"{ctx:,}", c_val, f_val)
         else:
             plan_pick["rule"] = "tie"
             plan_pick["reason"] = "Predicted equal at %s - the ceiling plan's context is the more informative number." % f"{ctx:,}"

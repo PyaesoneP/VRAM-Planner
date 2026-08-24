@@ -384,7 +384,7 @@ def recommend(plan_result, rows, sweep_budget_mib=None, strict=True):
       row      the winning row, or None
       predicted the planner's own config, always
       deltas   [{kind, text}], empty when the two agree
-       mode     "ceiling" | "fit" | None - the category this answers
+      mode     "ceiling" | "fit" | None - the category this answers
       axis     the knob that category leaves free, or None
       objective "extreme" (at the wall along `axis`) or "fastest"
       goal     the criterion in words, for the card to print

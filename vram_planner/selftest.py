@@ -606,11 +606,11 @@ def _run_suite(require_refs, tmp, skipped_real):
     print("  WALL draft walk: per-family rungs, nested depth ladder  %s"
           % ("OK" if wall_ok else "FAIL"))
     ok = ok and wall_ok
-    # In the dense SPEED mode -ngl is pinned at every block - that pin IS the
-    # mode - so the walk frees VRAM by giving back CONTEXT instead. Rungs are a
+    # In the dense CEILING plan -ngl is pinned at every block - that pin IS the
+    # plan - so the walk frees VRAM by giving back CONTEXT instead. Rungs are a
     # tenth of the window, snapped to CTX_LADDER_STEP, and -ngl must not move:
-    # a walk that traded layers away here would report the context plan's
-    # numbers as the speed plan's.
+    # a walk that traded layers away here would report the fit plan's
+    # numbers as the ceiling plan's.
     tr4 = {}
     dws = dict(wa, ngl=8, ctx=40960, spec="draft-dflash", spec_n_max=3)
     s1 = _spec_retry(dict(dws), {"status": "oom"}, facts8, tr4, drafter=drf,
@@ -632,15 +632,15 @@ def _run_suite(require_refs, tmp, skipped_real):
     # floor is one CTX_LADDER_STEP, and below it there is no window to give back
     spd_ok = (spd_ok and _spec_ctx_rung(2048) == 1024
               and _spec_ctx_rung(1024) is None and _spec_ctx_rung(0) is None)
-    # the CONTEXT mode is untouched - it still walks layers, because there the
+    # the FIT plan is untouched - it still walks layers, because there the
     # context is the thing being protected
     tr6 = {}
     c1 = _spec_retry(dict(dws), {"status": "oom"}, facts8, tr6, drafter=drf,
                      axis="ngl")
     spd_ok = spd_ok and c1 is not None and c1["ngl"] == 7 and c1["ctx"] == 40960
     # ...and an MoE ignores the mode entirely: its axis was never -ngl
-    spd_ok = spd_ok and _spec_axis({"is_moe": True}, "speed") == "ncmoe"
-    print("  WALL speed mode walks context, not layers  %s"
+    spd_ok = spd_ok and _spec_axis({"is_moe": True}, "ceiling") == "ncmoe"
+    print("  WALL ceiling plan walks context, not layers  %s"
           % ("OK" if spd_ok else "FAIL"))
     ok = ok and spd_ok
     # ...unless stage A phase 2 left dense FFN blocks ON the card, in which case
@@ -713,8 +713,8 @@ def _run_suite(require_refs, tmp, skipped_real):
               and _freer_rung("ngl", 8, 8) == 7 and _freer_rung("ngl", 1, 8) is None)
     # The all-OOM note has to suggest the same ladder the walk would have
     # spent, or the advice contradicts the eight OOM lines above it. In the
-    # speed mode -ngl is pinned at every block, so an ngl ladder there proposes
-    # leaving the mode rather than making room inside it.
+    # ceiling plan -ngl is pinned at every block, so an ngl ladder there proposes
+    # leaving the plan rather than making room inside it.
     nt, nt2 = [], []
     nout = [{"status": "oom", "config": {"spec": "draft-dflash"}}]
     ntodo = [{"spec": "draft-dflash", "spec_n_max": 1}, {"spec": "ngram-mod"}]
@@ -761,7 +761,7 @@ def _run_suite(require_refs, tmp, skipped_real):
     # Two gates decide it and they must widen TOGETHER on a swept axis - a row
     # that cannot be compared is never a candidate, and a winner that is not
     # carried is found and thrown away. ctx is the only axis that is both gated
-    # by comparable() and absent from CARRY_KEYS, because until the speed mode
+    # by comparable() and absent from CARRY_KEYS, because until the ceiling plan
     # it was only ever the campaign's definition and never its result.
     # CARRY_KEYS is imported again further down, which makes it a local for
     # this whole function - so it has to be bound here too, not just there.
@@ -824,7 +824,7 @@ def _run_suite(require_refs, tmp, skipped_real):
     ca, _ = _pick(lad, "a", "ctx")
     old, _ = best_config(lad, "M", pbase, n_predict=128, repeat=3, swept="ctx")
     obj_ok = obj_ok and ca["ctx"] == 148480 and old["ctx"] == 74752
-    # -ngl runs the other way round in the context plan, ncmoe the other way again
+    # -ngl runs the other way round in the fit plan, ncmoe the other way again
     cn, _ = _pick([_pr(6.2, ngl=61), _pr(6.9, ngl=63), _pr(6.85, ngl=65)], "a", "ngl")
     cm, _ = _pick([_pr(6.0, ncmoe=33), _pr(6.6, ncmoe=31), _pr(6.5, ncmoe=29)],
                   "a", "ncmoe")
@@ -842,7 +842,7 @@ def _run_suite(require_refs, tmp, skipped_real):
     obj_ok = obj_ok and cd["spec_n_max"] == 2 and wd["tok_s"] == 9.4
     # NO SLACK. The largest value that loaded wins even when it is much slower:
     # a big window measured slow is still the big window that fits, and that is
-    # what the speed mode exists to find. The 5% slack this replaces could hand
+    # what the ceiling plan exists to find. The 5% slack this replaces could hand
     # back half the context to buy 6% of a number that moves 4.2% across a
     # doubling of the window anyway.
     cg, _ = _pick([_pr(7.0, ctx=74752), _pr(3.0, ctx=148480)], "a", "ctx")
@@ -951,9 +951,10 @@ def _run_suite(require_refs, tmp, skipped_real):
     ok = ok and hyb_ok
 
     # 5) The two-plan regime. A dense model that does not fit has one answer per
-    #    question, so analyze() computes BOTH and reports one: SPEED pins every
-    #    block on the GPU with the dense FFN exiled (-ngl all, -ot all) and solves
-    #    for the largest context; CONTEXT holds the context and walks -ngl down.
+    #    question, so analyze() computes BOTH and reports one: the CEILING plan
+    #    pins every block on the GPU with the dense FFN exiled (-ngl all, -ot all)
+    #    and solves for the largest context; the FIT plan holds the context and
+    #    walks -ot (then -ngl) down to the least exile that fits.
     def _two(**kw):
         return analyze(p2, 4096, "f16", 512, False, vram_budget_mib=30,
                        ram_budget_mib=8000, gpu_reserve_mib=0,
@@ -961,32 +962,33 @@ def _run_suite(require_refs, tmp, skipped_real):
                        bw_vram_gbs=600, bw_ram_gbs=80, ctx_fill=1024, **kw)
     rk = _two()
     pl = rk.get("plans") or {}
-    sp_plan, cx_plan = pl.get("speed") or {}, pl.get("context") or {}
+    ceil_plan, fit_plan = pl.get("ceiling") or {}, pl.get("fit") or {}
     nL2 = rk["config"]["n_layers"]
     # Each plan carries its OWN roofline, because the browser toggles between them
     # without asking again - a single top-level one would show the selected plan's
     # speed under the other plan's split.
-    sk = sp_plan.get("speed") or {}
-    two_ok = (sp_plan.get("kind") == "dense_speed"
-              and sp_plan.get("n_gpu_layers") == nL2
-              and sp_plan.get("n_cpu_ffn") == nL2
-              and cx_plan.get("kind") == "dense_context"
-              and cx_plan.get("max_ctx") == 4096
-              # the context plan pays in the CHEAPEST currency first: it exiles
+    sk = ceil_plan.get("speed") or {}
+    two_ok = (ceil_plan.get("kind") == "dense_ceiling"
+              and ceil_plan.get("n_gpu_layers") == nL2
+              and ceil_plan.get("n_cpu_ffn") == nL2
+              and fit_plan.get("kind") == "dense_fit"
+              and fit_plan.get("max_ctx") == 4096
+              # the fit plan pays in the CHEAPEST currency first: it exiles
               # only as much dense FFN as it has to, and gives the rest back to
               # the GPU. Whole blocks move only when a full exile is not enough.
-              and 0 <= (cx_plan.get("n_cpu_ffn") or 0) <= nL2
-              and (cx_plan.get("n_gpu_layers") == nL2
-                   or cx_plan.get("n_cpu_ffn") == nL2)
+              and 0 <= (fit_plan.get("n_cpu_ffn") or 0) <= nL2
+              and (fit_plan.get("n_gpu_layers") == nL2
+                   or fit_plan.get("n_cpu_ffn") == nL2)
               # the exiled FFN must be charged to the CPU side of the roofline
               and sk.get("cpu_mib", 0) > 0
               and rk["plan"] is pl[rk["plan_mode"]])
-    print("  2PLAN  speed ngl=%s ffn=%s max_ctx=%s | context ngl=%s | reported=%s  %s"
-          % (sp_plan.get("n_gpu_layers"), sp_plan.get("n_cpu_ffn"),
-             sp_plan.get("max_ctx"), cx_plan.get("n_gpu_layers"),
+    print("  2PLAN  ceiling ngl=%s ffn=%s max_ctx=%s | fit ngl=%s ffn=%s | reported=%s  %s"
+          % (ceil_plan.get("n_gpu_layers"), ceil_plan.get("n_cpu_ffn"),
+             ceil_plan.get("max_ctx"), fit_plan.get("n_gpu_layers"),
+             fit_plan.get("n_cpu_ffn"),
              rk.get("plan_mode"), "OK" if two_ok else "FAIL"))
     ok = ok and two_ok
-    # 5aa) The context plan's FFN give-back, which is the dense answer to the
+    # 5aa) The fit plan's FFN give-back, which is the dense answer to the
     #      MoE expert split: exiling FFN frees VRAM without costing any KV, so
     #      with every block on the GPU the search wants the SMALLEST exile that
     #      fits. A bigger card must therefore keep MORE FFN in VRAM, never less
@@ -996,8 +998,8 @@ def _run_suite(require_refs, tmp, skipped_real):
     for budget in (30, 60, 120, 400):
         rr = analyze(p2, 4096, "f16", 512, False, vram_budget_mib=budget,
                      ram_budget_mib=8000, gpu_reserve_mib=0, compute_override_mib=5,
-                     safety_pct=0, plan_mode="context")
-        cp = (rr.get("plans") or {}).get("context") or rr["plan"]
+                     safety_pct=0, plan_mode="fit")
+        cp = (rr.get("plans") or {}).get("fit") or rr["plan"]
         ffn_at.append((budget, cp.get("n_gpu_layers"), cp.get("n_cpu_ffn") or 0))
     # more VRAM must never mean MORE exiled, and somewhere it must mean less -
     # otherwise the give-back is not happening at all
@@ -1006,31 +1008,42 @@ def _run_suite(require_refs, tmp, skipped_real):
     # ...and the emitted -ot count is the plan's, not a hardcoded "all blocks"
     rr = analyze(p2, 4096, "f16", 512, False, vram_budget_mib=60, ram_budget_mib=8000,
                  gpu_reserve_mib=0, compute_override_mib=5, safety_pct=0,
-                 plan_mode="context")
-    cp = (rr.get("plans") or {}).get("context") or rr["plan"]
+                 plan_mode="fit")
+    cp = (rr.get("plans") or {}).get("fit") or rr["plan"]
     cmd = cp.get("llama_cmd") or ""
     give_ok = give_ok and (("-ot" in cmd) == bool(cp.get("n_cpu_ffn")))
-    print("  2PLAN  context plan gives FFN back as VRAM allows: %s  %s"
+    print("  2PLAN  fit plan gives FFN back as VRAM allows: %s  %s"
           % (" ".join("%s->ot%s" % (b, f) for b, _, f in ffn_at),
              "OK" if give_ok else "FAIL"))
     ok = ok and give_ok
 
-    # 5a) The automatic rule, and the override of it. Absent a mode the speed plan
-    #     wins exactly when it already covers the requested context; an explicit
-    #     mode is obeyed either way, which is what the UI toggle rides on.
+    # 5a) The automatic rule, and the override of it. Absent a mode the plan
+    #     PREDICTED FASTER AT THE REQUESTED CONTEXT wins. The old rule keyed on
+    #     coverage (the ceiling plan's max_ctx >= ctx), but coverage only says
+    #     which plan CAN answer the context - when both can, the fit plan usually
+    #     streams less per token and is the faster one, which is the inversion
+    #     this assertion exists to catch. An explicit mode is obeyed either way,
+    #     which is what the UI toggle rides on.
     auto = rk.get("plan_mode")
-    expect = "speed" if (sp_plan.get("max_ctx") or 0) >= 4096 else "context"
-    forced = _two(plan_mode="context")
-    forced_s = _two(plan_mode="speed")
+    pp = rk.get("plan_pick") or {}
+    pp_c, pp_f = pp.get("ceiling") or {}, pp.get("fit") or {}
+    if pp_c.get("tok_s_hi") and pp_f.get("tok_s_hi"):
+        expect = "fit" if pp_f["tok_s_hi"] > pp_c["tok_s_hi"] else "ceiling"
+    else:
+        expect = pp.get("pick")
+    forced = _two(plan_mode="fit")
+    forced_c = _two(plan_mode="ceiling")
     mode_ok = (auto == expect
-               and forced.get("plan_mode") == "context"
-               and forced["plan"]["kind"] == "dense_context"
-               and forced_s.get("plan_mode") == "speed"
-               and forced_s["plan"]["kind"] == "dense_speed"
+               and pp.get("pick") == auto
+               and bool(pp.get("rule")) and bool(pp.get("reason"))
+               and forced.get("plan_mode") == "fit"
+               and forced["plan"]["kind"] == "dense_fit"
+               and forced_c.get("plan_mode") == "ceiling"
+               and forced_c["plan"]["kind"] == "dense_ceiling"
                # both plans are always returned, whichever one is reported
-               and set((forced.get("plans") or {})) == {"speed", "context"})
-    print("  PMODE  auto=%s (expect %s), forced context/speed honoured  %s"
-          % (auto, expect, "OK" if mode_ok else "FAIL"))
+               and set((forced.get("plans") or {})) == {"ceiling", "fit"})
+    print("  PMODE  auto=%s (expect %s, rule=%s), forced fit/ceiling honoured  %s"
+          % (auto, expect, pp.get("rule"), "OK" if mode_ok else "FAIL"))
     ok = ok and mode_ok
 
     # 5b) An explicit knob means "verify the config I actually ran", so it must
@@ -1049,10 +1062,11 @@ def _run_suite(require_refs, tmp, skipped_real):
               and rf_a["plan"]["n_cpu_ffn"] == 2
               and rf_b["plan"]["n_cpu_ffn"] == 6
               and rf_a["plan"]["vram_used_mib"] != rf_b["plan"]["vram_used_mib"]
-              # an override is not a mode: neither plans dict should be offered
-              and "plans" not in ro_a and "plans" not in rf_a
-              # the recommendation path (no override) must STILL reach the modes
-              and rk["plan"]["kind"] in ("dense_speed", "dense_context"))
+               # an override is not a mode: neither plans dict should be offered
+               and "plans" not in ro_a and "plans" not in rf_a
+               # the recommendation path (no override) must STILL reach the two
+               # plans
+               and rk["plan"]["kind"] in ("dense_ceiling", "dense_fit"))
     print("  NGL-OVR ngl 1->%.0f MiB, 3->%.0f MiB | ffn 2->%.0f MiB, 6->%.0f MiB  %s"
           % (ro_a["plan"]["vram_used_mib"], ro_b["plan"]["vram_used_mib"],
              rf_a["plan"]["vram_used_mib"], rf_b["plan"]["vram_used_mib"],
@@ -1155,27 +1169,27 @@ def _run_suite(require_refs, tmp, skipped_real):
                               n_cpu_moe=p_.get("n_cpu_moe") or 0,
                               n_cpu_ffn=p_.get("n_cpu_ffn") or 0)
     solo_ok = True
-    for _nm in ("speed", "context"):
+    for _nm in ("ceiling", "fit"):
         _a = (pl.get(_nm) or {}).get("speed") or {}
         _b = _alone(pl.get(_nm) or {})
         for _k in ("tok_s_hi", "tok_s_lo", "gpu_mib", "cpu_mib", "expert_frac", "ctx_fill"):
             solo_ok = solo_ok and _a.get(_k) is not None and _a.get(_k) == _b.get(_k)
-    _cxsp = (pl.get("context") or {}).get("speed") or {}
-    print("  SPEED-SOLO recomputed from own split: speed %.2f/%.2f, context %.2f/%.2f  %s"
+    _cxsp = (pl.get("fit") or {}).get("speed") or {}
+    print("  SPEED-SOLO recomputed from own split: ceiling %.2f/%.2f, fit %.2f/%.2f  %s"
           % (sk.get("tok_s_hi") or 0.0, sk.get("tok_s_lo") or 0.0,
              _cxsp.get("tok_s_hi") or 0.0, _cxsp.get("tok_s_lo") or 0.0,
              "OK" if solo_ok else "FAIL"))
     ok = ok and solo_ok
 
     # 5f) AC3 - synthetic bandwidths, real consequence. The two plans bill the
-    #     same bytes to different sides: the speed plan exiles the whole dense
+    #     same bytes to different sides: the ceiling plan exiles the whole dense
     #     FFN to RAM (streaming it every token) but keeps every block's KV on the
-    #     GPU; the context plan keeps as much FFN on the GPU as the card allows
-    #     and, once the card is tight enough, starts evicting whole blocks -
-    #     weights AND KV - to the slow side. A generous card favours the context
-    #     plan (FFN stays on the fast side); a tight one favours the speed plan
-    #     (all KV stays on the fast side), so the PREDICTED ordering must flip
-    #     somewhere in the family. A property of placement, not of the model:
+    #     GPU; the fit plan keeps as much FFN on the GPU as the card allows and,
+    #     once the card is tight enough, starts evicting whole blocks -
+    #     weights AND KV - to the slow side. A generous card favours the fit
+    #     plan (FFN stays on the fast side); a tight one favours the ceiling
+    #     plan (all KV stays on the fast side), so the PREDICTED ordering must
+    #     flip somewhere in the family. A property of placement, not of the model:
     #     no single card can show it.
     flip_rows = []
     for b in (30, 25, 20, 15, 10, 8):
@@ -1184,13 +1198,13 @@ def _run_suite(require_refs, tmp, skipped_real):
                      safety_pct=0, bw_vram_gbs=50, bw_ram_gbs=25)
         fps = fr.get("plans") or {}
         hi = {k: (v.get("speed") or {}).get("tok_s_hi") for k, v in fps.items()}
-        if hi.get("speed") is None or hi.get("context") is None:
+        if hi.get("ceiling") is None or hi.get("fit") is None:
             continue
-        flip_rows.append((b, hi["speed"], hi["context"]))
+        flip_rows.append((b, hi["ceiling"], hi["fit"]))
     flip_ok = (len(flip_rows) >= 3
                and any(s - c > 0 for _, s, c in flip_rows)
                and any(s - c < 0 for _, s, c in flip_rows))
-    print("  SPEED-FLIP bw 50/25, predicted tok_s_hi speed/context as the card shrinks: "
+    print("  SPEED-FLIP bw 50/25, predicted tok_s_hi ceiling/fit as the card shrinks: "
           "%s  %s"
           % (" ".join("b%d:%.2f/%.2f" % (b, s, c) for b, s, c in flip_rows),
              "OK" if flip_ok else "FAIL"))
@@ -3961,13 +3975,13 @@ def _run_suite(require_refs, tmp, skipped_real):
         from vram_planner.bench import axis_direction, pick_extreme
 
         nL = 48
-        sp_pr = {"plan_mode": "speed",
-                 "plan": {"kind": "dense_speed", "mode": "speed", "n_gpu_layers": nL,
-                          "n_cpu_ffn": nL, "max_ctx": 65536, "fits_fully": False},
+        sp_pr = {"plan_mode": "ceiling",
+                 "plan": {"kind": "dense_ceiling", "mode": "ceiling", "n_gpu_layers": nL,
+                           "n_cpu_ffn": nL, "max_ctx": 65536, "fits_fully": False},
                  "config": {"n_layers": nL},
                  "inputs": {"context": 32768, "kv_type": "f16", "n_ubatch": 512,
-                            "n_seq": 1, "flash_attn": True, "vram_budget_mib": 16376,
-                            "gpu_reserve_mib": 512, "safety_pct": 5}}
+                             "n_seq": 1, "flash_attn": True, "vram_budget_mib": 16376,
+                             "gpu_reserve_mib": 512, "safety_pct": 5}}
         s_base = {"kv": "f16", "fa": True, "seq": 1, "fill": 2048}
         # The trap, exactly as measured: the SMALLEST window is the fastest row,
         # by a margin far inside the noise a context ladder produces anyway.
@@ -4005,9 +4019,9 @@ def _run_suite(require_refs, tmp, skipped_real):
         # better, so the wall runs downward. That direction was wrong until
         # axis_direction() learned the dense table - it read n_cpu_ffn as "up"
         # and promoted the MOST exiled rung, the opposite of the answer.
-        cx_pr = {"plan_mode": "context",
-                 "plan": {"kind": "dense_context", "mode": "context", "n_gpu_layers": nL,
-                          "n_cpu_ffn": 30, "max_ctx": 32768, "fits_fully": False},
+        cx_pr = {"plan_mode": "fit",
+                 "plan": {"kind": "dense_fit", "mode": "fit", "n_gpu_layers": nL,
+                           "n_cpu_ffn": 30, "max_ctx": 32768, "fits_fully": False},
                  "config": {"n_layers": nL},
                  "inputs": dict(sp_pr["inputs"])}
         c_rows = [{"model": "m.gguf", "status": "ok", "tok_s": t, "proc_vram_mib": 15000,
@@ -4020,13 +4034,13 @@ def _run_suite(require_refs, tmp, skipped_real):
                                and "FFN" in c_got["goal"])
         # ...and once a full exile is not enough, whole blocks leave and the free
         # knob becomes -ngl, which runs the other way. Same rule as ngl_ladder().
-        cx_deep = {"plan_mode": "context",
+        cx_deep = {"plan_mode": "fit",
                    "plan": dict(cx_pr["plan"], n_gpu_layers=31, n_cpu_ffn=nL),
                    "config": {"n_layers": nL}, "inputs": dict(sp_pr["inputs"])}
         mode_ok = mode_ok and mode_axis(cx_deep) == ("ngl", "up")
 
         # A category exempts its own axis from the staleness gate, and nothing
-        # else: a speed plan did not ASK for a context, it proposed one, so a row
+        # else: a ceiling plan did not ASK for a context, it proposed one, so a row
         # that found a larger window is the answer improving. A row at another KV
         # quant is still a different experiment.
         wrong_kv = [dict(s_rows[2], config=dict(s_rows[2]["config"], kv="q8_0"))]
@@ -4039,14 +4053,24 @@ def _run_suite(require_refs, tmp, skipped_real):
         # cases above this one are still asserting.
         mode_ok = mode_ok and mode_axis(pr) == (None, None)             and recommend(pr, [win], sweep_budget_mib=15864)["objective"] == "fastest"
         # ...and a plan_mode with no matching plan is not a category either: the
-        # browser can hold "speed" while looking at an MoE.
-        mode_ok = mode_ok and mode_axis({"plan_mode": "speed",
+        # browser can hold "ceiling" while looking at an MoE.
+        mode_ok = mode_ok and mode_axis({"plan_mode": "ceiling",
                                          "plan": {"kind": "moe"}}) == (None, None)
+        # an old result in a live session carries the old mode names; the
+        # read-side mapping must keep answering with the new categories' axes
+        mode_ok = mode_ok and mode_axis({"plan_mode": "speed",
+                                         "plan": {"mode": "speed",
+                                                  "kind": "dense_speed"}}
+                                        ) == ("ctx", axis_direction("ctx"))
+        mode_ok = mode_ok and mode_axis({"plan_mode": "context",
+                                         "plan": {"mode": "context",
+                                                  "kind": "dense_context"}}
+                                        ) == ("ngl", axis_direction("ngl"))
         # The free axis only means something among rows that pinned everything
-        # else the way this category does. Measured on the real store: the SPEED
-        # card answered "the largest context that loaded" with a row at -ngl 28,
-        # a CONTEXT campaign's row where most of the model is in RAM and 128k
-        # naturally fits - the other plan's answer wearing this plan's badge.
+        # else the way this category does. Measured on the real store: the
+        # ceiling card answered "the largest context that loaded" with a row at
+        # -ngl 28, a fit campaign's row where most of the model is in RAM and
+        # 128k naturally fits - the other plan's answer wearing this plan's badge.
         other_regime = {"model": "m.gguf", "status": "ok", "tok_s": 4.0,
                         "proc_vram_mib": 15000,
                         "config": dict(s_base, ctx=262144, ngl=20, n_cpu_ffn=0, ub=512)}
@@ -4065,7 +4089,7 @@ def _run_suite(require_refs, tmp, skipped_real):
         mode_ok = mode_ok and (pick_extreme(s_rows, "ctx")["config"]["ctx"] == 131072
                                and pick_extreme(s_thrash, "ctx")["config"]["ctx"] == 131072
                                and pick_extreme([], "ctx") is None)
-        print("  RECMODE speed takes the widest window, context the least exiled  %s"
+        print("  RECMODE ceiling takes the widest window, fit the least exiled  %s"
               % ("OK" if mode_ok else "FAIL"))
         rec_all = rec_all and mode_ok
     except Exception as e:

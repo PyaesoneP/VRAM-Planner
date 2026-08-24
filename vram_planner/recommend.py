@@ -90,13 +90,15 @@ def mode_axis(plan_result):
       * the CEILING plan pins both placements at maximum - every block on the
         GPU, every block's dense FFN off it - so the only thing left free is the
         window.
-      * the FIT plan holds the window and pays for it in the cheapest currency
-        first: while every block still fits, the free knob is the -ot exile and
-        less exiled is better; once a full exile is not enough, whole blocks
-        start leaving and the free knob is -ngl. The campaign reaches the same
-        two answers in the other order - it searches -ngl first and only walks
-        the -ot exile back when every block turned out to fit - because it can
-        MEASURE which case it is in, where this has to read it off the plan.
+      * the FIT plan holds the window and is the point on the (blocks-on-GPU,
+        FFN-exile) grid with the most VRAM-resident bytes. What the campaign
+        leaves free depends on which side of that grid the point sits on: with
+        every block still on the GPU the free knob is the -ot exile and less
+        exiled is better; once blocks are off, it is -ngl. The campaign reaches
+        the same two answers in the other order - it searches -ngl first and
+        only walks the -ot exile back when every block turned out to fit -
+        because it can MEASURE which case it is in, where this has to read it
+        off the plan.
 
     A plan outside the two-plan regime has no mode and nothing left free: an
     MoE's --n-cpu-moe and a fits-whole plan are single answers, so they get

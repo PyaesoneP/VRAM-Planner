@@ -1,12 +1,13 @@
 """Turning a model file plus a budget into a layer split."""
 import os
-from .const import _mib
+from .const import _mib, MiB
 from .paths import user_path
 from .gguf import load_gguf, parse_meta_only
 from .model import classify_tensors, extract_config, ot_regex
-from .kv import (KV_TYPE_BYTES, kv_bytes_per_token, kv_bytes_per_token_growing,
-                 kv_bytes_total, kv_bytes_total_at, max_ctx_for_kv_budget,
-                 recurrent_bytes, resolve_kv_lengths, swa_cache_len)
+from .kv import (KV_TYPE_BYTES, kv_bytes_layer, kv_bytes_per_token,
+                 kv_bytes_per_token_growing, kv_bytes_total, kv_bytes_total_at,
+                 max_ctx_for_kv_budget, recurrent_bytes, resolve_kv_lengths,
+                 swa_cache_len)
 from .compute import MTP_SPEC_CONST_MIB, MTP_SPEC_PER_SEQ_MIB, compute_buffer_split, compute_buffer_terms, graph_is_split, output_head_on_gpu, vision_config, vision_grid, vision_peak_mib
 from .gpu import gpu_list, platform_support, cached_bandwidth
 from .speed import estimate_speed
@@ -709,9 +710,10 @@ def analyze(path, ctx, kv_type, n_ubatch, flash_attn,
         #   * the CEILING plan keeps every layer's attention and KV on the GPU
         #     (ngl = all) and exiles every dense FFN to the CPU (-ot); its
         #     answer is the LARGEST context that still fits that way.
-        #   * the FIT plan keeps the requested context pinned and walks -ot
-        #     first, then -ngl, until it fits; its answer is the LEAST exile
-        #     that does, and that is also the fastest way to hold this context.
+        #   * the FIT plan keeps the requested context pinned and searches the
+        #     whole (blocks-on-GPU, FFN-exile) grid; its answer is the point
+        #     with the most VRAM-resident bytes, which is also the fastest way
+        #     to hold this context.
         # Both plans load the same bytes, so the only thing that differs between
         # them at the requested context is HOW MANY weights sit in VRAM - and
         # that is exactly what the pick compares below.
@@ -1370,21 +1372,26 @@ def _plan_dense_fit(cfg, cl, eff_vram, ram, kv_total, weights, embed, output,
                     rec_total, max_ctx_gpu, ctx, kv_type, flash_attn, n_seq,
                     compute_fn, gpu_extra, layer_max, layer_mean, ffn_layer_mean):
     """Plan the FIT: the requested context is pinned and it is the thing being
-    protected. Two knobs pay for it, in this order:
+    protected. The answer is the (-ngl, -ot) point that leaves the MOST
+    VRAM-resident bytes - weights + KV + recurrent state - on the GPU.
 
-      1. The dense FFN is exiled to the CPU (-ot), and the search asks how
-         LITTLE of it has to go. Exiling FFN frees VRAM without costing any KV,
-         so with every block still on the GPU the answer is the SMALLEST
-         n_cpu_ffn that fits - exactly the shape of the MoE planner's
-         --n-cpu-moe search, and for the same reason: those are the only weights
-         big enough to be worth moving, and moving them does not drag KV along.
-      2. Only when even a full FFN exile is not enough does -ngl come down. That
-         is the expensive step - a whole block leaving the GPU takes its KV with
-         it - so it is the fallback, not the first move.
+    The old search moved one knob at a time: first the least FFN exile that
+    held the context with every block on the GPU, and only when even a full
+    exile fell short, walk -ngl down with the full exile pinned for the whole
+    walk. That left VRAM unused and streamed FFN weights over PCIe every token
+    for no reason - an interior point (a few blocks off the GPU, LESS FFN
+    exiled) usually beats both corners on resident bytes. So score the whole
+    (ngl, exile) grid: per-layer suffix sums price each point in O(1) instead
+    of _dense_cost's O(n), which keeps the full (n+1)^2 search in the
+    milliseconds even at 126 layers. Within a row both VRAM and resident bytes
+    fall as the exile grows, so the row's best point is its SMALLEST feasible
+    exile and the search is the argmax over those rows. Ties on resident bytes
+    go to the more layers on the GPU, then the less exile - the ceiling plan
+    already owns the other corner, and the least-exiled point streams the
+    least per token.
 
-    The old planner pinned n_cpu_ffn at every block unconditionally and went
-    straight to walking -ngl. On a card with room to spare that left VRAM unused
-    and streamed FFN weights over PCIe every token for no reason.
+    min_sacrifice carries the old row's answer as a sub-field: every block on
+    the GPU, the least FFN exile that still held the context.
 
     The sibling (ceiling plan) pins the other way: -ngl and the FFN exile are
     both at maximum and the CONTEXT is what is free."""
@@ -1407,38 +1414,95 @@ def _plan_dense_fit(cfg, cl, eff_vram, ram, kv_total, weights, embed, output,
         ram_used = cpu_w + (kv_total - gpu_kv) + (rec_total - gpu_rec) + cb["cpu"]
         return cost, cb, extra, gpu_w, cpu_w, gpu_kv, gpu_rec, vram_used, ram_used
 
-    # Phase 1: every block on the GPU, and as much FFN kept there as fits.
-    # Ascending, so the first hit is the LEAST FFN exiled - the most weight left
-    # in VRAM. n_cpu_ffn=0 is "nothing exiled at all", which is the right answer
-    # whenever the whole model fits at this context.
+    # Per-layer byte tables and their suffix sums, so any (ngl, exile) point
+    # prices in O(1) instead of _dense_cost's O(n) walk: the full (n+1)^2 grid
+    # has to stay in the milliseconds at 126 layers. The k = n - ngl first
+    # layers are the CPU-resident ones; the exile covers layers [0, f), so the
+    # FFN handed to the CPU while staying resident is [k, min(f, n)).
+    per_layer = cl.get("per_layer_bytes") or {}
+    per_ffn   = cl.get("per_layer_ffn_bytes") or {}
+    if per_layer:
+        lay_b = [float(per_layer.get(i, 0.0)) for i in range(n_layers)]
+        ff_b  = [float(per_ffn.get(i, 0.0)) for i in range(n_layers)]
+    else:
+        # metadata-only parse: the mean-value proxy _dense_cost itself falls
+        # back to, so the grid and the final build() stay on the same numbers.
+        lay_b = [layer_max * MiB] * n_layers
+        ff_b  = [ffn_layer_mean * MiB] * n_layers
+    kv_b  = [kv_bytes_layer(cfg, kv_type, i) for i in range(n_layers)]
+    ssm   = set(cfg.get("ssm_layers") or ())
+    rec_u = cfg.get("recurrent_bytes_per_layer", 0.0) * max(1, n_seq)
+    rec_b = [rec_u if i in ssm else 0.0 for i in range(n_layers)]
+    SB = [0.0] * (n_layers + 1)
+    SF = [0.0] * (n_layers + 1)
+    SK = [0.0] * (n_layers + 1)
+    SR = [0.0] * (n_layers + 1)
+    for i in range(n_layers - 1, -1, -1):
+        SB[i] = SB[i + 1] + lay_b[i]
+        SF[i] = SF[i + 1] + min(lay_b[i], ff_b[i])
+        SK[i] = SK[i + 1] + kv_b[i]
+        SR[i] = SR[i + 1] + rec_b[i]
+    exb = [gpu_extra(ngl) for ngl in range(n_layers + 1)]
+    _cb_cache = {}
+    def _cb(ngl, n_cpu_ffn):
+        key = (ngl, graph_is_split(n_layers, ngl, 0, n_cpu_ffn))
+        v = _cb_cache.get(key)
+        if v is None:
+            v = (compute_fn(ngl, any_on_cpu=key[1]) if compute_fn
+                 else {"gpu": 0.0, "cpu": 0.0})
+            _cb_cache[key] = v
+        return v
+    def point(ngl, n_cpu_ffn):
+        """(vram_used, resident_bytes) of a grid point, both in MiB, O(1)."""
+        k = n_layers - ngl
+        j = k if n_cpu_ffn <= k else n_cpu_ffn
+        gpu_w = _mib(SB[k] - (SF[k] - SF[j])) + exb[ngl]
+        gpu_kv = kv_total if k == 0 else _mib(SK[k])
+        gpu_rec = rec_total if k == 0 else _mib(SR[k])
+        resident = gpu_w + gpu_kv + gpu_rec
+        return resident + _cb(ngl, n_cpu_ffn)["gpu"], resident
+    # Within a row, VRAM and resident bytes are non-increasing in the exile on
+    # [1, n] - the graph is split at every one of those points, so the split
+    # surcharge is constant there - and the one step that can go the other way
+    # is 0 -> 1 on the all-GPU row, where the surcharge arrives while only
+    # block 0's FFN leaves. A row's best point is its SMALLEST feasible exile:
+    # f=0 when the whole row fits, f=n when none of it does, else a bisection
+    # over [1, n] with f=0 checked on its own.
+    def row_point(ngl):
+        if point(ngl, 0)[0] <= eff_vram:
+            return 0
+        if point(ngl, n_layers)[0] > eff_vram:
+            return None
+        lo, hi = 1, n_layers
+        while lo < hi:
+            mid = (lo + hi) // 2
+            if point(ngl, mid)[0] <= eff_vram:
+                hi = mid
+            else:
+                lo = mid + 1
+        return lo
     best = None
-    n_cpu_ffn = n_layers
-    for f in range(0, n_layers + 1):
-        c = build(n_layers, f)
-        if c[7] <= eff_vram:
-            best, n_cpu_ffn = (n_layers, c), f
-            break
-    # Phase 2: a full FFN exile still does not fit, so blocks have to go too.
-    # Blocks are not interchangeable, so search downward for the largest ngl
-    # that does - the same rule the classic planner uses.
+    for ngl in range(n_layers + 1):
+        f = row_point(ngl)
+        if f is None:
+            continue
+        _v, r = point(ngl, f)
+        key = (r, ngl, -f)
+        if best is None or key > best[0]:
+            best = (key, ngl, f)
     if best is None:
-        n_cpu_ffn = n_layers
-        for ngl in range(n_layers - 1, -1, -1):
-            c = build(ngl, n_cpu_ffn)
-            if c[7] <= eff_vram:
-                best = (ngl, c)
-                break
-    if best is None:
-        ngl, c = 0, build(0, n_cpu_ffn)
+        ngl, n_cpu_ffn = 0, n_layers
+        c = build(ngl, n_cpu_ffn)
         cost, cb, extra, gpu_w, cpu_w, gpu_kv, gpu_rec, vram_used, ram_used = c
         head = ("The context cannot fit even with nothing on the GPU: %.0f MiB of KV alone "
                 "exceeds the %.0f MiB RAM budget plus whatever the card keeps. Lower the "
                 "context or the KV quant." % (kv_total, ram))
         overflow = True
     else:
-        ngl, c = best
+        _key, ngl, n_cpu_ffn = best
+        c = build(ngl, n_cpu_ffn)
         cost, cb, extra, gpu_w, cpu_w, gpu_kv, gpu_rec, vram_used, ram_used = c
-        if n_cpu_ffn <= 0:
+        if ngl >= n_layers and n_cpu_ffn <= 0:
             head = ("Context %s pinned: all %d layers on the GPU, whole - nothing "
                     "had to be exiled to fit it." % (f"{ctx:,}", n_layers))
         elif ngl >= n_layers:
@@ -1446,12 +1510,33 @@ def _plan_dense_fit(cfg, cl, eff_vram, ram, kv_total, weights, embed, output,
                     "blocks' dense FFN on the CPU (-ot) to pay for it. The other %d "
                     "keep their FFN in VRAM."
                     % (f"{ctx:,}", n_layers, n_cpu_ffn, n_layers - n_cpu_ffn))
-        else:
-            head = ("Context %s pinned: %d of %d layers on GPU, every dense FFN on "
-                    "the CPU (-ot). The other %d layers run on the CPU, KV and all "
-                    "- that is the price of the context."
+        elif n_cpu_ffn <= 0:
+            head = ("Context %s pinned: %d of %d layers on GPU, nothing exiled - the "
+                    "other %d layers run on the CPU, KV and all. That is the price "
+                    "of the context."
                     % (f"{ctx:,}", ngl, n_layers, n_layers - ngl))
+        else:
+            head = ("Context %s pinned: %d of %d layers on GPU, the first %d blocks' "
+                    "dense FFN on the CPU (-ot) - the split that keeps the most "
+                    "bytes resident at this context. The other %d layers run on "
+                    "the CPU, KV and all."
+                    % (f"{ctx:,}", ngl, n_layers, n_cpu_ffn, n_layers - ngl))
         overflow = False
+    # The old row's answer survives as a sub-field: every block on the GPU, the
+    # least FFN exile that still held the context (all of it, when even that
+    # does not fit).
+    f_row = row_point(n_layers)
+    if f_row is None:
+        f_row = n_layers
+    c_row = build(n_layers, f_row)
+    min_sacrifice = {
+        "n_gpu_layers": n_layers, "n_cpu_ffn": f_row,
+        "vram_used_mib": c_row[7], "vram_ok": c_row[7] <= eff_vram,
+        "ram_used_mib": c_row[8], "ram_ok": c_row[8] <= ram,
+        # what the row keeps resident (weights + KV + recurrent) - the grid's
+        # point must keep at least this much, because the row is a grid point
+        "resident_mib": c_row[3] + c_row[5] + c_row[6],
+    }
     if not (ram_used <= ram):
         head += "  WARNING: needs %.0f MiB RAM (> %.0f budget)." % (ram_used, ram)
     ls = ["GPU Offload / GPU Layers: %s"
@@ -1474,6 +1559,7 @@ def _plan_dense_fit(cfg, cl, eff_vram, ram, kv_total, weights, embed, output,
         "cpu_weights_mib": cpu_w, "cpu_kv_mib": kv_total - gpu_kv,
         "cpu_recurrent_mib": rec_total - gpu_rec,
         "forced_ngl": False,
+        "min_sacrifice": min_sacrifice,
         "lmstudio": ls,
         "llama_cmd": _llama_flags(ctx, kv_type, flash_attn,
                                   ngl=(99 if ngl >= n_layers else ngl),
@@ -1493,13 +1579,23 @@ def _plan_moe(cfg, cl, eff_vram, ram, kv_total, kv_layer, compute, weights,
       * -ngl N          -> the last N blocks live on the GPU (attention + KV too)
       * --n-cpu-moe M   -> the routed experts of the FIRST M blocks go to the CPU
 
-    The efficient MoE config is ngl = all blocks (so every layer's attention and
-    KV stay on the GPU) plus the smallest --n-cpu-moe that fits, because experts
-    are the only weights big enough to be worth moving and only 8-of-256 of them
-    run per token. Whole-layer offload is the fallback for when even that fails.
+    The answer is the point that leaves the MOST VRAM-resident bytes (weights +
+    KV + recurrent state) on the GPU at the requested context. The old search
+    was one row then one column: the least expert exile that fit with every
+    block on the GPU, and - only when even a full exile fell short - the
+    largest ngl that fit with all experts exiled. An interior point (a few
+    blocks off the GPU, LESS expert exile) usually beats both corners on
+    resident bytes, so the whole (ngl, exile) grid is scored: per-layer suffix
+    sums price each point in O(1) and the argmax is taken over VRAM-resident
+    bytes subject to fitting at the context. Ties go to the more layers on the
+    GPU, then the less exile.
 
-    Everything is summed from the real per-block tensor bytes - expert blocks are
-    not interchangeable, and on a hybrid MoE only some blocks carry KV at all.
+    min_sacrifice carries the old row's answer: every block on the GPU, the
+    least expert exile that still held the context.
+
+    Everything is summed from the real per-block tensor bytes - expert blocks
+    are not interchangeable, and on a hybrid MoE only some blocks carry KV at
+    all.
     """
     n_layers = cfg["n_layers"]
     n_exp_layers = cl["n_expert_layers"]
@@ -1588,52 +1684,162 @@ def _plan_moe(cfg, cl, eff_vram, ram, kv_total, kv_layer, compute, weights,
                        "Context Length: %d" % ctx],
                       _llama_flags(ctx, kv_type, flash_attn, ngl=99))
 
-    # ---- keep every block on the GPU, push out only as many experts as needed
-    for ncm in range(0, n_layers + 1):
-        c = cost(n_layers, ncm)
-        if c["vram_used_mib"] <= eff_vram:
-            experts_gpu = n_layers - ncm
-            if ncm == 0:
-                head = "All experts fit on GPU alongside attention + KV."
-                ls = ["GPU Offload / GPU Layers: max",
-                      "Force Model Expert Weights onto CPU: OFF", "Context Length: %d" % ctx]
-                cmd = _llama_flags(ctx, kv_type, flash_attn, ngl=99)
-            elif experts_gpu == 0:
-                head = "Attention + KV on GPU; ALL experts on CPU (%d blocks)." % ncm
-                ls = ["GPU Offload / GPU Layers: max",
-                      "Force Model Expert Weights onto CPU: ON", "Context Length: %d" % ctx]
-                cmd = _llama_flags(ctx, kv_type, flash_attn, ngl=999, ot_all_experts=True)
+    # ---- score the whole (ngl, n-cpu-moe) grid -----------------------------
+    # Per-layer suffix sums price every point in O(1) instead of cost()'s O(n)
+    # walk, the same move as the dense fit planner: the full (n+1)^2 grid has
+    # to stay in the milliseconds. k = n - ngl blocks are CPU-resident, the
+    # exile covers blocks [0, n_cm), so the expert bytes handed to the CPU
+    # while staying resident are [k, min(n_cm, n)).
+    lay_b = [float(per_layer.get(i, 0)) for i in range(n_layers)]
+    e_b   = [float(per_expert.get(i, 0)) for i in range(n_layers)]
+    kv_b  = [kv_bytes_layer(cfg, kv_type, i) for i in range(n_layers)]
+    ssm   = set(cfg.get("ssm_layers") or ())
+    rec_u = cfg.get("recurrent_bytes_per_layer", 0.0) * max(1, n_seq)
+    rec_b = [rec_u if i in ssm else 0.0 for i in range(n_layers)]
+    SB = [0.0] * (n_layers + 1)
+    SE = [0.0] * (n_layers + 1)
+    SK = [0.0] * (n_layers + 1)
+    SR = [0.0] * (n_layers + 1)
+    for i in range(n_layers - 1, -1, -1):
+        SB[i] = SB[i + 1] + lay_b[i]
+        SE[i] = SE[i + 1] + e_b[i]
+        SK[i] = SK[i + 1] + kv_b[i]
+        SR[i] = SR[i + 1] + rec_b[i]
+    _cb_cache = {}
+    def _cb(ngl, n_cm):
+        key = (ngl, graph_is_split(n_layers, ngl, n_cm))
+        v = _cb_cache.get(key)
+        if v is None:
+            v = (compute_fn(ngl, any_on_cpu=key[1]) if compute_fn
+                 else {"gpu": compute, "cpu": 0.0})
+            _cb_cache[key] = v
+        return v
+    def point(ngl, n_cm):
+        """(vram_used, resident_bytes) of a grid point, both in MiB, O(1)."""
+        k = n_layers - ngl
+        j = k if n_cm <= k else n_cm
+        gpu_w = _mib(SB[k] - (SE[k] - SE[j]))
+        gpu_kv = kv_total if k == 0 else _mib(SK[k])
+        gpu_rec = rec_total if k == 0 else _mib(SR[k])
+        resident = gpu_w + gpu_kv + gpu_rec
+        return resident + _cb(ngl, n_cm)["gpu"], resident
+    # Within a row, VRAM and resident bytes are non-increasing in the exile on
+    # [1, n] - the graph is split at every one of those points, so the split
+    # surcharge is constant there - and the one step that can go the other way
+    # is 0 -> 1 on the all-GPU row, where the surcharge arrives while only
+    # block 0's experts leave. A row's best point is its SMALLEST feasible
+    # exile: n_cm=0 when the whole row fits, n_cm=n when none of it does, else
+    # a bisection over [1, n] with n_cm=0 checked on its own.
+    def row_point(ngl):
+        if point(ngl, 0)[0] <= eff_vram:
+            return 0
+        if point(ngl, n_layers)[0] > eff_vram:
+            return None
+        lo, hi = 1, n_layers
+        while lo < hi:
+            mid = (lo + hi) // 2
+            if point(ngl, mid)[0] <= eff_vram:
+                hi = mid
             else:
-                head = ("Attention + KV on GPU; experts for %d blocks on CPU, %d on GPU."
-                        % (ncm, experts_gpu))
-                ls = ["GPU Offload / GPU Layers: max",
-                      "0.4.x: set 'Num CPU Expert Layers' (Number of layers to keep experts "
-                      "on CPU) to %d - NOT the GPU Offload slider." % ncm,
-                      "0.3.x: 'Force Model Expert Weights onto CPU' offloads ALL experts; "
-                      "use the llama.cpp command below for a partial split.",
-                      "Context Length: %d" % ctx]
-                cmd = _llama_flags(ctx, kv_type, flash_attn, ngl=999, n_cpu_moe=ncm)
-            return finish(c, head, ls, cmd)
-
-    # ---- even attention + KV alone don't fit: fall back to whole-block offload
+                lo = mid + 1
+        return lo
     best = None
-    for ngl in range(n_layers, -1, -1):
-        c = cost(ngl, n_layers)                  # all experts on CPU
-        if c["vram_used_mib"] <= eff_vram:
-            best = c
-            break
+    for ngl in range(n_layers + 1):
+        m = row_point(ngl)
+        if m is None:
+            continue
+        _v, r = point(ngl, m)
+        key = (r, ngl, -m)
+        if best is None or key > best[0]:
+            best = (key, ngl, m)
     if best is None:
-        best = cost(0, n_layers)
-    c = best
-    c["attention_overflow"] = True
-    head = ("Attention + KV for all %d blocks (%.0f MiB KV at %s ctx) exceed the %.0f MiB budget "
-            "even with every expert on CPU - falling back to %d whole blocks on GPU. "
-            "Lower the context to keep attention on the GPU."
-            % (n_layers, kv_total, f"{ctx:,}", eff_vram, c["n_gpu_layers"]))
-    return finish(c, head,
-                  ["Even attention+KV exceed VRAM at this context.",
-                   "Lower Context Length (KV cache is the cost) before reducing GPU Layers.",
-                   "GPU Offload / GPU Layers: %d" % c["n_gpu_layers"],
-                   "Num CPU Expert Layers: %d" % n_layers],
-                  _llama_flags(ctx, kv_type, flash_attn, ngl=c["n_gpu_layers"],
-                               n_cpu_moe=n_layers))
+        ngl, n_cm = 0, n_layers
+    else:
+        _key, ngl, n_cm = best
+    c = cost(ngl, n_cm)
+    # The flag means "the returned plan does not fit" - set only when no grid
+    # point fits at all and the fallback (nothing on the GPU) is what comes
+    # back, like the dense kv_overflow. The all-blocks row failing while a
+    # lower row still fits is a degraded but feasible plan; _verdict must read
+    # its own numbers for it, or a long-context MoE plan reads "DOES NOT FIT".
+    attention_overflow = best is None
+    if attention_overflow:
+        c["attention_overflow"] = True
+    # The old row's answer survives as a sub-field: every block on the GPU,
+    # the least expert exile that still held the context (all of it, when
+    # even that does not fit).
+    m_row = row_point(n_layers)
+    if m_row is None:
+        m_row = n_layers
+    c_row = cost(n_layers, m_row)
+    _v_row, r_row = point(n_layers, m_row)
+    # finish() derives the RAM line from the cost dict; do the same here
+    ram_row = (c_row["cpu_weights_mib"] + c_row["cpu_kv_mib"]
+               + c_row["cpu_recurrent_mib"] + c_row.get("cpu_compute_mib", 0.0))
+    c["min_sacrifice"] = {
+        "n_gpu_layers": n_layers, "n_cpu_moe": m_row,
+        "vram_used_mib": c_row["vram_used_mib"],
+        "vram_ok": c_row["vram_used_mib"] <= eff_vram,
+        "ram_used_mib": ram_row,
+        "ram_ok": ram_row <= ram,
+        # what the row keeps resident - the grid's point must keep at least
+        # this much, because the row is a grid point
+        "resident_mib": r_row,
+    }
+    if ngl >= n_layers and n_cm == 0:
+        head = "All experts fit on GPU alongside attention + KV."
+        ls = ["GPU Offload / GPU Layers: max",
+              "Force Model Expert Weights onto CPU: OFF", "Context Length: %d" % ctx]
+        cmd = _llama_flags(ctx, kv_type, flash_attn, ngl=99)
+    elif ngl >= n_layers:
+        experts_gpu = n_layers - n_cm
+        if experts_gpu == 0:
+            head = "Attention + KV on GPU; ALL experts on CPU (%d blocks)." % n_cm
+            ls = ["GPU Offload / GPU Layers: max",
+                  "Force Model Expert Weights onto CPU: ON", "Context Length: %d" % ctx]
+            cmd = _llama_flags(ctx, kv_type, flash_attn, ngl=999, ot_all_experts=True)
+        else:
+            head = ("Attention + KV on GPU; experts for %d blocks on CPU, %d on GPU."
+                    % (n_cm, experts_gpu))
+            ls = ["GPU Offload / GPU Layers: max",
+                  "0.4.x: set 'Num CPU Expert Layers' (Number of layers to keep experts "
+                  "on CPU) to %d - NOT the GPU Offload slider." % n_cm,
+                  "0.3.x: 'Force Model Expert Weights onto CPU' offloads ALL experts; "
+                  "use the llama.cpp command below for a partial split.",
+                  "Context Length: %d" % ctx]
+            cmd = _llama_flags(ctx, kv_type, flash_attn, ngl=999, n_cpu_moe=n_cm)
+    elif n_cm == 0:
+        head = ("%d of %d blocks on GPU with all experts on GPU - the other %d "
+                "blocks run on the CPU, KV and all. That is the split that keeps "
+                "the most bytes resident at this context."
+                % (ngl, n_layers, n_layers - ngl))
+        ls = ["GPU Offload / GPU Layers: %d" % ngl,
+              "Force Model Expert Weights onto CPU: OFF", "Context Length: %d" % ctx]
+        cmd = _llama_flags(ctx, kv_type, flash_attn, ngl=ngl)
+    elif n_cm >= n_layers:
+        if attention_overflow:
+            head = ("Attention + KV for all %d blocks (%.0f MiB KV at %s ctx) exceed the %.0f MiB budget "
+                    "even with every expert on CPU - falling back to %d whole blocks on GPU. "
+                    "Lower the context to keep attention on the GPU."
+                    % (n_layers, kv_total, f"{ctx:,}", eff_vram, ngl))
+            ls = ["Even attention+KV exceed VRAM at this context.",
+                  "Lower Context Length (KV cache is the cost) before reducing GPU Layers."]
+        else:
+            head = ("%d of %d blocks on GPU, ALL experts on CPU - the split that "
+                    "keeps the most bytes resident at this context." % (ngl, n_layers))
+            ls = ["Experts of every block pinned to the CPU."]
+        ls.append("GPU Offload / GPU Layers: %d" % ngl)
+        ls.append("Num CPU Expert Layers: %d" % n_layers)
+        cmd = _llama_flags(ctx, kv_type, flash_attn, ngl=ngl, n_cpu_moe=n_layers)
+    else:
+        head = ("%d of %d blocks on GPU, experts of the first %d blocks on the CPU "
+                "- the split that keeps the most bytes resident at this context."
+                % (ngl, n_layers, n_cm))
+        ls = ["GPU Offload / GPU Layers: %d" % ngl,
+              "0.4.x: set 'Num CPU Expert Layers' (Number of layers to keep experts "
+              "on CPU) to %d - NOT the GPU Offload slider." % n_cm,
+              "0.3.x: 'Force Model Expert Weights onto CPU' offloads ALL experts; "
+              "use the llama.cpp command below for a partial split.",
+              "Context Length: %d" % ctx]
+        cmd = _llama_flags(ctx, kv_type, flash_attn, ngl=ngl, n_cpu_moe=n_cm)
+    return finish(c, head, ls, cmd)

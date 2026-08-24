@@ -67,10 +67,11 @@ neither of them said so.
 not fit, it returns two of them — one per question. The *ceiling* plan pins
 `-ngl` at every block and exiles every block's dense FFN to RAM (`-ot`), then
 solves for the largest context that still fits; the *fit* plan holds the context
-you asked for and walks `-ot` down first — then `-ngl`, once a full exile is not
-enough — to the least exile that fits. On an MoE
-`_plan_moe` searches up from `--n-cpu-moe 0` for the first split that fits. All of
-them stop at the first feasible config. That is a **memory** answer.
+you asked for and searches the whole (blocks-on-GPU × FFN-exile) grid, keeping
+the point with the most VRAM-resident bytes — a pure layer exile, a pure FFN
+exile, or a mix of the two. On an MoE
+`_plan_moe` does the same over (blocks-on-GPU × `--n-cpu-moe`): the point with
+the most expert blocks resident. These are **memory** answers.
 
 **Which question you are asking is a control, not a discovery.** *Plan for* sits
 in tier 1 of the form, above **Analyze fit**: *Auto*, *Ceiling*, *Fit*. Auto —

@@ -47,7 +47,7 @@ let PLAN_MODE = null;
 const PLAN_MODES = [
   ["auto",    "Auto",    "whichever the planner predicts faster at the context above"],
   ["ceiling", "Ceiling", "all layers on the GPU; context is what fits"],
-  ["fit",     "Fit",     "hold the context; pay in FFN, then layers"]
+  ["fit",     "Fit",     "hold the context; keep the most bytes on the card (FFN, layers, or a mix)"]
 ];
 
 const CALIB_TERMS = ["floor", "ctx", "act", "nofa"];
@@ -940,8 +940,8 @@ function recToScript(){
  *
  * A model that does not fit has one answer per question: keep every block's
  * attention and KV on the GPU with the dense FFN exiled and take the largest
- * context that still fits (CEILING), or hold the context you asked for and walk
- * -ot (then -ngl) down to the least exile that fits (FIT). The server computes
+  * context that still fits (CEILING), or hold the context you asked for and keep
+  * the most bytes on the card anywhere on the split grid (FIT). The server computes
  * both, prices both AT THE CONTEXT YOU ASKED FOR, and preselects the one it
  * predicts faster - so flipping is free (no round trip) and every card below
  * re-renders from the plan that was picked. */
@@ -987,10 +987,12 @@ function renderModes(r){
       ${pick.reason ? raw(pick.reason) + " " : ""}
       Switch with the chips above <b>Analyze fit</b>.
       <details class="why"><summary>what the two trade</summary>
-        Both exile dense FFN to RAM (<b>-ot</b>); they differ in what is left free.
-        <b>Ceiling</b> pins every layer on the GPU so all the KV stays in VRAM and the
-        window becomes whatever still fits. <b>Fit</b> holds the window you asked for and
-        gives up FFN &mdash; then layers, if the full exile is not enough &mdash; to pay for it.
+        They differ in what is left free. <b>Ceiling</b> pins every layer on the GPU with
+        every block's dense FFN exiled to RAM (<b>-ot</b>), so all the KV stays in VRAM and
+        the window becomes whatever still fits. <b>Fit</b> holds the window you asked for
+        and searches the whole split grid &mdash; blocks on the GPU and FFN blocks exiled
+        &mdash; keeping the point with the most bytes in VRAM: a pure layer exile, a pure
+        FFN exile, or a mix of the two.
         The auto pick prices both at your context and takes the faster; the choice also
         decides which recorded row <b>Run this</b> calls the best one.</details></p>
   </section>`;

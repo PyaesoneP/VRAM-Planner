@@ -4040,6 +4040,43 @@ def _run_suite(require_refs, tmp, skipped_real):
                         _facts, {}, _drf, "ctx") is None
             and _spec_retry(_spec_c, {"config": _spec_c, "status": "oom"},
                             _facts, {}, _drf, "ctx") is not None)
+        # 19c) ...and #27454's other tenant of the same signature: the base
+        #     filled the card, the draft loader NaNs its device split, and the
+        #     row reads loadfail. The headroom the base left (11523 - 10999.8,
+        #     the shape of the burst that taught this) is under the drafter's
+        #     weights, so the row is the OOM the walk exists for: it starts one
+        #     rung freer and the walk keeps going on the probe's own row.
+        _dfl = {"kind": "dflash", "block_size": 16, "path": "dflash-1.gguf",
+                "tensor_bytes": 1556 * 1024 * 1024}
+        _no_room = {"config": _spec_c, "status": "loadfail",
+                    "error": "invalid vector subscript",
+                    "gpu_free_before_mib": 11523.0,
+                    "log": {"load_error": "invalid vector subscript", "oom": False,
+                            "ready": False,
+                            "buffers": {"CUDA0.model": 9674.8, "CUDA0.KV": 884.0,
+                                        "CUDA0.compute": 441.0,
+                                        "CPU_Mapped.model": 12990.0}}}
+        _nr_c = dict(_spec_c, spec="draft-dflash", md="dflash-1.gguf")
+        _tries = {}
+        _p1 = _spec_retry(_nr_c, _no_room, _facts, _tries, _dfl, "ctx")
+        _p2 = _spec_retry(_p1, _no_room, _facts, _tries, _dfl, "ctx")
+        # 19d) The reverse: plenty of headroom, drafter still refused - a broken
+        #     file, and the walk must stay away (19b's whole point, kept true
+        #     once the no-room case walks). Missing numbers stay loadfail too -
+        #     the walk walks on numbers, not on sympathy.
+        _roomy = dict(_no_room, gpu_free_before_mib=40000.0)
+        _no_free = dict(_no_room)
+        del _no_free["gpu_free_before_mib"]
+        _no_md = dict(_nr_c, md="")
+        _bad_md = dict(_nr_c, md="C:/no/such/dflash-9.gguf")
+        ok_ = ok_ and (
+            _p1 is not None and _p1["n_cpu_ffn"] == 1
+            and _p2 is not None and _p2["n_cpu_ffn"] == 2
+            and _spec_retry(_nr_c, _roomy, _facts, {}, _dfl, "ctx") is None
+            and _spec_retry(_nr_c, _no_free, _facts, {}, _dfl, "ctx") is None
+            and _spec_retry(_no_md, _no_room, _facts, {}, _dfl, "ctx") is None
+            and _spec_retry(_bad_md, _no_room, _facts, {},
+                            {"kind": "dflash", "block_size": 16}, "ctx") is None)
         print("  WALLSIG assert-only log is oom, post-ready assert is not  %s"
               % ("OK" if ok_ else "FAIL"))
     except Exception as e:

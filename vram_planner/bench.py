@@ -27,8 +27,8 @@ from .gpu import get_gpu_processes, gpu_list, gpu_shared_mib
 from .lmstudio import default_models_dir
 from .paths import _data_dir
 from .sweep import (build_argv, classify_drafter, discover_models,
-                    find_drafter_for, finish_row, model_facts, pick_backend,
-                    backends_dir, serve, sweep_path,
+                    find_drafter_for, finish_row, gpu_side, model_facts,
+                    pick_backend, backends_dir, serve, sweep_path,
                     _drafter_block_size, _key, load_rows, unsound_reason)
 
 
@@ -2783,19 +2783,27 @@ def speed_sweep(models=None, backend=None, dry_run=False, timeout=420.0,
                 # A hard OOM is monotone evidence: it proves every pending config
                 # in the same family that is worse on a tagged axis fails the same
                 # way, so those loads would re-prove the wall instead of measuring
-                # anything. Only `oom` prunes - a genfail, exit or timeout says
-                # nothing about the next rung, and `spilled` means it LOADED (and
-                # ran badly), which is a measurement. The OOM row stays: it is
-                # the wall the ladder is read from. Pruned rows are never
-                # recorded, so a resumed campaign after a card change re-measures
-                # them naturally.
-                if row.get("status") == "oom":
+                # anything. A drafter load failure with no headroom for the
+                # drafter's weights is the same evidence wearing a file's clothes -
+                # _draft_no_room(): the base filled the card, which is a fact
+                # about the split, not the file. Everything else says nothing
+                # about the next rung: a genfail, exit or timeout, and `spilled`
+                # means it LOADED (and ran badly), which is a measurement; a
+                # loadfail WITH headroom is a fact about the file, and the walk's
+                # own gate at _spec_retry() keeps it from being retried. The wall
+                # row stays: it is the ladder's reading point. Pruned rows are
+                # never recorded, so a resumed campaign after a card change
+                # re-measures them naturally.
+                if row.get("status") == "oom" or _draft_no_room(c, row, drafter):
                     kept, dropped = _prune_queue(queue, walls, i, name, c)
                     if dropped:
                         queue = kept
-                        log("wall    : %s OOMs; %d later config%s provably worse, "
+                        log("wall    : %s %s; %d later config%s provably worse, "
                             "skipped: %s"
-                            % (_carry_summary(c), len(dropped),
+                            % (_carry_summary(c),
+                               "OOMs" if row.get("status") == "oom"
+                               else "leaves no room for the drafter",
+                               len(dropped),
                                "" if len(dropped) == 1 else "s",
                                ", ".join(_carry_summary(d) for d in dropped)))
                         total[0] = len(out) + (len(queue) - i - 1)
@@ -2858,8 +2866,9 @@ def speed_sweep(models=None, backend=None, dry_run=False, timeout=420.0,
                     # where the cache fitted and the walk is simply carrying on
                     # to the next depth. Two situations, two sentences.
                     log("          ^ %s: %s"
-                        % (("the draft cache does not fit here, walking one rung "
-                            "freer" if row.get("status") == "oom"
+                        % (("the drafter does not fit here, walking one rung "
+                            "freer" if (row.get("status") == "oom"
+                                        or _draft_no_room(c, row, drafter))
                             else "it fits, so the depth ladder continues here"),
                            _carry_summary(nxt)))
                     queue.append(nxt)
@@ -3232,6 +3241,70 @@ def _draft_probe(c, axis, rung, depth):
     return d
 
 
+_DRAFTER_FLOOR = {}
+
+
+def _drafter_floor_mib(drafter, md):
+    """The drafter's tensor bytes, in MiB - the VRAM a card must leave it just to
+    hold the weights, before a draft cache or a compute graph exists.
+
+    Taken from the campaign's drafter detail when it carries the number, else
+    read once from the file the config points at and cached by path. A GGUF's
+    tensor table is a header section, so this is a few kilobytes of reading even
+    for a multi-gigabyte drafter. None when the file cannot be read, which
+    reads as "cannot tell" and the row stays a plain loadfail rather than being
+    waved through the walk on a guess."""
+    v = (drafter or {}).get("tensor_bytes")
+    if v is None and md:
+        try:
+            key = os.path.normcase(os.path.abspath(md))
+        except TypeError:
+            return None
+        if key not in _DRAFTER_FLOOR:
+            try:
+                from .plan import load_drafter   # deferred: plan is above bench
+                _DRAFTER_FLOOR[key] = load_drafter(md)["tensor_bytes"]
+            except Exception:
+                return None
+        v = _DRAFTER_FLOOR[key]
+    return None if v is None else v / (1024.0 * 1024.0)
+
+
+def _draft_no_room(c, row, drafter):
+    """A drafter load failure that is a lack of room wearing the file's clothes.
+
+    When the target model has filled the card, llama.cpp's draft loader dies in
+    load_tensors with the same "error loading model: invalid vector subscript" a
+    broken file produces (ggml-org/llama.cpp#27454: zero free, non-zero total
+    NaNs the device split), so the log line cannot tell the two apart. The row
+    can: the base model's own buffers are in the parsed log, the free memory it
+    started with is on the row, and the drafter's weights are a number. If the
+    headroom the base left is less than the weights alone, the file is innocent
+    - nothing it contains could have loaded - and the row is the OOM the walk
+    exists for.
+
+    The reverse stays loadfail: plenty of headroom, drafter still refused - the
+    broken MTP head the walk must not re-refuse at seven progressively freer
+    splits. Missing data (no free reading, no buffers, unreadable drafter) also
+    stays loadfail: the walk walks on numbers, not on sympathy."""
+    if row.get("status") != "loadfail":
+        return False
+    lg = row.get("log") or {}
+    if not lg.get("load_error"):
+        return False
+    md = (c.get("md") or "").strip()
+    if not md:
+        return False
+    free = row.get("gpu_free_before_mib")
+    if not free:
+        return False
+    headroom = free - gpu_side(lg.get("buffers") or {})[0]
+    if headroom <= 0:
+        return True
+    floor = _drafter_floor_mib(drafter, md)
+    return floor is not None and headroom < floor
+
+
 def _spec_retry(c, row, facts, tries, drafter=None, axis=None):
     """The next config a draft family's wall walk measures, or None.
 
@@ -3243,6 +3316,15 @@ def _spec_retry(c, row, facts, tries, drafter=None, axis=None):
     one that fits, usually the one with the least headroom - so the draft rows
     OOM and the campaign reads "speculation does not work" when what it measured
     was "speculation does not fit at this particular split".
+
+    A drafter load failure is walked the same way when the row proves there was
+    no room for it - see _draft_no_room. llama.cpp's draft loader cannot report
+    a full card as an OOM (ggml-org/llama.cpp#27454): it dies in load_tensors
+    with the file-loader's error, and the row reads loadfail. The walk is free
+    to treat such a row as the OOM it is, provided the headroom the base left is
+    less than the drafter's weights; a drafter refused DESPITE headroom is a
+    broken file and stays loadfail, because the walk exists to free VRAM, not to
+    re-ask a file for a second chance.
 
     The walk settles which it is. It belongs to the SPEC FAMILY, not to one
     (spec, depth) pair: one walk per draft scheme, rung by rung in the direction
@@ -3278,7 +3360,11 @@ def _spec_retry(c, row, facts, tries, drafter=None, axis=None):
     spec = (c.get("spec") or "none")
     if spec not in ("draft-mtp", "draft-dflash"):
         return None
-    if row.get("status") not in ("ok", "oom"):
+    # A drafter load failure with no headroom for the drafter's weights is the
+    # OOM that #27454 misreports - the walk treats it as one (see
+    # _draft_no_room).
+    no_room = _draft_no_room(c, row, drafter)
+    if row.get("status") not in ("ok", "oom") and not no_room:
         return None
     depths = _draft_depths(spec, drafter)
     if not depths:
@@ -3292,7 +3378,7 @@ def _spec_retry(c, row, facts, tries, drafter=None, axis=None):
     if st is None:
         # The first OOM at the baseline rung starts the walk one rung freer,
         # resuming the ladder at the depth that just failed.
-        if row.get("status") != "oom":
+        if row.get("status") != "oom" and not no_room:
             return None          # the plan rows cover the baseline rung's ladder
         d = int(c.get("spec_n_max") or 0)
         idx = min(range(len(depths)), key=lambda i: abs(depths[i] - d))

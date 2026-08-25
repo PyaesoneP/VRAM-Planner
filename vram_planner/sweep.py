@@ -181,11 +181,22 @@ def parse_log(text):
     """Everything worth keeping from one llama-server startup."""
     out = {"buffers": {}, "kv_caches": [], "layers": {}, "swa_layers": [],
            "info": {}, "ready": False, "oom": False}
+    # llama.cpp reports each buffer more than once - a reserve pass, then the
+    # final context - so CONSECUTIVE equal values are one buffer seen twice.
+    # Distinct values under one device.kind are genuinely separate buffers that
+    # share both: an ISWA model's second KV cache beside the full-context one,
+    # or a drafter's weights and compute beside the target's. Keep every
+    # distinct buffer - the row must carry the process's whole allocation, and
+    # keep-the-largest quietly dropped the SWA cache (510 MiB on the gemma
+    # burst that taught this), reading as headroom the card did not have.
+    reported = {}
     for m in RE_BUF.finditer(text):
-        # a backend can report the same kind twice; keep the largest
         k = "%s.%s" % (m.group(1), m.group(2))
         v = float(m.group(3))
-        out["buffers"][k] = max(out["buffers"].get(k, 0.0), v)
+        vals = reported.setdefault(k, [])
+        if not vals or vals[-1] != v:
+            vals.append(v)
+    out["buffers"] = {k: sum(vals) for k, vals in reported.items() if vals[-1] > 0}
     # llama.cpp prints the cache summary once per reserve pass, so the same cache
     # shows up several times; the set of distinct caches is what we want.
     for m in RE_KVCACHE.finditer(text):

@@ -4077,6 +4077,45 @@ def _run_suite(require_refs, tmp, skipped_real):
             and _spec_retry(_no_md, _no_room, _facts, {}, _dfl, "ctx") is None
             and _spec_retry(_bad_md, _no_room, _facts, {},
                             {"kind": "dflash", "block_size": 16}, "ctx") is None)
+        # 19e) The gemma burst: weights were NOT the floor. Its MTP head
+        #     carries 252 MiB of tensors but needs ~1.5 GiB at 131k - the
+        #     full-context state plus a compute reservation that grows with
+        #     ctx (measured 88 MiB + 9216 B/cell). With 431 MiB of true
+        #     headroom it died with this same vector subscript, and
+        #     keep-the-largest parsing had hidden the SWA KV cache and read
+        #     941 - roomy, so the walk sat out. The floor now prices the
+        #     drafter's own cells, so both gemma-shaped failures walk while a
+        #     genuinely roomy refusal still stays put.
+        _mtp = {"kind": "mtp", "depth": 4, "tensor_bytes": 252 * 1024 * 1024,
+                "cfg": {"kv_layer_dims": [[512, 512, 0]] * 4}}
+        _gem_c = dict(_spec_c, ctx=131072, md="mtp-g.gguf")
+        _gem_row = {"config": _gem_c, "status": "loadfail",
+                    "error": "invalid vector subscript",
+                    "gpu_free_before_mib": 11520.6,
+                    "log": {"load_error": "invalid vector subscript",
+                            "oom": False, "ready": False,
+                            "buffers": {"CUDA0.model": 4398.36,
+                                        "CUDA0.KV": 4862.0,
+                                        "CUDA0.compute": 1829.25,
+                                        "CPU_Mapped.model": 16471.65}}}
+        ok_ = ok_ and (
+            _spec_retry(_gem_c, _gem_row, _facts, {}, _mtp, "ngl") is not None
+            and _spec_retry(_gem_c, dict(_gem_row, gpu_free_before_mib=40000.0),
+                            _facts, {}, _mtp, "ngl") is None)
+        # ...and the parsing that hid the second cache: consecutive equal
+        # reports are one buffer seen twice (reserve pass, then final);
+        # distinct values under one device.kind are separate buffers that sum.
+        _iswa = parse_log(
+            "0.01 I llama_kv_cache:      CUDA0 KV buffer size =     0.00 MiB\n"
+            "0.04 I llama_kv_cache:      CUDA0 KV buffer size =  4352.00 MiB\n"
+            "0.04 I llama_kv_cache:      CUDA0 KV buffer size =   510.00 MiB\n"
+            "0.01 I sched_reserve:      CUDA0 compute buffer size =  1829.25 MiB\n"
+            "0.04 I sched_reserve:      CUDA0 compute buffer size =  1829.25 MiB\n"
+            "0.04 I load_tensors:        CUDA0 model buffer size =  4398.36 MiB\n"
+            "0.06 I load_tensors:        CUDA0 model buffer size =   251.93 MiB\n")
+        ok_ = ok_ and (_iswa["buffers"]["CUDA0.KV"] == 4862.0
+                       and _iswa["buffers"]["CUDA0.compute"] == 1829.25
+                       and _iswa["buffers"]["CUDA0.model"] == 4650.29)
         print("  WALLSIG assert-only log is oom, post-ready assert is not  %s"
               % ("OK" if ok_ else "FAIL"))
     except Exception as e:

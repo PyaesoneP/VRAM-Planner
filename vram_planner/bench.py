@@ -3241,52 +3241,85 @@ def _draft_probe(c, axis, rung, depth):
     return d
 
 
-_DRAFTER_FLOOR = {}
+_DRAFTER_DET = {}
 
 
-def _drafter_floor_mib(drafter, md):
-    """The drafter's tensor bytes, in MiB - the VRAM a card must leave it just to
-    hold the weights, before a draft cache or a compute graph exists.
+def _drafter_floor_mib(drafter, md, c=None):
+    """The VRAM a card must leave a drafter before its load can even try, in MiB.
 
-    Taken from the campaign's drafter detail when it carries the number, else
-    read once from the file the config points at and cached by path. A GGUF's
-    tensor table is a header section, so this is a few kilobytes of reading even
-    for a multi-gigabyte drafter. None when the file cannot be read, which
-    reads as "cannot tell" and the row stays a plain loadfail rather than being
-    waved through the walk on a guess."""
+    Weights alone proved too low a bar: gemma's MTP head carries 252 MiB of
+    tensors yet needs ~1.5 GiB at a 131k context, because the draft keeps
+    full-context state and reserves a compute buffer that grows with it -
+    measured 88 MiB + 9216 B per cell on the burst that taught this, against
+    the drafter's own kv_layer_dims f16 accounting of 8192 B/cell. The floor
+    is therefore weights + those cells priced from the file's geometry at this
+    config's context and draft-cache quant + a reservation constant. A dflash
+    drafter has no such table and holds its cache at block depth regardless,
+    so it floors at its weights - which is what caught the Muse burst.
+
+    Taken from the campaign's drafter detail when it carries the numbers, else
+    read once from the file the config points at and cached by path. None when
+    the file cannot be read, which reads as "cannot tell" and the row stays a
+    plain loadfail rather than being waved through the walk on a guess."""
+    det = drafter if isinstance(drafter, dict) and drafter.get("cfg") else None
     v = (drafter or {}).get("tensor_bytes")
-    if v is None and md:
+    if md:
         try:
             key = os.path.normcase(os.path.abspath(md))
         except TypeError:
             return None
-        if key not in _DRAFTER_FLOOR:
+        if key not in _DRAFTER_DET:
             try:
                 from .plan import load_drafter   # deferred: plan is above bench
-                _DRAFTER_FLOOR[key] = load_drafter(md)["tensor_bytes"]
+                _DRAFTER_DET[key] = load_drafter(md)
             except Exception:
-                return None
-        v = _DRAFTER_FLOOR[key]
-    return None if v is None else v / (1024.0 * 1024.0)
+                _DRAFTER_DET[key] = None
+        d = _DRAFTER_DET[key]
+        if d is not None:
+            # the file's own geometry is the truth; a campaign detail only
+            # fills in when the file cannot be read
+            det = d
+            if v is None:
+                v = d.get("tensor_bytes")
+    elif det is None:
+        return None
+    if v is None:
+        return None
+    floor = v / (1024.0 * 1024.0)
+    dims = ((det or {}).get("cfg") or {}).get("kv_layer_dims") or []
+    ctx = (c or {}).get("ctx")
+    if dims and ctx:
+        try:
+            from .kv import KV_TYPE_BYTES   # deferred: plan/kv sit above bench
+            elems = sum(float(kd) + float(vd) for kd, vd, _ in dims)
+            bpe = KV_TYPE_BYTES.get(c.get("spec_kv") or "f16", 2.0) / 2.0
+            floor += elems * 2.0 * bpe * float(ctx) / (1024.0 * 1024.0)
+        except Exception:
+            pass
+    from .compute import MTP_SPEC_CONST_MIB
+    return floor + MTP_SPEC_CONST_MIB
 
 
 def _draft_no_room(c, row, drafter):
     """A drafter load failure that is a lack of room wearing the file's clothes.
 
-    When the target model has filled the card, llama.cpp's draft loader dies in
-    load_tensors with the same "error loading model: invalid vector subscript" a
-    broken file produces (ggml-org/llama.cpp#27454: zero free, non-zero total
-    NaNs the device split), so the log line cannot tell the two apart. The row
-    can: the base model's own buffers are in the parsed log, the free memory it
-    started with is on the row, and the drafter's weights are a number. If the
-    headroom the base left is less than the weights alone, the file is innocent
-    - nothing it contains could have loaded - and the row is the OOM the walk
-    exists for.
+    When the target model has squeezed the draft out, llama.cpp dies while
+    loading it with the same "error loading model: invalid vector subscript"
+    a broken file produces (ggml-org/llama.cpp#27454: a device split computed
+    from memory that is not there), so the log line cannot tell the two apart.
+    The row can: the base model's own buffers are in the parsed log, the free
+    memory it started with is on the row, and the drafter's floor is a number.
+    If the headroom the base left is under that floor - weights plus the
+    full-context state and compute reservation a draft context needs, which
+    the gemma burst measured at ~6x its weight bytes - the file is innocent:
+    nothing it contains could have loaded. That row is the OOM the walk exists
+    for. (A clean allocation failure inside the draft's context creation never
+    gets here: RE_OOM stamps it oom and the ordinary OOM walk takes it.)
 
-    The reverse stays loadfail: plenty of headroom, drafter still refused - the
+    The reverse stays loadfail: headroom to spare, drafter still refused - the
     broken MTP head the walk must not re-refuse at seven progressively freer
-    splits. Missing data (no free reading, no buffers, unreadable drafter) also
-    stays loadfail: the walk walks on numbers, not on sympathy."""
+    splits. Missing data (no free reading, no buffers, unreadable drafter)
+    also stays loadfail: the walk walks on numbers, not on sympathy."""
     if row.get("status") != "loadfail":
         return False
     lg = row.get("log") or {}
@@ -3301,7 +3334,7 @@ def _draft_no_room(c, row, drafter):
     headroom = free - gpu_side(lg.get("buffers") or {})[0]
     if headroom <= 0:
         return True
-    floor = _drafter_floor_mib(drafter, md)
+    floor = _drafter_floor_mib(drafter, md, c)
     return floor is not None and headroom < floor
 
 

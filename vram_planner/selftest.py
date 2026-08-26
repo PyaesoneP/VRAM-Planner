@@ -588,7 +588,10 @@ def _run_suite(require_refs, tmp, skipped_real):
     q2 = _spec_retry(q1, {"status": "oom"}, facts8, tr2, drafter=drf)
     wall_ok = wall_ok and q2 is not None and q2["ngl"] == 22 \
         and q2["spec_n_max"] == 3
-    # On an MoE the walk goes UP, and a genfail row never walks at all.
+    # On an MoE the walk goes UP. A genfail walks only when the process died
+    # mid-request - the card running out arrives as a connection reset, a
+    # Windows abort - while an answered error status is about the request and
+    # never walks; n-gram schemes never walk either way.
     tr3 = {}
     dwm = dict(wa, ncmoe=6, ngl=0, spec="draft-mtp", spec_n_max=2)
     m1 = _spec_retry(dict(dwm), {"status": "oom"}, {"is_moe": True, "n_layers": 8},
@@ -603,7 +606,13 @@ def _run_suite(require_refs, tmp, skipped_real):
         and _spec_retry(dict(wa, spec="draft-gram-l2"),
                         {"status": "oom"}, facts8, {}) is None \
         and _spec_retry(dict(wa, spec="draft-dflash", spec_n_max=2),
-                        {"status": "genfail"}, facts8, {}, drafter=drf) is None
+                        {"status": "genfail",
+                         "gen_error": "HTTPError: HTTP Error 500"},
+                        facts8, {}, drafter=drf) is None \
+        and _spec_retry(dict(dw), {"status": "genfail",
+                                   "gen_error": "ConnectionResetError: "
+                                               "[WinError 10054] remote host"},
+                        facts8, {}, drafter=drf) is not None
     print("  WALL draft walk: per-family rungs, nested depth ladder  %s"
           % ("OK" if wall_ok else "FAIL"))
     ok = ok and wall_ok
@@ -4102,6 +4111,32 @@ def _run_suite(require_refs, tmp, skipped_real):
             _spec_retry(_gem_c, _gem_row, _facts, {}, _mtp, "ngl") is not None
             and _spec_retry(_gem_c, dict(_gem_row, gpu_free_before_mib=40000.0),
                             _facts, {}, _mtp, "ngl") is None)
+        # 19f) ...and the Qwen burst's shape: the config LOADED (ready) and
+        #     died mid-generation - connection reset, process aborted by an
+        #     allocator that came up short while running. That genfail is the
+        #     OOM arriving late: it starts a walk at the baseline rung and
+        #     steps one freer mid-walk, instead of ending the family one rung
+        #     short of a split that runs. A genfail from a scheme the walk
+        #     does not own (n-gram builds no second cache) stays put.
+        _gf_e = "ConnectionResetError: [WinError 10054]"
+        _tries_g = {}
+        _g1c = dict(_spec_c, spec_n_max=1)
+        _g1 = _spec_retry(_g1c, {"config": _g1c, "status": "genfail",
+                                 "gen_error": _gf_e}, _facts, _tries_g,
+                          {"kind": "mtp", "depth": 4}, "ngl")
+        ok_ = ok_ and _g1 is not None
+        if _g1 is not None:
+            _g2 = _spec_retry(_g1, {"config": _g1, "status": "genfail",
+                                    "gen_error": _gf_e}, _facts, _tries_g,
+                              {"kind": "mtp", "depth": 4}, "ngl")
+            # the give-back prefers FFN blocks - from zero here, so the step
+            # is n_cpu_ffn up while the stage-A axis waits its turn
+            ok_ = ok_ and (_g2 is not None
+                           and _g2.get("n_cpu_ffn") == _g1.get("n_cpu_ffn") + 1)
+        ok_ = ok_ and (
+            _spec_retry({"spec": "ngram-mod", "ctx": 4096},
+                        {"config": {"spec": "ngram-mod"}, "status": "genfail"},
+                        _facts, {}, {}, "ngl") is None)
         # ...and the parsing that hid the second cache: consecutive equal
         # reports are one buffer seen twice (reserve pass, then final);
         # distinct values under one device.kind are separate buffers that sum.

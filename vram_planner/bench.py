@@ -3338,6 +3338,23 @@ def _draft_no_room(c, row, drafter):
     return floor is not None and headroom < floor
 
 
+# A generation whose SERVER died mid-request: urllib surfaces a dead peer as
+# a connection-level error, while a server still standing answers with an
+# HTTPError carrying its status. The distinction is the walk's: a crashed
+# process is plausibly the card running out (Windows aborts the process on a
+# failed allocation instead of printing one), an answered error is not.
+_RE_GENDIED = re.compile(
+    r"ConnectionReset|RemoteDisconnected|IncompleteRead|WinError 10054", re.I)
+
+
+def _gen_died(row):
+    """True when a genfail row's request ended because the process went away."""
+    if row.get("status") != "genfail":
+        return False
+    err = row.get("gen_error") or ""
+    return bool(_RE_GENDIED.search(err))
+
+
 def _spec_retry(c, row, facts, tries, drafter=None, axis=None):
     """The next config a draft family's wall walk measures, or None.
 
@@ -3378,7 +3395,8 @@ def _spec_retry(c, row, facts, tries, drafter=None, axis=None):
         freer at the depth that just failed - the depths below it fit at a
         stricter rung and are dominated there;
       * a rung where a depth FITS continues the ladder at that same rung until
-        it OOMs or the ladder is exhausted - the rungs below are dominated,
+        it fails to run - an OOM, or a genfail whose process died generating -
+        or the ladder is exhausted - the rungs below are dominated,
         because they carry less on the GPU (fewer layers, or less context) and
         nothing fit there that did not fit at the richer rung.
 
@@ -3395,9 +3413,15 @@ def _spec_retry(c, row, facts, tries, drafter=None, axis=None):
         return None
     # A drafter load failure with no headroom for the drafter's weights is the
     # OOM that #27454 misreports - the walk treats it as one (see
-    # _draft_no_room).
+    # _draft_no_room). A row that LOADED and then lost its connection is the
+    # same shortage arriving later: Windows builds abort the whole process on
+    # an allocator that comes up short while running, the request dies with a
+    # connection reset, and freeing VRAM is the plausible cure. A genfail from
+    # a server still standing - it answered with an error status - is about
+    # the request, not the card, and stays put; so does any other scheme.
     no_room = _draft_no_room(c, row, drafter)
-    if row.get("status") not in ("ok", "oom") and not no_room:
+    died = _gen_died(row)
+    if row.get("status") not in ("ok", "oom") and not (no_room or died):
         return None
     depths = _draft_depths(spec, drafter)
     if not depths:
@@ -3409,9 +3433,10 @@ def _spec_retry(c, row, facts, tries, drafter=None, axis=None):
     axis = axis or _spec_axis(facts, None)
     st = tries.get(spec)
     if st is None:
-        # The first OOM at the baseline rung starts the walk one rung freer,
-        # resuming the ladder at the depth that just failed.
-        if row.get("status") != "oom" and not no_room:
+        # The first OOM - or a genfail whose process died running the config -
+        # starts the walk one rung freer, resuming the ladder at the depth
+        # that just failed.
+        if row.get("status") != "oom" and not (no_room or died):
             return None          # the plan rows cover the baseline rung's ladder
         d = int(c.get("spec_n_max") or 0)
         idx = min(range(len(depths)), key=lambda i: abs(depths[i] - d))
@@ -3425,7 +3450,9 @@ def _spec_retry(c, row, facts, tries, drafter=None, axis=None):
             return None
         st["idx"] += 1
         return _draft_probe(c, st["axis"], st["rung"], depths[st["idx"]])
-    # OOM: walk one rung freer and resume the ladder at the depth that failed.
+    # Out of room - an OOM, or a genfail whose process died running the depth
+    # it loaded: walk one rung freer and resume the ladder at the depth that
+    # failed.
     r = _freer_rung(st["axis"], st["rung"], nl)
     if r is None and st["axis"] != axis:
         # Every FFN block is back on the CPU and the cache still does not fit.
